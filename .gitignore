@@ -131,3 +131,7 @@ logs
 log
 outputs
 .history
+
+# local analysis artifacts
+analysis/*.json
+analysis/wandb_*/

@@ -23,6 +23,7 @@ from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
 import torch
+from packaging import version
 from vllm.outputs import RequestOutput
 
 from verl.plugin.platform import get_platform
@@ -41,6 +42,30 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def build_vllm_prefix_cache_reset_kwargs(vllm_version: Any, *, reset_running_requests: bool = False) -> dict[str, bool]:
+    parsed_version = version.parse(str(vllm_version))
+    kwargs = {}
+    if parsed_version >= version.parse("0.13.0"):
+        kwargs["reset_connector"] = True
+    if reset_running_requests and parsed_version >= version.parse("0.12.0"):
+        kwargs["reset_running_requests"] = True
+    return kwargs
+
+
+async def reset_vllm_weight_update_caches(engine: Any, vllm_version: Any) -> None:
+    parsed_version = version.parse(str(vllm_version))
+    reset_successful = await engine.reset_prefix_cache(
+        **build_vllm_prefix_cache_reset_kwargs(parsed_version, reset_running_requests=True)
+    )
+    if reset_successful is False:
+        raise RuntimeError("Failed to reset vLLM prefix cache after weight update")
+
+    if parsed_version >= version.parse("0.9.0"):
+        await engine.reset_mm_cache()
+    if parsed_version >= version.parse("0.16.0"):
+        await engine.reset_encoder_cache()
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
@@ -294,14 +319,36 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
-                weights,
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                quant_prepared=bool(quant_reload_state),
-            )
+        model = self.model_runner.model
+        transactional_weight_update = (
+            use_standard_weight_load
+            and callable(getattr(model, "start_weight_update", None))
+            and callable(getattr(model, "finish_weight_update", None))
         )
+        if transactional_weight_update:
+            model.start_weight_update()
+
+        try:
+            receiver.receive_weights(
+                on_bucket_received=lambda weights: self._update_weights(
+                    weights,
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
+                    quant_prepared=bool(quant_reload_state),
+                )
+            )
+            if transactional_weight_update:
+                model.finish_weight_update()
+                model_state = getattr(self.model_runner, "model_state", None)
+                reset_state = getattr(model_state, "reset_after_weight_update", None)
+                if callable(reset_state):
+                    reset_state()
+        except Exception:
+            if transactional_weight_update:
+                abort_weight_update = getattr(model, "abort_weight_update", None)
+                if callable(abort_weight_update):
+                    abort_weight_update()
+            raise
 
         if self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received

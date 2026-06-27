@@ -73,6 +73,16 @@ def _with_routing_replay_flag(enabled: bool):
     return decorator
 
 
+def _normalize_gathered_metric_values(values):
+    if not isinstance(values, list) or not values:
+        return values
+    if isinstance(values[0], Metric):
+        return Metric.aggregate_dp(values)
+    if isinstance(values[0], (list, tuple)):
+        return list(chain.from_iterable(values))
+    return values
+
+
 class TrainingWorker(Worker, DistProfilerExtension):
     """
     TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
@@ -224,6 +234,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
             if forward_only:
                 final_metrics["mfu"] /= 3.0
+        else:
+            final_metrics.setdefault("mfu", 0.0)
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics
@@ -309,11 +321,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            output[key] = _normalize_gathered_metric_values(val)
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()

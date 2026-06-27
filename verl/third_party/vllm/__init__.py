@@ -31,6 +31,7 @@ package_name = "vllm"
 package_version = get_version(package_name)
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
+_is_npu_available = is_npu_available() if callable(is_npu_available) else is_npu_available
 
 if package_version is None:
     if not is_sglang_available():
@@ -38,7 +39,7 @@ if package_version is None:
             f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
             f"vllm versions are 0.7.0+"
         )
-elif is_npu_available:
+elif _is_npu_available:
     # sleep_mode=2 is not supported on vllm-ascend for now, will remove this restriction when this ability is ready.
     VLLM_SLEEP_LEVEL = 1
     from vllm import LLM

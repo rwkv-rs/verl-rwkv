@@ -960,6 +960,17 @@ def compute_offpolicy_metrics(
         # More stable for small KL values using: E[exp(log_ratio) - log_ratio - 1]
         # Formula: KL ≈ E[r - log(r) - 1] where r = π_training/π_rollout
         log_ratio = old_log_prob - rollout_log_prob
+        rollout_minus_training = rollout_log_prob - old_log_prob
+        rollout_minus_training_values = torch.masked_select(
+            rollout_minus_training.detach().float(), response_mask.bool()
+        )
+        metrics["rollout_minus_training_logprob_mean"] = float(rollout_minus_training_values.mean().item())
+        metrics["rollout_minus_training_logprob_std"] = float(rollout_minus_training_values.std(unbiased=False).item())
+        metrics["rollout_minus_training_logprob_min"] = float(rollout_minus_training_values.min().item())
+        metrics["rollout_minus_training_logprob_max"] = float(rollout_minus_training_values.max().item())
+        metrics["rollout_minus_training_logprob_abs_mean"] = (
+            verl_F.masked_mean(rollout_minus_training.abs(), response_mask).detach().item()
+        )
         k3_kl_matrix = torch.exp(log_ratio) - log_ratio - 1
         metrics["k3_kl"] = verl_F.masked_mean(k3_kl_matrix, response_mask).detach().item()
 

@@ -112,12 +112,13 @@ def patch_vllm_moe_model_weight_loader(model):
 
     DEFAULT_MLP_ATTR = "mlp"
 
-    # Get inner model (either model.model or model.language_model)
+    # Non-MoE models, such as RWKV, can expose the causal LM directly without a
+    # `.model` or `.language_model` wrapper. This MoE-specific patch should be a
+    # no-op for those models.
     inner_model = getattr(model, "model", None) or getattr(model, "language_model", None)
-    if inner_model is None:
-        raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
-
-    if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS)):
+    if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and (
+        inner_model is None or not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS))
+    ):
         return
 
     # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -58,14 +59,14 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     build_mtp_speculative_config,
+    build_vllm_prefix_cache_reset_kwargs,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
+    reset_vllm_weight_update_caches,
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
-_RESET_PREFIX_CACHE_KWARGS = {}
-if _VLLM_VERSION >= version.parse("0.13.0"):
-    _RESET_PREFIX_CACHE_KWARGS["reset_connector"] = True
+_RESET_PREFIX_CACHE_KWARGS = build_vllm_prefix_cache_reset_kwargs(_VLLM_VERSION)
 
 
 if _VLLM_VERSION > version.parse("0.11.0"):
@@ -88,6 +89,61 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
+
+
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+@dataclass
+class _RWKVRolloutModelConfig:
+    local_path: str
+    hf_config: Any
+    trust_remote_code: bool = False
+    tokenizer: Any = None
+    processor: Any = None
+    lora: dict[str, Any] = field(default_factory=dict)
+    lora_rank: int = 0
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+def _is_rwkv_native_model_config(model_config: Any) -> bool:
+    return _config_get(model_config, "_target_") == RWKV_NATIVE_MODEL_TARGET
+
+
+def _init_rwkv_rollout_model_config(model_config: Any) -> _RWKVRolloutModelConfig:
+    from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
+
+    from verl.models.rwkv import build_rwkv_tokenizer
+    from verl.utils.fs import copy_to_local
+
+    local_path = copy_to_local(_config_get(model_config, "path"), use_shm=_config_get(model_config, "use_shm", False))
+    hf_config = build_rwkv7_config_from_pth(local_path)
+    if hf_config is None:
+        raise ValueError(
+            "RWKV native vLLM rollout requires a BlinkDL RWKV7 raw .pth checkpoint path "
+            f"that vLLM can parse, got: {local_path}"
+        )
+
+    tokenizer = None
+    if _config_get(model_config, "load_tokenizer", True):
+        tokenizer = build_rwkv_tokenizer(tokenizer_path=_config_get(model_config, "tokenizer_path"), pickleable=True)
+
+    return _RWKVRolloutModelConfig(
+        local_path=local_path,
+        hf_config=hf_config,
+        tokenizer=tokenizer,
+        processor=None,
+        lora=_config_get(model_config, "lora", {}) or {},
+        lora_rank=0,
+    )
 
 
 class vLLMHttpServer:
@@ -821,16 +877,7 @@ class vLLMHttpServer:
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
-            # reset_connector=True drops any attached external KV store
-            # (e.g. MooncakeStoreConnector) whose entries were computed
-            # against the previous model weights. With no connector it
-            # is a no-op success, so we can pass it unconditionally.
-            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
-
-            if _VLLM_VERSION >= version.parse("0.9.0"):
-                await self.engine.reset_mm_cache()
-            if _VLLM_VERSION >= version.parse("0.16.0"):
-                await self.engine.reset_encoder_cache()
+            await reset_vllm_weight_update_caches(self.engine, _VLLM_VERSION)
 
     async def release_kv_cache(self):
         """Release only kv_cache GPU memory, keeping model weights intact.
@@ -1000,6 +1047,8 @@ class vLLMHttpServer:
 
     def _init_model_config(self, model_config):
         """Initialise model_config. Override when a specific dataclass_type is needed."""
+        if _is_rwkv_native_model_config(model_config):
+            return _init_rwkv_rollout_model_config(model_config)
         return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
 
     def _validate_configs(self) -> None:
