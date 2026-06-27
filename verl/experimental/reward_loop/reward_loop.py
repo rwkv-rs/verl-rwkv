@@ -26,6 +26,7 @@ from tensordict import TensorDict
 from verl.protocol import DataProto, pad_dataproto_to_divisor
 from verl.single_controller.ray.base import RayResourcePool
 from verl.trainer.ppo.reward import load_reward_manager, resolve_reward_manager_cls
+from verl.trainer.tokenizer import is_rwkv_native_model_config
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.ray_utils import get_event_loop
@@ -118,11 +119,20 @@ class RewardLoopWorker:
         self.loop = get_event_loop()
 
     def _init_reward_fn(self):
-        input_tokenizer_path = self.config.actor_rollout_ref.model.tokenizer_path
-        if input_tokenizer_path is None:
-            input_tokenizer_path = self.config.actor_rollout_ref.model.path
-        input_tokenizer_local_path = copy_to_local(input_tokenizer_path)
-        self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
+        model_config = self.config.actor_rollout_ref.model
+        if is_rwkv_native_model_config(model_config):
+            from verl.models.rwkv import build_rwkv_tokenizer
+
+            self.input_tokenizer = build_rwkv_tokenizer(
+                tokenizer_path=model_config.get("tokenizer_path"),
+                pickleable=True,
+            )
+        else:
+            input_tokenizer_path = model_config.tokenizer_path
+            if input_tokenizer_path is None:
+                input_tokenizer_path = model_config.path
+            input_tokenizer_local_path = copy_to_local(input_tokenizer_path)
+            self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
         self.reward_model_tokenizer = None
         if self.config.reward.reward_model.enable:
             reward_model_tokenizer_local_path = copy_to_local(self.config.reward.reward_model.model_path)

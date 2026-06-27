@@ -1104,6 +1104,15 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _shutdown_dataloader_workers(self) -> None:
+        for dataloader_name in ("train_dataloader", "val_dataloader"):
+            dataloader = getattr(self, dataloader_name, None)
+            iterator = getattr(dataloader, "_iterator", None)
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+        self.train_dataloader_it = None
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -1404,6 +1413,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dataloader_workers()
                 self._shutdown_dump_executor()
                 return
 
@@ -1760,6 +1770,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dataloader_workers()
                     self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
@@ -1772,4 +1783,5 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dataloader_workers()
         self._shutdown_dump_executor()
