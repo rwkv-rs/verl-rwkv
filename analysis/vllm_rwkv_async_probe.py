@@ -9,6 +9,7 @@ import gc
 import json
 import math
 import os
+import time
 from collections import Counter
 from typing import Any
 
@@ -87,24 +88,19 @@ async def _generate_one(engine: Any, prompt_ids: list[int], sampling_params: Any
     return final
 
 
-async def _send_weights(args: argparse.Namespace, zmq_handle: str) -> None:
+async def _update_weights_from_ipc(
+    engine: Any,
+    args: argparse.Namespace,
+    weights: list[tuple[str, Any]] | None,
+    repeat_index: int,
+) -> Any:
     from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 
-    sender = BucketedWeightSender(
-        zmq_handle=zmq_handle,
-        bucket_size_mb=args.bucket_size_mb,
-        use_shm=args.use_shm,
-    )
-    await sender.async_send_weights(
-        _iter_checkpoint_weights(args.update_model, device=args.weights_device, cast_bf16=args.cast_bf16)
-    )
-
-
-async def _update_weights_from_ipc(engine: Any, args: argparse.Namespace) -> Any:
     job_id = os.environ["VERL_RAY_JOB_ID"]
     replica_rank = os.environ["VERL_REPLICA_RANK"]
     zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-0.sock"
     print(f"ipc_update_handle={zmq_handle}", flush=True)
+    total_start = time.perf_counter()
     update_task = asyncio.create_task(
         engine.collective_rpc(
             method="update_weights_from_ipc",
@@ -112,8 +108,23 @@ async def _update_weights_from_ipc(engine: Any, args: argparse.Namespace) -> Any
         )
     )
     await asyncio.sleep(args.sender_start_delay)
-    await _send_weights(args, zmq_handle)
-    return await asyncio.wait_for(update_task, timeout=args.update_timeout)
+    send_start = time.perf_counter()
+    sender = BucketedWeightSender(
+        zmq_handle=zmq_handle,
+        bucket_size_mb=args.bucket_size_mb,
+        use_shm=args.use_shm,
+    )
+    if weights is None:
+        weights = _iter_checkpoint_weights(args.update_model, device=args.weights_device, cast_bf16=args.cast_bf16)
+    await sender.async_send_weights(weights)
+    send_end = time.perf_counter()
+    result = await asyncio.wait_for(update_task, timeout=args.update_timeout)
+    total_end = time.perf_counter()
+    print(f"ipc_update_repeat={repeat_index}", flush=True)
+    print(f"ipc_send_seconds={send_end - send_start:.6f}", flush=True)
+    print(f"ipc_update_wait_seconds={total_end - send_end:.6f}", flush=True)
+    print(f"ipc_update_total_seconds={total_end - total_start:.6f}", flush=True)
+    return result
 
 
 async def _reset_after_weight_update(engine: Any) -> None:
@@ -271,14 +282,34 @@ async def _run_async(args: argparse.Namespace) -> None:
     print(f"before_first_ids={before_ids[:32]}", flush=True)
 
     if args.ipc_update:
+        update_weights = None
+        if args.preload_update_weights:
+            preload_start = time.perf_counter()
+            update_weights = list(
+                _iter_checkpoint_weights(
+                    args.update_model,
+                    device=args.weights_device,
+                    cast_bf16=args.cast_bf16,
+                )
+            )
+            preload_end = time.perf_counter()
+            print(f"preload_update_weight_count={len(update_weights)}", flush=True)
+            print(
+                "preload_update_weight_bytes="
+                f"{sum(tensor.nbytes for _, tensor in update_weights if isinstance(tensor, torch.Tensor))}",
+                flush=True,
+            )
+            print(f"preload_update_weights_seconds={preload_end - preload_start:.6f}", flush=True)
+
         if args.sleep_cycle:
             print(f"sleep_level={args.sleep_level}", flush=True)
             await engine.sleep(level=args.sleep_level)
             print("wake_up_weights", flush=True)
             await engine.wake_up(tags=["weights"])
             await _reset_prefix_cache_after_wake(engine)
-        update_result = await _update_weights_from_ipc(engine, args)
-        print(f"ipc_update_result={update_result}", flush=True)
+        for repeat_index in range(args.update_repeats):
+            update_result = await _update_weights_from_ipc(engine, args, update_weights, repeat_index)
+            print(f"ipc_update_result={update_result}", flush=True)
         if args.sleep_cycle:
             print("reset_after_weight_update", flush=True)
             await _reset_after_weight_update(engine)
@@ -312,6 +343,8 @@ def main() -> None:
     parser.add_argument("--enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cli-config", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ipc-update", action="store_true")
+    parser.add_argument("--update-repeats", type=int, default=1)
+    parser.add_argument("--preload-update-weights", action="store_true")
     parser.add_argument("--sleep-cycle", action="store_true")
     parser.add_argument("--sleep-level", type=int, default=2)
     parser.add_argument("--bucket-size-mb", type=int, default=2048)
