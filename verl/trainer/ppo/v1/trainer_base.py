@@ -71,14 +71,13 @@ from verl.trainer.ppo.utils import (
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.utils import compute_advantage_for_multi_trajectories
-from verl.utils import hf_processor, hf_tokenizer
+from verl.trainer.tokenizer import build_ppo_tokenizer_and_processor
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
 from verl.utils.debug.metrics import calculate_debug_metrics
-from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import load_extern_type
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
@@ -507,15 +506,7 @@ class PPOTrainer(ABC):
 
     def _init_tokenizer(self):
         """Initialize tokenizer."""
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            self.config.actor_rollout_ref.model.path, use_shm=self.config.actor_rollout_ref.model.get("use_shm", False)
-        )
-        trust_remote_code = self.config.data.get("trust_remote_code", False)
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        self.tokenizer, self.processor = build_ppo_tokenizer_and_processor(self.config)
 
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
