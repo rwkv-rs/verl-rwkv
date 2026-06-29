@@ -618,8 +618,8 @@ class RWKVLMEngineConfig(EngineConfig):
 
     strategy: str = "rwkv_lm"
     rwkv_lm_path: Optional[str] = None
-    train_entrypoint: str = "RWKV-v7/train_temp/train.py"
-    model_entrypoint: str = "RWKV-v7/train_temp/src/model.py"
+    train_entrypoint: str = "train.py"
+    model_entrypoint: str = "src/model.py"
     rwkv_version: str = "v7"
     precision: str = "bf16"
     ctx_len: Optional[int] = None

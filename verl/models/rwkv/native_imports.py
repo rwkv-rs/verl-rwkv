@@ -94,10 +94,10 @@ def import_rwkv_lm(
 ) -> ModuleType:
     """Import a module from a caller-provided rwkv-lm checkout.
 
-    This is interface glue only. It puts ``RWKV-v7/train_temp`` on
-    ``sys.path`` and imports the requested native module from the upstream
-    checkout. Callers importing ``src.model`` must pass the same ``RWKV_*``
-    environment values that rwkv-lm's ``train.py`` would set before import.
+    This is interface glue only. It puts the flattened native training directory
+    on ``sys.path`` and imports the requested native module from that checkout.
+    Callers importing ``src.model`` must pass the same ``RWKV_*`` environment
+    values that rwkv-lm's ``train.py`` would set before import.
     """
 
     paths = resolve_rwkv_lm_paths(rwkv_lm_path)

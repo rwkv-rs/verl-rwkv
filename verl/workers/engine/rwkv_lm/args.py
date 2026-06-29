@@ -14,7 +14,7 @@
 """Argument bridge for native rwkv-lm.
 
 Defaults in ``RWKV_LM_TRAIN_ARG_DEFAULTS`` are copied from
-``rwkv-lm/RWKV-v7/train_temp/train.py``. This module only builds an
+the native flat-layout ``rwkv-lm/train.py``. This module only builds an
 argparse-like namespace for the native upstream code.
 """
 
