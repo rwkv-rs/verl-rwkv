@@ -22,8 +22,8 @@ RWKV_LM_DEEPSPEED_PREFIX = "_forward_module."
 def strip_rwkv_lm_deepspeed_prefix(name: str) -> str:
     """Strip rwkv-lm's DeepSpeed wrapper prefix.
 
-    Source: ``rwkv-lm/RWKV-v7/train_temp/train.py`` rewrites
-    ``_forward_module.*`` checkpoint keys immediately after ``torch.load``.
+    Source: native flat-layout ``rwkv-lm/train.py`` rewrites ``_forward_module.*``
+    checkpoint keys immediately after ``torch.load``.
     """
 
     if name.startswith(RWKV_LM_DEEPSPEED_PREFIX):

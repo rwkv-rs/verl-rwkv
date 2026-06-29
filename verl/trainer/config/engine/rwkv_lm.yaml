@@ -5,10 +5,10 @@ _target_: verl.workers.config.RWKVLMEngineConfig
 rwkv_lm_path: ???
 
 # Native rwkv-lm training entrypoint relative to rwkv_lm_path
-train_entrypoint: RWKV-v7/train_temp/train.py
+train_entrypoint: train.py
 
 # Native rwkv-lm model implementation relative to rwkv_lm_path
-model_entrypoint: RWKV-v7/train_temp/src/model.py
+model_entrypoint: src/model.py
 
 # RWKV architecture version
 rwkv_version: v7

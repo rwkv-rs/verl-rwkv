@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Path contracts for native RWKV upstream checkouts."""
+"""Path contracts for native RWKV training checkouts."""
 
 from __future__ import annotations
 
@@ -23,11 +23,10 @@ from typing import Optional
 
 RWKV_LM_ENV = "RWKV_LM_PATH"
 
-RWKV_LM_TRAIN_REL = Path("RWKV-v7/train_temp")
 RWKV_LM_REQUIRED_FILES = (
-    RWKV_LM_TRAIN_REL / "train.py",
-    RWKV_LM_TRAIN_REL / "src/model.py",
-    RWKV_LM_TRAIN_REL / "src/trainer.py",
+    Path("train.py"),
+    Path("src/model.py"),
+    Path("src/trainer.py"),
 )
 
 
@@ -49,21 +48,26 @@ def _resolve_root(path: Optional[str], env_name: str, default_relative: str) -> 
     return root.resolve()
 
 
-def _require_files(root: Path, relative_files: tuple[Path, ...], project_name: str) -> None:
-    missing = [str(root / relative) for relative in relative_files if not (root / relative).is_file()]
-    if missing:
-        missing_list = "\n  - ".join(missing)
-        raise FileNotFoundError(f"{project_name} checkout is missing required files:\n  - {missing_list}")
+def _missing_files(root: Path, relative_files: tuple[Path, ...]) -> list[str]:
+    return [str(root / relative) for relative in relative_files if not (root / relative).is_file()]
+
+
+def _resolve_train_dir(root: Path, *, require: bool) -> Path:
+    missing = _missing_files(root, RWKV_LM_REQUIRED_FILES)
+    if require:
+        if missing:
+            missing_list = "\n  - ".join(missing)
+            raise FileNotFoundError(f"rwkv-lm checkout is missing required flat-layout files:\n  - {missing_list}")
+    return root
 
 
 def resolve_rwkv_lm_paths(path: Optional[str] = None, *, require: bool = True) -> RWKVLMPaths:
     """Resolve a native rwkv-lm repository path.
 
-    ``path`` may point at the rwkv-lm repository root. When omitted, this checks
-    ``RWKV_LM_PATH`` and then the future repo-local ``third_party/rwkv-lm``.
+    ``path`` must point at the flattened native training directory containing
+    ``train.py`` and ``src/model.py``. When omitted, this checks ``RWKV_LM_PATH``
+    and then the future repo-local ``third_party/rwkv-lm``.
     """
 
     repo_root = _resolve_root(path, RWKV_LM_ENV, "third_party/rwkv-lm")
-    if require:
-        _require_files(repo_root, RWKV_LM_REQUIRED_FILES, "rwkv-lm")
-    return RWKVLMPaths(repo_root=repo_root, train_dir=repo_root / RWKV_LM_TRAIN_REL)
+    return RWKVLMPaths(repo_root=repo_root, train_dir=_resolve_train_dir(repo_root, require=require))

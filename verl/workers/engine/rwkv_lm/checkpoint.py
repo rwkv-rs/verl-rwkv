@@ -21,8 +21,8 @@ RWKV_LM_DEEPSPEED_PREFIX = "_forward_module."
 def normalize_rwkv_lm_state_dict(state: dict[str, Any]) -> dict[str, Any]:
     """Normalize native rwkv-lm checkpoint keys.
 
-    Source: ``rwkv-lm/RWKV-v7/train_temp/train.py`` strips the
-    ``_forward_module.`` prefix after ``torch.load``.
+    Source: native flat-layout ``rwkv-lm/train.py`` strips the ``_forward_module.``
+    prefix after ``torch.load``.
     """
 
     normalized = dict(state)

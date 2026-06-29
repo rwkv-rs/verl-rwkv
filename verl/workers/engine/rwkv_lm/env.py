@@ -14,7 +14,7 @@
 """Environment bridge for native rwkv-lm.
 
 The base ``RWKV_*`` assignments are copied from
-``rwkv-lm/RWKV-v7/train_temp/train.py``.
+the native flat-layout ``rwkv-lm/train.py``.
 """
 
 from __future__ import annotations

@@ -34,29 +34,30 @@ def _clear_modules(*module_names: str) -> None:
         sys.modules.pop(module_name, None)
 
 
-def test_resolve_rwkv_lm_paths_accepts_required_train_temp_layout(tmp_path):
-    _write(tmp_path / "RWKV-v7/train_temp/train.py", "")
-    _write(tmp_path / "RWKV-v7/train_temp/src/model.py", "")
-    _write(tmp_path / "RWKV-v7/train_temp/src/trainer.py", "")
+def _write_required_train_files(train_dir: Path) -> None:
+    _write(train_dir / "train.py", "")
+    _write(train_dir / "src/model.py", "")
+    _write(train_dir / "src/trainer.py", "")
+
+
+def test_resolve_rwkv_lm_paths_accepts_flat_train_layout(tmp_path):
+    _write_required_train_files(tmp_path)
 
     paths = resolve_rwkv_lm_paths(str(tmp_path))
 
     assert paths.repo_root == tmp_path.resolve()
-    assert paths.train_dir == (tmp_path / "RWKV-v7/train_temp").resolve()
+    assert paths.train_dir == tmp_path.resolve()
 
 
 def test_resolve_rwkv_lm_paths_rejects_missing_native_files(tmp_path):
-    with pytest.raises(FileNotFoundError, match="rwkv-lm checkout is missing required files"):
+    with pytest.raises(FileNotFoundError, match="rwkv-lm checkout is missing required flat-layout files"):
         resolve_rwkv_lm_paths(str(tmp_path))
 
 
-def test_import_rwkv_lm_uses_train_temp_sys_path_and_cwd(tmp_path):
-    train_dir = tmp_path / "RWKV-v7/train_temp"
-    _write(train_dir / "train.py", "")
-    _write(train_dir / "src/model.py", "")
-    _write(train_dir / "src/trainer.py", "")
+def test_import_rwkv_lm_uses_flat_train_sys_path_and_cwd(tmp_path):
+    _write_required_train_files(tmp_path)
     _write(
-        train_dir / "src/import_probe.py",
+        tmp_path / "src/import_probe.py",
         "from pathlib import Path\n"
         "CWD = Path.cwd()\n"
         "VALUE = 'rwkv-lm'\n",
@@ -66,16 +67,13 @@ def test_import_rwkv_lm_uses_train_temp_sys_path_and_cwd(tmp_path):
     module = import_rwkv_lm("src.import_probe", rwkv_lm_path=str(tmp_path))
 
     assert module.VALUE == "rwkv-lm"
-    assert module.CWD == train_dir.resolve()
+    assert module.CWD == tmp_path.resolve()
 
 
 def test_import_rwkv_lm_patches_native_env_only_during_import(tmp_path, monkeypatch):
-    train_dir = tmp_path / "RWKV-v7/train_temp"
-    _write(train_dir / "train.py", "")
-    _write(train_dir / "src/model.py", "")
-    _write(train_dir / "src/trainer.py", "")
+    _write_required_train_files(tmp_path)
     _write(
-        train_dir / "src/env_probe.py",
+        tmp_path / "src/env_probe.py",
         "import os\n"
         "VALUE = os.environ['RWKV_HEAD_SIZE']\n",
     )
