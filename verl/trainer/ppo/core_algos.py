@@ -108,6 +108,7 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    MAXRL = "maxrl"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -356,6 +357,46 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.MAXRL)
+def compute_maxrl_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute MaxRL outcome advantages from grouped scalar rewards.
+
+    MaxRL replaces GRPO's std normalization with mean-probability
+    normalization: (r_i - mean(group)) / (mean(group) + epsilon).
+    This matches the official MaxRL implementation while keeping the current
+    verl registry signature.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            scores[i] = (scores[i] - id2mean[index[i]]) / (id2mean[index[i]] + epsilon)
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
 
 
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")

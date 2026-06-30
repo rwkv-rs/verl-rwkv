@@ -69,7 +69,7 @@ class PickleableRWKVTokenizer:
         return len(self._tokenizer)
 
     def encode(self, *args: Any, **kwargs: Any) -> list[int]:
-        return self._with_bos(self._tokenizer.encode(*args, **kwargs))
+        return list(self._tokenizer.encode(*args, **kwargs))
 
     def apply_chat_template(
         self,
@@ -93,9 +93,6 @@ class PickleableRWKVTokenizer:
             output = self._plain_text_prompt(messages)
             if tokenize:
                 output = self.encode(output)
-        else:
-            if tokenize:
-                output = self._with_bos(output)
         if not return_dict:
             return output
         if not tokenize:
@@ -106,12 +103,6 @@ class PickleableRWKVTokenizer:
 
             result = {key: torch.tensor([value], dtype=torch.long) for key, value in result.items()}
         return result
-
-    def _with_bos(self, token_ids: list[int]) -> list[int]:
-        token_ids = list(token_ids)
-        if token_ids[:1] == [self.bos_token_id]:
-            return token_ids
-        return [self.bos_token_id] + token_ids
 
     def _plain_text_prompt(self, messages) -> str:
         user_parts = []
