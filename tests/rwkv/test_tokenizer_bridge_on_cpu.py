@@ -72,7 +72,7 @@ def test_build_rwkv_tokenizer_can_return_pickleable_proxy():
         pickleable=True,
     )
 
-    assert tokenizer.encode("abc") == [0, 3]
+    assert tokenizer.encode("abc") == [3]
     pickle.dumps(tokenizer)
 
 
@@ -117,7 +117,7 @@ def test_pickleable_rwkv_tokenizer_accepts_hf_chat_template_kwargs():
         return_dict=True,
     )
 
-    assert output["input_ids"] == [0, *[ord(char) for char in "user:hi|assistant:"]]
+    assert output["input_ids"] == [ord(char) for char in "user:hi|assistant:"]
     assert output["attention_mask"] == [1] * len(output["input_ids"])
 
 
@@ -153,11 +153,11 @@ def test_pickleable_rwkv_tokenizer_falls_back_to_plain_text_without_chat_templat
     )
 
     expected_prompt = "User: solve\n\nAssistant: <think"
-    assert output["input_ids"] == [0, *[ord(char) for char in expected_prompt]]
+    assert output["input_ids"] == [ord(char) for char in expected_prompt]
     assert output["attention_mask"] == [1] * len(output["input_ids"])
 
 
-def test_pickleable_rwkv_tokenizer_does_not_duplicate_existing_bos():
+def test_pickleable_rwkv_tokenizer_preserves_native_bos_policy():
     import verl.models.rwkv.tokenizer as tokenizer_module
 
     class BosTokenizer:
