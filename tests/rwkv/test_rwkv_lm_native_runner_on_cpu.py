@@ -18,6 +18,8 @@ import types
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 
 def _load_runner_module():
     package_name = "rwkv_lm_engine_test"
@@ -104,10 +106,11 @@ def test_default_import_rejects_wrong_pytorch_lightning_version(monkeypatch):
         lambda package: "2.6.4" if package == "pytorch-lightning" else "0.19.0",
     )
 
-    try:
+    with pytest.raises(RuntimeError) as raised:
         runner_module._default_import_rwkv_lm("src.model", rwkv_lm_path="/src/rwkv-lm")
-    except RuntimeError as exc:
-        assert "pytorch-lightning==1.9.5" in str(exc)
-        assert "2.6.4" in str(exc)
-    else:
-        raise AssertionError("expected native rwkv-lm runtime validation to reject Lightning 2.x")
+
+    assert str(raised.value) == (
+        "native rwkv-lm requires pytorch-lightning==1.9.5; found 2.6.4. "
+        "Fix the uv environment with `uv pip install pytorch-lightning==1.9.5` "
+        "before running RWKV training."
+    )
