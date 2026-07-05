@@ -12,11 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 from pathlib import Path
 
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
+
+
+def _load_rwkv_trainer_module(name: str):
+    path = Path("examples/rwkv_trainer") / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"rwkv_trainer_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_rwkv_model_config_exposes_generic_worker_compat_fields():
@@ -61,6 +71,9 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.load_format=auto",
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.tokenizer_mode=rwkv",
+        "actor_rollout_ref.rollout.val_kwargs.presence_penalty=0.65",
+        "actor_rollout_ref.rollout.val_kwargs.repetition_penalty=0.25",
+        "actor_rollout_ref.rollout.val_kwargs.penalty_decay=0.99",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=2048",
@@ -81,6 +94,9 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
     assert cfg.actor_rollout_ref.model._target_ == "verl.models.rwkv.RWKVNativeModelConfig"
     assert cfg.actor_rollout_ref.rollout.name == "vllm"
     assert cfg.actor_rollout_ref.rollout.engine_kwargs.vllm.tokenizer_mode == "rwkv"
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.presence_penalty == 0.65
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.repetition_penalty == 0.25
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.penalty_decay == 0.99
     assert "nano_vllm_rwkv" not in cfg.actor_rollout_ref.rollout.engine_kwargs
     assert cfg.actor_rollout_ref.rollout.val_kwargs.do_sample is False
     assert cfg.actor_rollout_ref.rollout.multi_turn.enable is False
@@ -92,7 +108,7 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
 
 
 def test_rwkv_grpo_reward_delegates_to_math_verify(monkeypatch):
-    from examples.rwkv_trainer import math_verify_reward
+    math_verify_reward = _load_rwkv_trainer_module("math_verify_reward")
 
     calls = []
 

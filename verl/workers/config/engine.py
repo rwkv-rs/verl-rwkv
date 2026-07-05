@@ -625,6 +625,8 @@ class RWKVLMEngineConfig(EngineConfig):
     ctx_len: Optional[int] = None
     head_size: Optional[int] = None
     grad_cp: Optional[int] = None
+    infctx: bool = False
+    chunk_ctx: Optional[int] = None
     compile_cuda: bool = True
     native_env: dict[str, str] = field(default_factory=dict)
     checkpoint_format: str = "pth"
@@ -634,6 +636,11 @@ class RWKVLMEngineConfig(EngineConfig):
         assert self.strategy == "rwkv_lm", f"strategy must be 'rwkv_lm', got {self.strategy}"
         assert self.precision in ["bf16", "fp16", "fp32"], f"precision {self.precision} not supported"
         assert self.checkpoint_format in ["pth"], f"checkpoint_format {self.checkpoint_format} not supported"
+        if self.infctx:
+            assert self.chunk_ctx is not None and self.chunk_ctx > 0, "infctx requires chunk_ctx > 0"
+            if self.ctx_len is not None:
+                assert self.chunk_ctx < self.ctx_len, "infctx requires chunk_ctx < ctx_len"
+            assert self.chunk_ctx % 16 == 0, "infctx chunk_ctx must be divisible by RWKV CUDA chunk length 16"
 
 
 @dataclass

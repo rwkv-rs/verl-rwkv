@@ -168,8 +168,12 @@ class RWKVLMEngine(BaseEngine):
         model_input_ids = self._build_model_input_ids(forward_batch.input_ids)
         ctx = torch.no_grad() if forward_only else nullcontext()
         with ctx:
-            raw_output = self.model(model_input_ids)
-            model_output = self._build_model_output(raw_output, forward_batch, data, original_seq_len=original_seq_len)
+            model_output = self._forward_model_output(
+                model_input_ids,
+                forward_batch,
+                data,
+                original_seq_len=original_seq_len,
+            )
             if loss_function is None:
                 if not forward_only:
                     raise ValueError("loss_function is required unless forward_only=True")
@@ -385,6 +389,257 @@ class RWKVLMEngine(BaseEngine):
 
     def _rwkv_chunk_len(self) -> int:
         return 16
+
+    def _forward_model_output(
+        self,
+        model_input_ids: Any,
+        forward_batch: Any,
+        data: TensorDict,
+        *,
+        original_seq_len: int | None = None,
+    ) -> dict[str, Any]:
+        if self._can_build_chunked_infctx_response_output(forward_batch):
+            return self._forward_infctx_response_model_output(
+                model_input_ids,
+                forward_batch,
+                data,
+                original_seq_len=original_seq_len,
+            )
+        if not self._infctx_enabled():
+            raw_output = self.model(model_input_ids)
+        else:
+            if not hasattr(self.model, "forward_infctx_sequence"):
+                raise RuntimeError("RWKV infctx mode requires model.forward_infctx_sequence(input_ids, chunk_ctx=...).")
+            raw_output = self.model.forward_infctx_sequence(model_input_ids, chunk_ctx=self._infctx_chunk_ctx())
+        return self._build_model_output(raw_output, forward_batch, data, original_seq_len=original_seq_len)
+
+    def _can_build_chunked_infctx_response_output(self, forward_batch: Any) -> bool:
+        return (
+            self._infctx_enabled()
+            and forward_batch.responses is not None
+            and self.model is not None
+            and hasattr(self.model, "create_infctx_state")
+            and hasattr(self.model, "forward_infctx_chunk")
+            and hasattr(self.model, "head")
+        )
+
+    def _forward_infctx_response_model_output(
+        self,
+        model_input_ids: Any,
+        forward_batch: Any,
+        data: TensorDict,
+        *,
+        original_seq_len: int | None = None,
+    ) -> dict[str, Any]:
+        from verl.utils.torch_functional import logprobs_from_logits, logprobs_from_logits_v2
+
+        responses = forward_batch.responses
+        if hasattr(responses, "to"):
+            responses = responses.to(device=model_input_ids.device)
+
+        packed_layout = self._infctx_packed_log_prob_layout(
+            forward_batch=forward_batch,
+            data=data,
+            device=model_input_ids.device,
+        )
+        if packed_layout is not None:
+            offsets, sequence_lens, prompt_lens, response_lens = packed_layout
+            state_dtype = self._infctx_state_dtype()
+            shift_states, wkv_states = self.model.create_infctx_state(
+                int(model_input_ids.size(0)),
+                model_input_ids.device,
+                state_dtype,
+            )
+
+            full_log_probs = None
+            chunk_ctx = self._infctx_chunk_ctx()
+            chunk_len = self._rwkv_chunk_len()
+            max_needed_position = torch.where(response_lens > 0, sequence_lens - 1, sequence_lens.new_zeros(()))
+            forward_until = int(max_needed_position.max().item())
+            sequence_length = original_seq_len if original_seq_len is not None else int(model_input_ids.size(-1))
+            forward_until = min(forward_until, sequence_length)
+
+            for start in range(0, forward_until, chunk_ctx):
+                valid_end = min(start + chunk_ctx, forward_until)
+                if valid_end <= start:
+                    break
+                idx_chunk = model_input_ids[:, start:valid_end]
+                valid_T = int(idx_chunk.size(1))
+                pad_len = (-valid_T) % chunk_len
+                if pad_len:
+                    idx_chunk = F.pad(idx_chunk, (0, pad_len), value=0)
+
+                positions = torch.arange(start, valid_end, device=model_input_ids.device, dtype=torch.long)
+                target_mask = (
+                    (positions.unsqueeze(0) >= (prompt_lens - 1).unsqueeze(1))
+                    & (positions.unsqueeze(0) < (sequence_lens - 1).unsqueeze(1))
+                    & (response_lens > 0).unsqueeze(1)
+                )
+                has_response_logits = bool(target_mask.any().item())
+                grad_ctx = nullcontext() if has_response_logits and torch.is_grad_enabled() else torch.no_grad()
+                with grad_ctx:
+                    hidden, shift_states, wkv_states = self.model.forward_infctx_chunk(
+                        idx_chunk,
+                        shift_states,
+                        wkv_states,
+                    )
+                    if has_response_logits:
+                        label_tokens = model_input_ids[:, start + 1 : valid_end + 1]
+                        response_logits = self.model.head(hidden[:, :valid_T][target_mask])
+                        response_labels = label_tokens[target_mask]
+                        if (
+                            getattr(response_logits, "device", None) is not None
+                            and response_logits.device.type == "cpu"
+                        ):
+                            log_probs = logprobs_from_logits_v2(logits=response_logits, labels=response_labels)
+                        else:
+                            log_probs = logprobs_from_logits(logits=response_logits, labels=response_labels)
+                        flat_indices = (offsets[:-1].unsqueeze(1) + positions.unsqueeze(0))[target_mask]
+                        if full_log_probs is None:
+                            full_log_probs = log_probs.new_zeros(int(offsets[-1].item()))
+                        full_log_probs = full_log_probs.scatter(0, flat_indices, log_probs)
+
+                shift_states = shift_states.detach()
+                wkv_states = wkv_states.detach()
+
+            if full_log_probs is None:
+                full_log_probs = torch.zeros(
+                    int(offsets[-1].item()),
+                    device=model_input_ids.device,
+                    dtype=self._model_dtype() or torch.float32,
+                )
+            return build_verl_loss_model_output(
+                log_probs=torch.nested.nested_tensor_from_jagged(full_log_probs, offsets),
+            )
+
+        response_length = int(responses.size(-1))
+        sequence_length = original_seq_len if original_seq_len is not None else int(model_input_ids.size(-1))
+        response_start = max(0, sequence_length - response_length - 1)
+        response_end = response_start + response_length
+
+        state_dtype = self._infctx_state_dtype()
+        shift_states, wkv_states = self.model.create_infctx_state(
+            int(model_input_ids.size(0)),
+            model_input_ids.device,
+            state_dtype,
+        )
+
+        log_prob_chunks = []
+        chunk_ctx = self._infctx_chunk_ctx()
+        chunk_len = self._rwkv_chunk_len()
+        forward_until = min(sequence_length, response_end)
+        for start in range(0, forward_until, chunk_ctx):
+            valid_end = min(start + chunk_ctx, sequence_length)
+            if valid_end <= start:
+                break
+            idx_chunk = model_input_ids[:, start:valid_end]
+            valid_T = int(idx_chunk.size(1))
+            pad_len = (-valid_T) % chunk_len
+            if pad_len:
+                idx_chunk = F.pad(idx_chunk, (0, pad_len), value=0)
+
+            slice_start = max(response_start, start)
+            slice_end = min(response_end, start + valid_T)
+            has_response_logits = slice_end > slice_start
+            grad_ctx = nullcontext() if has_response_logits and torch.is_grad_enabled() else torch.no_grad()
+            with grad_ctx:
+                hidden, shift_states, wkv_states = self.model.forward_infctx_chunk(
+                    idx_chunk,
+                    shift_states,
+                    wkv_states,
+                )
+                if has_response_logits:
+                    local_start = slice_start - start
+                    local_end = slice_end - start
+                    response_offset = slice_start - response_start
+                    response_labels = responses[:, response_offset : response_offset + (slice_end - slice_start)]
+                    response_logits = self.model.head(hidden[:, local_start:local_end])
+                    if getattr(response_logits, "device", None) is not None and response_logits.device.type == "cpu":
+                        log_probs = logprobs_from_logits_v2(logits=response_logits, labels=response_labels)
+                    else:
+                        log_probs = logprobs_from_logits(logits=response_logits, labels=response_labels)
+                    log_prob_chunks.append(log_probs)
+
+            shift_states = shift_states.detach()
+            wkv_states = wkv_states.detach()
+
+        if log_prob_chunks:
+            log_probs = torch.cat(log_prob_chunks, dim=1)
+        else:
+            log_probs = torch.empty(
+                responses.size(0),
+                0,
+                device=model_input_ids.device,
+                dtype=self._model_dtype() or torch.float32,
+            )
+        if int(log_probs.size(-1)) != response_length:
+            raise RuntimeError(
+                f"RWKV infctx chunked log-prob path produced {log_probs.size(-1)} tokens, "
+                f"expected {response_length}."
+            )
+        return build_verl_loss_model_output(log_probs=log_probs)
+
+    def _infctx_packed_log_prob_layout(
+        self,
+        *,
+        forward_batch: Any,
+        data: TensorDict,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        input_ids = forward_batch.input_ids
+        if not getattr(input_ids, "is_nested", False):
+            return None
+
+        offsets = input_ids.offsets().to(device=device, dtype=torch.long)
+        sequence_lens = offsets.diff()
+        response_mask = forward_batch.response_mask
+        if response_mask is None and "response_mask" in data:
+            response_mask = data["response_mask"]
+
+        if response_mask is not None:
+            response_lens = response_mask.to(device=device).sum(dim=-1).to(dtype=torch.long)
+        else:
+            response_ids = forward_batch.responses
+            if getattr(response_ids, "is_nested", False):
+                response_lens = response_ids.offsets().diff().to(device=device, dtype=torch.long)
+            elif hasattr(response_ids, "dim") and response_ids.dim() >= 2:
+                response_lens = torch.full_like(sequence_lens, int(response_ids.size(-1)))
+            else:
+                return None
+
+        if response_lens.numel() != sequence_lens.numel():
+            raise RuntimeError(
+                "RWKV infctx no-padding layout mismatch: "
+                f"{response_lens.numel()} response lengths for {sequence_lens.numel()} sequences."
+            )
+        prompt_lens = sequence_lens - response_lens
+        if torch.any(response_lens < 0) or torch.any(prompt_lens <= 0) or torch.any(response_lens > sequence_lens):
+            raise RuntimeError(
+                "RWKV infctx no-padding layout is invalid: "
+                f"prompt_lens={prompt_lens.tolist()}, response_lens={response_lens.tolist()}, "
+                f"sequence_lens={sequence_lens.tolist()}."
+            )
+        return offsets, sequence_lens, prompt_lens, response_lens
+
+    def _infctx_state_dtype(self) -> torch.dtype:
+        emb = getattr(self.model, "emb", None)
+        weight = getattr(emb, "weight", None)
+        dtype = getattr(weight, "dtype", None)
+        return dtype or self._model_dtype() or torch.float32
+
+    def _infctx_enabled(self) -> bool:
+        return bool(getattr(self.engine_config, "infctx", False))
+
+    def _infctx_chunk_ctx(self) -> int:
+        chunk_ctx = getattr(self.engine_config, "chunk_ctx", None)
+        if chunk_ctx is None:
+            raise RuntimeError("RWKV infctx mode requires engine_config.chunk_ctx.")
+        chunk_ctx = int(chunk_ctx)
+        if chunk_ctx <= 0:
+            raise RuntimeError("RWKV infctx mode requires chunk_ctx > 0.")
+        if chunk_ctx % self._rwkv_chunk_len() != 0:
+            raise RuntimeError("RWKV infctx chunk_ctx must be divisible by RWKV CUDA chunk length 16.")
+        return chunk_ctx
 
     def _move_data_to_model_device(self, data: TensorDict) -> TensorDict:
         device = self._model_device()

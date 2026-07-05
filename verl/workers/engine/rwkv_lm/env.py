@@ -33,12 +33,16 @@ RWKV_LM_ENV_KEYS = (
     "RWKV_HEAD_L2WRAP_CE_CHUNK",
     "RWKV_FLOAT_MODE",
     "RWKV_JIT_ON",
+    "RWKV_TRAIN_TYPE",
+    "RWKV_CHUNK_CTX",
 )
 
 
 def build_rwkv_lm_env(args: Any, extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build native ``RWKV_*`` env values from an rwkv-lm args namespace."""
 
+    train_type = str(getattr(args, "train_type", "none"))
+    jit_on = "0" if "deepspeed_stage_3" in str(args.strategy) else "1"
     env = {
         "RWKV_MY_TESTING": str(args.my_testing),
         "RWKV_KERNEL": str(args.kernel),
@@ -46,7 +50,9 @@ def build_rwkv_lm_env(args: Any, extra_env: Mapping[str, str] | None = None) -> 
         "RWKV_HEAD_SIZE": str(args.head_size),
         "RWKV_HEAD_L2WRAP_CE_CHUNK": str(args.head_chunk),
         "RWKV_FLOAT_MODE": str(args.precision),
-        "RWKV_JIT_ON": "0" if "deepspeed_stage_3" in str(args.strategy) else "1",
+        "RWKV_JIT_ON": jit_on,
+        "RWKV_TRAIN_TYPE": train_type,
+        "RWKV_CHUNK_CTX": str(getattr(args, "chunk_ctx", 0) or 0),
     }
     if extra_env:
         env.update({key: str(value) for key, value in extra_env.items()})

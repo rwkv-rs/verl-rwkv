@@ -33,6 +33,12 @@ from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
+from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_DEFAULT_STOP_TOKEN_IDS,
+    RWKV_DEFAULT_STOPS,
+    is_rwkv_model_config,
+)
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -40,6 +46,13 @@ from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.ngram_repetition import (
+    NGramRepetitionDetector,
+    consume_token_stream,
+    consume_until_repetition,
+    repetition_extra_fields,
+    vllm_repetition_detection_config,
+)
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
@@ -92,6 +105,33 @@ logger.setLevel(logging.INFO)
 
 
 RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
+
+
+def _rollout_output_kind(*, needs_generation_logprobs: bool, needs_prompt_logprobs: bool) -> RequestOutputKind:
+    if needs_generation_logprobs or needs_prompt_logprobs:
+        return RequestOutputKind.CUMULATIVE
+    return RequestOutputKind.DELTA
+
+
+def _apply_rwkv_default_stop_params(sampling_params: dict[str, Any], model_config: Any) -> None:
+    if not is_rwkv_model_config(model_config):
+        return
+    sampling_params.setdefault("stop", list(RWKV_DEFAULT_STOPS))
+    sampling_params.setdefault("stop_token_ids", list(RWKV_DEFAULT_STOP_TOKEN_IDS))
+
+
+def _token_to_bytes_getter(tokenizer: Any) -> Callable[[int], bytes] | None:
+    idx2token = getattr(tokenizer, "idx2token", None)
+    if idx2token is None:
+        return None
+
+    def token_to_bytes(token_id: int) -> bytes:
+        token = idx2token[int(token_id)]
+        if isinstance(token, bytes):
+            return token
+        return bytes(token)
+
+    return token_to_bytes
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -648,9 +688,12 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        generation_logprobs_requested = bool(sampling_params.pop("logprobs", False))
+        prompt_logprobs_requested = sampling_params.get("prompt_logprobs", None) is not None
+        sampling_params["logprobs"] = 0 if generation_logprobs_requested else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        _apply_rwkv_default_stop_params(sampling_params, self.model_config)
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
@@ -660,7 +703,17 @@ class vLLMHttpServer:
             extra_args["kv_transfer_params"] = kv_transfer_params
             sampling_params["extra_args"] = extra_args
 
+        sampling_params["output_kind"] = _rollout_output_kind(
+            needs_generation_logprobs=generation_logprobs_requested,
+            needs_prompt_logprobs=prompt_logprobs_requested,
+        )
+        sampling_params.setdefault(
+            "repetition_detection",
+            RepetitionDetectionParams(**vllm_repetition_detection_config()),
+        )
+        detect_rollout_repetition = sampling_params.get("repetition_detection") is not None
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        stream_is_cumulative = sampling_params.output_kind == RequestOutputKind.CUMULATIVE
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -697,10 +750,28 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-            # Get final response
-            final_res: Optional[RequestOutput] = None
-            async for output in generator:
-                final_res = output
+            async def abort_current_request() -> dict[str, Any]:
+                return await self.abort_request(request_id, reset_prefix_cache=False)
+
+            repetition_detector = None
+            if detect_rollout_repetition:
+                repetition_detector = NGramRepetitionDetector(
+                    token_to_bytes=_token_to_bytes_getter(self.model_config.tokenizer),
+                )
+                final_res, repetition_truncation_length, observed_token_ids = await consume_until_repetition(
+                    generator,
+                    get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],
+                    abort_request=abort_current_request,
+                    detector=repetition_detector,
+                    cumulative=stream_is_cumulative,
+                )
+            else:
+                final_res, observed_token_ids = await consume_token_stream(
+                    generator,
+                    get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],
+                    cumulative=stream_is_cumulative,
+                )
+                repetition_truncation_length = None
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
@@ -721,18 +792,69 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
-        token_ids = final_res.outputs[0].token_ids
+        finish_reason = final_res.outputs[0].finish_reason
+        stop_reason_raw = final_res.outputs[0].stop_reason
+        extra_fields["finish_reason"] = finish_reason
+        extra_fields["backend_stop_reason"] = stop_reason_raw
+        engine_repetition_truncated = (
+            finish_reason == "repetition" or stop_reason_raw == "repetition_detected"
+        )
+        original_response_length = (
+            len(observed_token_ids) if observed_token_ids else len(final_res.outputs[0].token_ids)
+        )
+        if repetition_truncation_length is not None:
+            assert repetition_detector is not None
+            token_ids = observed_token_ids[:repetition_truncation_length]
+            logger.info(
+                "Truncated request %s after repetition/anomaly detection: "
+                "reason=%s observed_length=%s truncation_length=%s",
+                request_id,
+                repetition_detector.matched_reason,
+                original_response_length,
+                repetition_truncation_length,
+            )
+            extra_fields.update(
+                repetition_extra_fields(
+                    truncated=True,
+                    truncation_length=repetition_truncation_length,
+                    original_response_length=original_response_length,
+                    matched_rule=repetition_detector.matched_rule,
+                    matched_reason=repetition_detector.matched_reason,
+                    matched_text_stats=repetition_detector.matched_text_stats
+                    or repetition_detector.last_text_stats,
+                )
+            )
+        else:
+            token_ids = observed_token_ids or final_res.outputs[0].token_ids
+            truncation_length = len(token_ids) if engine_repetition_truncated else None
+            extra_fields.update(
+                repetition_extra_fields(
+                    truncated=engine_repetition_truncated,
+                    truncation_length=truncation_length,
+                    original_response_length=original_response_length,
+                    matched_reason="engine_repetition" if engine_repetition_truncated else None,
+                    matched_text_stats=(
+                        repetition_detector.last_text_stats if repetition_detector is not None else None
+                    ),
+                )
+            )
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            log_probs = [
+                logprobs[token_ids[i]].logprob
+                for i, logprobs in enumerate(final_res.outputs[0].logprobs[: len(token_ids)])
+            ]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
+            if repetition_truncation_length is not None and routed_experts is not None:
+                routed_experts = routed_experts[: len(prompt_ids) + len(token_ids)]
 
         # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
+        if repetition_truncation_length is not None or engine_repetition_truncated:
+            stop_reason = "repetition_truncated"
+        elif finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
             stop_reason = "completed"

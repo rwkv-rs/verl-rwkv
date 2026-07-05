@@ -929,7 +929,21 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
+        reward_extra_keys = []
+        for d in data:
+            for key in d.meta_info.get("reward_extra_keys", []):
+                if key not in reward_extra_keys:
+                    reward_extra_keys.append(key)
+
+        non_tensor_batches = []
+        for d in data:
+            non_tensor_batch_item = dict(d.non_tensor_batch)
+            for key in reward_extra_keys:
+                if key not in non_tensor_batch_item:
+                    non_tensor_batch_item[key] = np.full((len(d),), None, dtype=object)
+            non_tensor_batches.append(non_tensor_batch_item)
+
+        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=non_tensor_batches)
         for key, val in non_tensor_batch.items():
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
@@ -946,6 +960,8 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        continue
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
@@ -956,6 +972,8 @@ class DataProto:
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
                 merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+            if reward_extra_keys:
+                merged_meta_info["reward_extra_keys"] = reward_extra_keys
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)

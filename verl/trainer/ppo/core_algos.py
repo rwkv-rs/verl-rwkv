@@ -377,6 +377,10 @@ def compute_maxrl_outcome_advantage(
     verl registry signature.
     """
     scores = token_level_rewards.sum(dim=-1)
+    # MaxRL's estimator is defined on binary success rewards. Reward managers
+    # such as DAPO may emit -1/0/1, so normalize the estimator input to
+    # success/failure before computing the per-prompt mean probability.
+    scores = (scores > 0).to(dtype=scores.dtype, device=scores.device)
 
     id2score = defaultdict(list)
     id2mean = {}

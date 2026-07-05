@@ -313,6 +313,37 @@ def test_maxrl_outcome_advantage_uses_group_mean_probability():
     assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_maxrl_outcome_advantage_treats_nonpositive_rewards_as_failures():
+    token_level_rewards = torch.tensor([[1.0], [-1.0], [0.0], [-1.0], [0.0], [0.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["a", "a", "a", "b", "b", "b"], dtype=object)
+
+    advantages, returns = compute_maxrl_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        epsilon=1e-6,
+    )
+
+    group_a_mean = 1.0 / 3.0
+    expected = torch.tensor(
+        [
+            [(1.0 - group_a_mean) / (group_a_mean + 1e-6)],
+            [(0.0 - group_a_mean) / (group_a_mean + 1e-6)],
+            [(0.0 - group_a_mean) / (group_a_mean + 1e-6)],
+            [0.0],
+            [0.0],
+            [0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    assert torch.isfinite(advantages).all()
+    assert advantages.abs().max() < 10.0
+    assert torch.allclose(advantages, expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_ray_trainer_compute_advantage_dispatches_maxrl():
     token_level_rewards = torch.tensor([[1.0], [0.0], [1.0], [1.0], [0.0], [0.0]], dtype=torch.float32)
     response_mask = torch.ones_like(token_level_rewards)

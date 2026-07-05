@@ -36,6 +36,9 @@ MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-7168}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 RWKV_USE_DYNAMIC_BSZ=${RWKV_USE_DYNAMIC_BSZ:-True}
+RWKV_CTX_LEN=${RWKV_CTX_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}
+RWKV_INFCTX=${RWKV_INFCTX:-False}
+RWKV_CHUNK_CTX=${RWKV_CHUNK_CTX:-}
 
 ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo}
 REWARD_MANAGER=${REWARD_MANAGER:-naive}
@@ -98,6 +101,7 @@ MODEL=(
 ACTOR=(
     actor@actor_rollout_ref.actor=rwkv_lm
     actor_rollout_ref.actor.engine.rwkv_lm_path="${RWKV_LM_PATH}"
+    actor_rollout_ref.actor.engine.ctx_len=${RWKV_CTX_LEN}
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE}
@@ -119,10 +123,23 @@ ACTOR=(
 REF=(
     ref@actor_rollout_ref.ref=rwkv_lm
     actor_rollout_ref.ref.engine.rwkv_lm_path="${RWKV_LM_PATH}"
+    actor_rollout_ref.ref.engine.ctx_len=${RWKV_CTX_LEN}
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE}
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${RWKV_USE_DYNAMIC_BSZ}
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
 )
+
+if [[ "${RWKV_INFCTX}" == "True" || "${RWKV_INFCTX}" == "true" || "${RWKV_INFCTX}" == "1" ]]; then
+    [[ -n "${RWKV_CHUNK_CTX}" ]] || { echo "RWKV_CHUNK_CTX is required when RWKV_INFCTX=${RWKV_INFCTX}"; exit 1; }
+    ACTOR+=(
+        actor_rollout_ref.actor.engine.infctx=True
+        actor_rollout_ref.actor.engine.chunk_ctx=${RWKV_CHUNK_CTX}
+    )
+    REF+=(
+        actor_rollout_ref.ref.engine.infctx=True
+        actor_rollout_ref.ref.engine.chunk_ctx=${RWKV_CHUNK_CTX}
+    )
+fi
 
 ROLLOUT=(
     actor_rollout_ref.hybrid_engine=False

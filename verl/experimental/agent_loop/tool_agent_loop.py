@@ -67,6 +67,7 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        validate: bool = False,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -76,6 +77,7 @@ class AgentData:
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
+        self.validate = validate
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -123,6 +125,7 @@ class ToolAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        validate = bool(kwargs.pop("__validate__", False))
         messages = list(kwargs["raw_prompt"])
 
         # extract multimodal inputs from messages
@@ -145,6 +148,7 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            validate=validate,
         )
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
@@ -218,6 +222,7 @@ class ToolAgentLoop(AgentLoopBase):
                 videos=agent_data.video_data,
                 audios=agent_data.audio_data,
                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
+                validate=agent_data.validate,
             )
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING

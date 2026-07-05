@@ -426,6 +426,33 @@ class RolloutMoELoadBalanceMetricsAccumulator:
         return metrics
 
 
+def _iter_non_tensor_values(batch: DataProto, key: str):
+    non_tensor_batch = getattr(batch, "non_tensor_batch", {}) or {}
+    if key not in non_tensor_batch:
+        return
+    for value in np.asarray(non_tensor_batch[key], dtype=object).reshape(-1):
+        if hasattr(value, "item"):
+            value = value.item()
+        yield value
+
+
+def _numeric_non_tensor_values(batch: DataProto, key: str) -> np.ndarray:
+    values: list[float] = []
+    for value in _iter_non_tensor_values(batch, key) or ():
+        if value is None:
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return np.asarray(values, dtype=np.float32)
+
+
+def _bool_non_tensor_values(batch: DataProto, key: str) -> np.ndarray:
+    values = [bool(value) for value in _iter_non_tensor_values(batch, key) or ()]
+    return np.asarray(values, dtype=np.bool_)
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -591,6 +618,79 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    repetition_truncated = _bool_non_tensor_values(batch, "repetition_truncated")
+    if repetition_truncated.size > 0:
+        metrics["response_repetition/truncated_ratio"] = float(np.mean(repetition_truncated.astype(np.float32)))
+        metrics["response_repetition/truncated_count"] = float(np.sum(repetition_truncated.astype(np.float32)))
+
+    matched_reasons = [str(value) for value in _iter_non_tensor_values(batch, "repetition_matched_reason") or () if value]
+    if matched_reasons:
+        reason_denominator = int(repetition_truncated.size) if repetition_truncated.size > 0 else len(matched_reasons)
+        for reason in sorted(set(matched_reasons)):
+            metric_name = reason.replace("/", "_")
+            metrics[f"response_repetition/matched_reason/{metric_name}_ratio"] = float(
+                matched_reasons.count(reason) / reason_denominator
+            )
+            metrics[f"response_repetition/matched_reason/{metric_name}_count"] = float(matched_reasons.count(reason))
+
+    original_response_length = _numeric_non_tensor_values(batch, "original_response_length")
+    if original_response_length.size > 0:
+        metrics["response_repetition/original_length_mean"] = float(np.mean(original_response_length))
+        metrics["response_repetition/original_length_max"] = float(np.max(original_response_length))
+
+    truncation_length = _numeric_non_tensor_values(batch, "repetition_truncation_length")
+    if truncation_length.size > 0:
+        metrics["response_repetition/truncation_length_mean"] = float(np.mean(truncation_length))
+        metrics["response_repetition/truncation_length_max"] = float(np.max(truncation_length))
+
+    zstd_ratio = _numeric_non_tensor_values(batch, "repetition_zstd_ratio")
+    if zstd_ratio.size > 0:
+        metrics["response_repetition/zstd_ratio_mean"] = float(np.mean(zstd_ratio))
+        metrics["response_repetition/zstd_ratio_min"] = float(np.min(zstd_ratio))
+        metrics["response_repetition/zstd_ratio_max"] = float(np.max(zstd_ratio))
+
+    zstd_window_ratio = _numeric_non_tensor_values(batch, "repetition_zstd_window_ratio")
+    if zstd_window_ratio.size > 0:
+        metrics["response_repetition/zstd_window_ratio_mean"] = float(np.mean(zstd_window_ratio))
+        metrics["response_repetition/zstd_window_ratio_min"] = float(np.min(zstd_window_ratio))
+        metrics["response_repetition/zstd_window_ratio_max"] = float(np.max(zstd_window_ratio))
+
+    suspicious_script_ratio = _numeric_non_tensor_values(batch, "repetition_suspicious_script_ratio")
+    if suspicious_script_ratio.size > 0:
+        metrics["response_repetition/suspicious_script_ratio_mean"] = float(np.mean(suspicious_script_ratio))
+        metrics["response_repetition/suspicious_script_ratio_max"] = float(np.max(suspicious_script_ratio))
+
+    script_window_suspicious_ratio = _numeric_non_tensor_values(
+        batch, "repetition_script_window_suspicious_ratio"
+    )
+    if script_window_suspicious_ratio.size > 0:
+        metrics["response_repetition/script_window_suspicious_ratio_mean"] = float(
+            np.mean(script_window_suspicious_ratio)
+        )
+        metrics["response_repetition/script_window_suspicious_ratio_max"] = float(
+            np.max(script_window_suspicious_ratio)
+        )
+
+    text_ngram_max_count = _numeric_non_tensor_values(batch, "repetition_text_ngram_max_count")
+    if text_ngram_max_count.size > 0:
+        metrics["response_repetition/text_ngram_max_count_mean"] = float(np.mean(text_ngram_max_count))
+        metrics["response_repetition/text_ngram_max_count_max"] = float(np.max(text_ngram_max_count))
+
+    reasoning_marker_count = _numeric_non_tensor_values(batch, "repetition_reasoning_marker_count")
+    if reasoning_marker_count.size > 0:
+        metrics["response_repetition/reasoning_marker_count_mean"] = float(np.mean(reasoning_marker_count))
+        metrics["response_repetition/reasoning_marker_count_max"] = float(np.max(reasoning_marker_count))
+
+    unclosed_think = _bool_non_tensor_values(batch, "repetition_unclosed_think_detected")
+    if unclosed_think.size > 0:
+        metrics["response_repetition/unclosed_think_ratio"] = float(np.mean(unclosed_think.astype(np.float32)))
+        metrics["response_repetition/unclosed_think_count"] = float(np.sum(unclosed_think.astype(np.float32)))
+
+    replacement_count = _numeric_non_tensor_values(batch, "repetition_replacement_count")
+    if replacement_count.size > 0:
+        metrics["response_repetition/replacement_count_mean"] = float(np.mean(replacement_count))
+        metrics["response_repetition/replacement_count_max"] = float(np.max(replacement_count))
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

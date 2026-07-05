@@ -37,6 +37,42 @@ def _mock_rlhf_dataset():
     return dataset
 
 
+def test_create_rl_dataset_uses_validation_chat_template_kwargs_for_eval(monkeypatch):
+    captured_configs = []
+
+    class FakeDataset:
+        def __init__(self, data_files, tokenizer, processor, config, max_samples=-1):
+            del data_files, tokenizer, processor, max_samples
+            captured_configs.append(config)
+
+    monkeypatch.setattr(
+        "verl.utils.dataset.rl_dataset.get_dataset_class",
+        lambda data_config: FakeDataset,
+    )
+
+    from verl.trainer.ppo.utils import create_rl_dataset
+
+    config = OmegaConf.create(
+        {
+            "apply_chat_template_kwargs": {
+                "rwkv_generation_prompt": "open_think",
+                "shared_key": "shared_value",
+            },
+            "val_apply_chat_template_kwargs": {
+                "rwkv_generation_prompt": "fake_think",
+            },
+        }
+    )
+
+    create_rl_dataset(["train.parquet"], config, tokenizer=None, processor=None, is_train=True)
+    create_rl_dataset(["validation.parquet"], config, tokenizer=None, processor=None, is_train=False)
+
+    assert captured_configs[0].apply_chat_template_kwargs.rwkv_generation_prompt == "open_think"
+    assert captured_configs[1].apply_chat_template_kwargs.rwkv_generation_prompt == "fake_think"
+    assert captured_configs[1].apply_chat_template_kwargs.shared_key == "shared_value"
+    assert config.apply_chat_template_kwargs.rwkv_generation_prompt == "open_think"
+
+
 def get_gsm8k_data():
     # prepare test dataset
     local_folder = os.path.expanduser("~/data/gsm8k/")

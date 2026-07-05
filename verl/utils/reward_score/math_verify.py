@@ -50,7 +50,7 @@ def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
     extracted_gold = parse(ground_truth_boxed, gold_targets)
     extracted_pred = parse(model_output, pred_targets)
     if extracted_gold and extracted_pred:
-        return max(1.0 if any(verify(g, p) for g in extracted_gold) else 0.0 for p in extracted_pred)
+        return max(1.0 if any(verify(g, p, strict=False) for g in extracted_gold) else 0.0 for p in extracted_pred)
     return 0.0
 
 

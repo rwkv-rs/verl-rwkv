@@ -40,6 +40,10 @@ class SamplingConfig(BaseConfig):
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    penalty_decay: float = 0.996
+    logprobs: Optional[bool] = None
     do_sample: bool = True
     n: int = 1
 
@@ -165,7 +169,9 @@ class RolloutConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    penalty_decay: float = 0.996
 
     # Whether to enable full determinism for reproducibility.
     full_determinism: bool = False

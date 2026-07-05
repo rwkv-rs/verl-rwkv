@@ -14,6 +14,8 @@
 
 from typing import Any
 
+from vllm.tokenizers.rwkv_defaults import render_rwkv_chat_template
+
 
 def _resolve_rwkv_tokenizer_cls(tokenizer_cls: type | None = None) -> type:
     if tokenizer_cls is not None:
@@ -71,6 +73,12 @@ class PickleableRWKVTokenizer:
     def encode(self, *args: Any, **kwargs: Any) -> list[int]:
         return list(self._tokenizer.encode(*args, **kwargs))
 
+    def batch_decode(self, sequences, **kwargs: Any) -> list[str]:
+        native_batch_decode = getattr(self._tokenizer, "batch_decode", None)
+        if callable(native_batch_decode):
+            return list(native_batch_decode(sequences, **kwargs))
+        return [self._tokenizer.decode(sequence, **kwargs) for sequence in sequences]
+
     def apply_chat_template(
         self,
         messages,
@@ -81,16 +89,33 @@ class PickleableRWKVTokenizer:
         **kwargs: Any,
     ):
         """Expose vLLM-RWKV's tokenizer through Verl's HF-style call shape."""
-        if tools:
-            raise ValueError("RWKV tokenizer chat template does not support tool schemas")
         try:
+            template_kwargs = {
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+            }
+            if tools is not None:
+                template_kwargs["tools"] = tools
+            if "rwkv_generation_prompt" in kwargs:
+                template_kwargs["rwkv_generation_prompt"] = kwargs[
+                    "rwkv_generation_prompt"
+                ]
+            if "add_special_tokens" in kwargs:
+                template_kwargs["add_special_tokens"] = kwargs["add_special_tokens"]
             output = self._tokenizer.apply_chat_template(
                 messages,
-                tokenize=tokenize,
-                add_generation_prompt=add_generation_prompt,
+                **template_kwargs,
             )
         except NotImplementedError:
-            output = self._plain_text_prompt(messages)
+            output = render_rwkv_chat_template(
+                list(messages),
+                tools,
+                add_generation_prompt=add_generation_prompt,
+                rwkv_generation_prompt=kwargs.get(
+                    "rwkv_generation_prompt",
+                    "open_think",
+                ),
+            )
             if tokenize:
                 output = self.encode(output)
         if not return_dict:
@@ -103,32 +128,6 @@ class PickleableRWKVTokenizer:
 
             result = {key: torch.tensor([value], dtype=torch.long) for key, value in result.items()}
         return result
-
-    def _plain_text_prompt(self, messages) -> str:
-        user_parts = []
-        for message in messages:
-            if isinstance(message, dict) and message.get("role") not in {None, "user"}:
-                continue
-            content = message.get("content", "") if isinstance(message, dict) else str(message)
-            text = self._content_to_text(content)
-            if text:
-                user_parts.append(text)
-        problem = "\n".join(user_parts)
-        return f"User: {problem}\n\nAssistant: <think"
-
-    def _content_to_text(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            segments = []
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "text":
-                        segments.append(str(item.get("text", "")))
-                else:
-                    segments.append(str(item))
-            return "".join(segments)
-        return str(content)
 
     def pad(
         self,

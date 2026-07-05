@@ -317,6 +317,7 @@ class TestComputeDataMetrics(unittest.TestCase):
             ),
             "values": torch.tensor([[0.9, 1.0], [1.1, 1.2]]),
         }
+        self.batch.non_tensor_batch = {}
 
     def test_compute_data_metrics_with_critic(self):
         """Test compute_data_metrics with critic enabled."""
@@ -348,6 +349,38 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+    def test_compute_data_metrics_reports_repetition_truncation(self):
+        self.batch.non_tensor_batch = {
+            "repetition_truncated": np.array([True, False], dtype=object),
+            "original_response_length": np.array([7168, 128], dtype=object),
+            "repetition_truncation_length": np.array([96, None], dtype=object),
+            "repetition_matched_reason": np.array(["zstd_low_ratio", None], dtype=object),
+            "repetition_zstd_ratio": np.array([0.12, None], dtype=object),
+            "repetition_zstd_window_ratio": np.array([0.32, None], dtype=object),
+            "repetition_suspicious_script_ratio": np.array([0.08, None], dtype=object),
+            "repetition_script_window_suspicious_ratio": np.array([0.11, None], dtype=object),
+            "repetition_replacement_count": np.array([3, None], dtype=object),
+            "repetition_text_ngram_max_count": np.array([12, None], dtype=object),
+            "repetition_reasoning_marker_count": np.array([31, None], dtype=object),
+            "repetition_unclosed_think_detected": np.array([True, None], dtype=object),
+        }
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertEqual(metrics["response_repetition/truncated_ratio"], 0.5)
+        self.assertEqual(metrics["response_repetition/truncated_count"], 1.0)
+        self.assertEqual(metrics["response_repetition/original_length_max"], 7168.0)
+        self.assertEqual(metrics["response_repetition/truncation_length_mean"], 96.0)
+        self.assertEqual(metrics["response_repetition/matched_reason/zstd_low_ratio_ratio"], 0.5)
+        self.assertAlmostEqual(metrics["response_repetition/zstd_ratio_mean"], 0.12)
+        self.assertAlmostEqual(metrics["response_repetition/zstd_window_ratio_mean"], 0.32)
+        self.assertAlmostEqual(metrics["response_repetition/suspicious_script_ratio_mean"], 0.08)
+        self.assertAlmostEqual(metrics["response_repetition/script_window_suspicious_ratio_mean"], 0.11)
+        self.assertEqual(metrics["response_repetition/text_ngram_max_count_max"], 12.0)
+        self.assertEqual(metrics["response_repetition/reasoning_marker_count_max"], 31.0)
+        self.assertEqual(metrics["response_repetition/unclosed_think_count"], 1.0)
+        self.assertEqual(metrics["response_repetition/replacement_count_max"], 3.0)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):
