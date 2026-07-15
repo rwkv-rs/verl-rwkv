@@ -345,9 +345,12 @@ class PPOTrainer(ABC):
         # perform validation before training
         if self.config.trainer.get("val_before_train", True):
             self.on_validate_begin()
-            val_metrics = self._validate()
+            initial_validation_timing = {}
+            with marked_timer("testing", initial_validation_timing, color="green"):
+                val_metrics = self._validate()
             self.on_validate_end()
             assert val_metrics, f"{val_metrics=}"
+            val_metrics["timing_s/testing"] = initial_validation_timing["testing"]
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
