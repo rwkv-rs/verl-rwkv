@@ -106,7 +106,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for i in range(n):
                 task = asyncio.create_task(
                     self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                        run_sampling_params,
+                        trajectory=trajectory,
+                        trace=trace,
+                        session_id=i,
+                        group_size=n,
+                        **prompt,
                     )
                 )
                 tasks.append(task)
@@ -171,6 +176,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["multi_modal_inputs"] = multi_modal_inputs
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+            rollout_metrics = field.get("metrics", {})
             tags.append(
                 {
                     "status": "success",
@@ -185,6 +191,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    "group_id": uid,
+                    "group_size": kwargs["group_size"],
+                    "response_index": session_id,
+                    "policy_version": field["extra_fields"].get("policy_version"),
+                    "weight_digest": field["extra_fields"].get("weight_digest"),
+                    "sampling_config_digest": field["extra_fields"].get("sampling_config_digest"),
+                    "request_sampling_digest": field["extra_fields"].get("request_sampling_digest"),
+                    "runtime_identity": field["extra_fields"].get("runtime_identity"),
+                    "generation_seconds": float(rollout_metrics.get("generate_sequences", 0.0)),
+                    "num_preempted": int(rollout_metrics.get("num_preempted", -1)),
                 }
             )
 

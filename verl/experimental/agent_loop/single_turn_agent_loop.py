@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.trainer.ppo.v1.policy_identity import IDENTITY_TAG_KEYS, canonical_digest
 from verl.utils.ngram_repetition import NGramRepetitionDetector, repetition_extra_fields
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -41,6 +42,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
         priority = int(priority)
         validate = bool(kwargs.pop("__validate__", False))
         messages = list(kwargs["raw_prompt"])
+        identity_values = {key: kwargs.get(key) for key in IDENTITY_TAG_KEYS}
+        present_identity_keys = {key for key, value in identity_values.items() if value is not None}
+        if present_identity_keys and present_identity_keys != set(IDENTITY_TAG_KEYS):
+            missing = sorted(set(IDENTITY_TAG_KEYS) - present_identity_keys)
+            raise RuntimeError(f"rollout request has partial behavior-policy identity: missing {missing}")
+        expected_policy_identity = identity_values if present_identity_keys else None
+        expected_sampling_digest = canonical_digest(sampling_params)
 
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -76,6 +84,8 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
+                expected_policy_identity=expected_policy_identity,
+                expected_sampling_digest=expected_sampling_digest,
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1

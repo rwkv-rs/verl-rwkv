@@ -118,4 +118,20 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # Strict-run provenance and artifact paths must cross the Ray driver/actor
+    # boundary. Keep this an allowlist so unrelated dotenv VLLM_* values cannot
+    # silently alter the execution contract.
+    for key in (
+        "REMOTE_RUN_LOG_DIR",
+        "VERL_FILE_LOGGER_PATH",
+        "VERL_POLICY_IDENTITY_LOG_PATH",
+        "HELICOPTER_RUN_ID",
+        "HELICOPTER_CHECKPOINT_SHA256",
+        "VLLM_RWKV7_WKV_MODE",
+        "HELICOPTER_RWKV_INIT_STAGGER_SECONDS",
+        "HELICOPTER_RWKV_INIT_CONCURRENCY",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

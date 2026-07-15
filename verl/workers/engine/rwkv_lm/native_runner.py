@@ -21,9 +21,12 @@ or training-step logic.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from importlib import metadata
 from types import ModuleType, SimpleNamespace
 from typing import Any
+
+import torch
 
 from .args import build_rwkv_lm_args
 from .checkpoint import load_rwkv_lm_checkpoint
@@ -123,7 +126,11 @@ class NativeRWKVLMRunner:
         model_module = self.model_module
         if model_module is None:
             model_module, _ = self.import_native_modules()
-        with rwkv_lm_env(self.args, extra_env=self._engine_native_env()):
+        direct_cuda_construction = (
+            not bool(getattr(self.engine_config, "param_offload", False)) and torch.cuda.is_available()
+        )
+        device_context = torch.device("cuda") if direct_cuda_construction else nullcontext()
+        with rwkv_lm_env(self.args, extra_env=self._engine_native_env()), device_context:
             model = model_module.RWKV(self.args)
         if self.args.load_model:
             model.load_state_dict(self.checkpoint_loader(self.args.load_model))

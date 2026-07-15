@@ -25,6 +25,33 @@ from .config import NsightToolConfig
 from .profile import DistProfiler, ProfilerConfig
 
 
+# ``nvtx`` only resolves a small built-in color set without matplotlib.  VERL
+# uses additional CSS color names (for example ``olive`` and ``brown``), and a
+# profiler run must not acquire a heavyweight plotting dependency merely to
+# encode an NVTX attribute.
+_NVTX_COLOR_HEX = {
+    "black": "#000000",
+    "blue": "#0000ff",
+    "brown": "#a52a2a",
+    "cyan": "#00ffff",
+    "gray": "#808080",
+    "green": "#008000",
+    "grey": "#808080",
+    "olive": "#808000",
+    "orange": "#ffa500",
+    "pink": "#ffc0cb",
+    "purple": "#800080",
+    "red": "#ff0000",
+    "yellow": "#ffff00",
+}
+
+
+def _normalize_color(color: Optional[str]) -> Optional[str]:
+    if color is None:
+        return None
+    return _NVTX_COLOR_HEX.get(color.lower(), color)
+
+
 def mark_start_range(
     message: Optional[str] = None,
     color: Optional[str] = None,
@@ -43,7 +70,7 @@ def mark_start_range(
         category (str, optional):
             The category of the range. Defaults to None.
     """
-    return nvtx.start_range(message=message, color=color, domain=domain, category=category)
+    return nvtx.start_range(message=message, color=_normalize_color(color), domain=domain, category=category)
 
 
 def mark_end_range(range_id: str) -> None:
@@ -77,7 +104,7 @@ def mark_annotate(
 
     def decorator(func):
         profile_message = message or func.__name__
-        return nvtx.annotate(profile_message, color=color, domain=domain, category=category)(func)
+        return nvtx.annotate(profile_message, color=_normalize_color(color), domain=domain, category=category)(func)
 
     return decorator
 

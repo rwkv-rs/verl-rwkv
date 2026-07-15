@@ -97,6 +97,38 @@ def test_native_runner_builds_upstream_model_and_loads_native_checkpoint():
     assert runner.state().model is model
 
 
+def test_native_runner_constructs_non_offloaded_model_directly_on_cuda(monkeypatch):
+    runner_module = _load_runner_module()
+    model_module = ModuleType("src.model")
+    model_module.RWKV = FakeRWKV
+    trainer_module = ModuleType("src.trainer")
+    entered_devices = []
+
+    class FakeDeviceContext:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            entered_devices.append(self.device)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def importer(module_name, **kwargs):
+        return model_module if module_name == "src.model" else trainer_module
+
+    monkeypatch.setattr(runner_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runner_module.torch, "device", FakeDeviceContext)
+    runner = runner_module.NativeRWKVLMRunner(
+        engine_config=SimpleNamespace(param_offload=False),
+        importer=importer,
+    )
+
+    runner.build_model()
+
+    assert entered_devices == ["cuda"]
+
+
 def test_default_import_rejects_wrong_pytorch_lightning_version(monkeypatch):
     runner_module = _load_runner_module()
 

@@ -1,0 +1,53 @@
+import os
+
+import ray
+
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+
+
+def test_strict_runtime_contract_crosses_ray_boundary_by_allowlist(monkeypatch):
+    forwarded = {
+        "REMOTE_RUN_LOG_DIR": "/workspace/.helicopter-dev/runs/test",
+        "VERL_FILE_LOGGER_PATH": "/workspace/.helicopter-dev/runs/test/metrics.jsonl",
+        "VERL_POLICY_IDENTITY_LOG_PATH": "/workspace/.helicopter-dev/runs/test/policy_identity.jsonl",
+        "HELICOPTER_RUN_ID": "run-1",
+        "HELICOPTER_CHECKPOINT_SHA256": "a" * 64,
+        "VLLM_RWKV7_WKV_MODE": "fp32io16",
+    }
+    for key, value in forwarded.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("VLLM_USE_V1", "1")
+    monkeypatch.setenv("VLLM_UNRELATED_DOTENV_VALUE", "must-not-forward")
+
+    runtime_env = get_ppo_ray_runtime_env()["env_vars"]
+
+    assert {key: runtime_env[key] for key in forwarded} == forwarded
+    assert "VLLM_USE_V1" not in runtime_env
+    assert "VLLM_UNRELATED_DOTENV_VALUE" not in runtime_env
+
+
+def test_strict_runtime_contract_is_visible_inside_ray_actor(monkeypatch):
+    forwarded = {
+        "REMOTE_RUN_LOG_DIR": "/workspace/.helicopter-dev/runs/test",
+        "VERL_FILE_LOGGER_PATH": "/workspace/.helicopter-dev/runs/test/metrics.jsonl",
+        "VERL_POLICY_IDENTITY_LOG_PATH": "/workspace/.helicopter-dev/runs/test/policy_identity.jsonl",
+        "HELICOPTER_RUN_ID": "run-actor",
+        "HELICOPTER_CHECKPOINT_SHA256": "b" * 64,
+        "VLLM_RWKV7_WKV_MODE": "fp32io16",
+    }
+    for key, value in forwarded.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("VLLM_USE_V1", raising=False)
+
+    @ray.remote
+    def capture_environment():
+        return {key: os.environ.get(key) for key in (*forwarded, "VLLM_USE_V1")}
+
+    ray.init(num_cpus=1, include_dashboard=False, runtime_env=get_ppo_ray_runtime_env())
+    try:
+        observed = ray.get(capture_environment.remote())
+    finally:
+        ray.shutdown()
+
+    assert {key: observed[key] for key in forwarded} == forwarded
+    assert observed["VLLM_USE_V1"] is None

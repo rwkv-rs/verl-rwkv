@@ -15,6 +15,8 @@
 import torch
 from tensordict import TensorDict
 
+from verl.utils import tensordict_utils as tu
+
 
 def test_rwkv_lm_engine_populates_verl_loss_global_batch_fields():
     from verl.workers.config import RWKVLMEngineConfig, RWKVLMOptimizerConfig
@@ -59,6 +61,45 @@ def test_rwkv_lm_engine_populates_verl_loss_global_batch_fields():
 
     assert engine.model.seen_input_shape == (2, 16)
     assert engine.model.weight.grad is not None
+
+
+def test_rwkv_lm_engine_padded_inference_returns_temperature_scaled_entropy():
+    from types import SimpleNamespace
+
+    from verl.workers.config import RWKVLMEngineConfig, RWKVLMOptimizerConfig
+    from verl.workers.engine.rwkv_lm import RWKVLMEngine
+
+    engine = RWKVLMEngine(
+        model_config=None,
+        engine_config=RWKVLMEngineConfig(),
+        optimizer_config=RWKVLMOptimizerConfig(),
+        checkpoint_config=None,
+    )
+    logits = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 1.0, -2.0],
+                [2.0, 0.0, -1.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ]
+    )
+    responses = torch.tensor([[0, 1]])
+    data = TensorDict({}, batch_size=[1])
+    tu.assign_non_tensor_data(data, "calculate_entropy", True)
+    tu.assign_non_tensor_data(data, "temperature", 2.0)
+
+    output = engine._build_model_output(
+        logits,
+        SimpleNamespace(input_ids=torch.tensor([[4, 5, 0, 1]]), responses=responses),
+        data,
+    )
+
+    expected_logits = logits[:, 1:3] / 2.0
+    expected_entropy = torch.distributions.Categorical(logits=expected_logits).entropy()
+    assert torch.allclose(output["entropy"], expected_entropy)
+    assert output["log_probs"].shape == responses.shape
 
 
 def test_rwkv_lm_engine_uses_infctx_sequence_forward_when_enabled():
@@ -162,9 +203,13 @@ def test_rwkv_lm_engine_infctx_chunks_response_log_probs_and_detaches_state():
         },
         batch_size=[1],
     )
+    tu.assign_non_tensor_data(data, "calculate_entropy", True)
+    tu.assign_non_tensor_data(data, "temperature", 2.0)
 
     def loss_function(model_output, data, dp_group):
         assert tuple(model_output["log_probs"].shape) == (1, 40)
+        assert tuple(model_output["entropy"].shape) == (1, 40)
+        assert torch.isfinite(model_output["entropy"]).all()
         return -model_output["log_probs"].sum(), {}
 
     engine.forward_backward_batch(data, loss_function=loss_function)
@@ -251,11 +296,18 @@ def test_rwkv_lm_engine_infctx_chunked_output_satisfies_no_padding_loss_contract
         batch_size=[2],
     )
     data = left_right_2_no_padding(data)
+    tu.assign_non_tensor_data(data, "calculate_entropy", True)
+    tu.assign_non_tensor_data(data, "temperature", 2.0)
 
     def loss_function(model_output, data, dp_group):
         log_probs = no_padding_2_padding(model_output["log_probs"], data)
+        entropy = no_padding_2_padding(model_output["entropy"], data)
         assert tuple(log_probs.shape) == (2, 8)
-        assert log_probs.dtype == torch.bfloat16
+        assert tuple(entropy.shape) == (2, 8)
+        # Behavior-policy probabilities use the same FP32 log-softmax
+        # reduction as vLLM even when model logits are BF16.
+        assert log_probs.dtype == torch.float32
+        assert torch.isfinite(entropy[data["response_mask"].bool()]).all()
         return -log_probs[data["response_mask"].bool()].sum(), {}
 
     engine.forward_backward_batch(data, loss_function=loss_function)
@@ -331,6 +383,7 @@ def test_rwkv_lm_engine_honors_static_micro_batch_size():
     assert loss_batch_sizes == [1, 1, 1, 1]
     assert output["loss"] == [1.0, 1.0, 1.0, 1.0]
     assert output["metrics"]["loss_batch_size"] == [1, 1, 1, 1]
+    assert output["metrics"]["actual_micro_batches"] == [4]
     assert isinstance(output["metrics"]["metric_batch_size"], Metric)
     assert output["metrics"]["metric_batch_size"].aggregate() == 1.0
     assert engine.model.weight.grad.item() == 4.0
@@ -405,6 +458,6 @@ def test_rwkv_lm_engine_averages_gradients_before_optimizer_step(monkeypatch):
     assert len(all_reduce_calls) == 1
     assert all_reduce_calls[0][1] is transformer_impl.torch.distributed.ReduceOp.SUM
     assert all_reduce_calls[0][2] is fake_group
-    torch.testing.assert_close(model.weight.grad, torch.tensor([[5.0]]))
+    assert model.weight.grad is None
     torch.testing.assert_close(model.weight, torch.tensor([[5.0]]))
     torch.testing.assert_close(grad_norm, torch.tensor(5.0))

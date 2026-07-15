@@ -473,6 +473,7 @@ class PPOTrainer(ABC):
             )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            self.on_batch_prepared(batch)
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
@@ -558,6 +559,10 @@ class PPOTrainer(ABC):
     @abstractmethod
     def on_sample_end(self):
         """Called after sampling a batch from replay buffer."""
+        return
+
+    def on_batch_prepared(self, batch: KVBatchMeta):
+        """Validate a sampled batch before reward, policy loss, or optimizer work."""
         return
 
     # ------------------------------ common methods ------------------------------
@@ -1260,7 +1265,17 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
-        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
+        rollout_metadata = self.get_rollout_metadata()
+        for key, value in rollout_metadata.items():
+            tu.assign_non_tensor_data(batch, key, value)
+
+        prompt_tag = {
+            "is_prompt": True,
+            "status": "pending",
+            "global_steps": self.global_steps,
+            **rollout_metadata,
+        }
+        tags = [dict(prompt_tag) for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(
                 keys=list(batch["uid"]),
@@ -1286,6 +1301,10 @@ class PPOTrainer(ABC):
         """Add one training batch to the AgentLoopManager."""
         batch = self._next_train_batch()
         self._submit_batch_to_rollout(batch)
+
+    def get_rollout_metadata(self) -> dict[str, Any]:
+        """Return immutable metadata attached to every request in the next rollout."""
+        return {}
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
         """Compute the reward score with a colocated reward model."""
@@ -1628,7 +1647,10 @@ class PPOTrainer(ABC):
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
-        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+        batch_tags = batch.tags
+        non_padding_mask = np.array(
+            [not tag.get("is_padding", False) for tag in batch_tags], dtype=bool
+        )
         fields = [
             "prompts",
             "responses",
@@ -1695,6 +1717,79 @@ class PPOTrainer(ABC):
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        actual_samples = int(non_padding_mask.sum())
+        actual_prompt_tokens = int(prompt_length[non_padding_mask].sum().item()) if actual_samples else 0
+        actual_response_tokens = int(response_length[non_padding_mask].sum().item()) if actual_samples else 0
+        actual_total_tokens = actual_prompt_tokens + actual_response_tokens
+        actual_policy_loss_tokens = (
+            int(metrics_batch.batch["response_mask"].sum().item()) if actual_samples else 0
+        )
+        metrics.update(
+            {
+                "training/actual_samples": actual_samples,
+                "training/actual_prompt_tokens": actual_prompt_tokens,
+                "training/actual_response_tokens": actual_response_tokens,
+                "training/actual_total_tokens": actual_total_tokens,
+                "training/actual_policy_loss_tokens": actual_policy_loss_tokens,
+            }
+        )
+        for stage, seconds, tokens in (
+            ("rollout", timing_raw.get("gen"), actual_response_tokens),
+            ("train", timing_raw.get("update_actor"), actual_policy_loss_tokens),
+            ("full_step", timing_raw.get("step"), actual_total_tokens),
+        ):
+            if seconds is not None and seconds > 0:
+                metrics[f"throughput/{stage}_tokens_per_second"] = tokens / seconds
+                metrics[f"throughput/{stage}_samples_per_second"] = actual_samples / seconds
+                metrics[f"timing/{stage}_seconds"] = seconds
+
+        # ``batch`` above is intentionally replaced by the metric DataProto;
+        # keep using the original TransferQueue tags captured before that
+        # conversion for strict policy identity and rollout-tail metrics.
+        identity_tags = [
+            tag for tag in batch_tags if not tag.get("is_padding", False)
+        ]
+        if identity_tags and all(tag.get("policy_version") is not None for tag in identity_tags):
+            policy_versions = {tag["policy_version"] for tag in identity_tags}
+            weight_digests = {tag["weight_digest"] for tag in identity_tags}
+            sampling_digests = {tag["sampling_config_digest"] for tag in identity_tags}
+            runtime_identities = {tag["runtime_identity"] for tag in identity_tags}
+            metrics.update(
+                {
+                    "training/on_policy/policy_version": next(iter(policy_versions)),
+                    "training/on_policy/version_count": len(policy_versions),
+                    "training/on_policy/weight_digest_count": len(weight_digests),
+                    "training/on_policy/sampling_config_count": len(sampling_digests),
+                    "training/on_policy/runtime_identity_count": len(runtime_identities),
+                }
+            )
+        generation_seconds = [float(tag.get("generation_seconds", 0.0)) for tag in identity_tags]
+        if generation_seconds:
+            group_completion: dict[str, float] = {}
+            for tag, duration in zip(identity_tags, generation_seconds, strict=True):
+                group_id = str(tag.get("group_id"))
+                group_completion[group_id] = max(group_completion.get(group_id, 0.0), duration)
+            completion_values = sorted(group_completion.values())
+            p95_index = max(0, math.ceil(len(completion_values) * 0.95) - 1)
+            preemptions = [int(tag.get("num_preempted", -1)) for tag in identity_tags]
+            known_preemptions = [value for value in preemptions if value >= 0]
+            metrics.update(
+                {
+                    "training/rollout_request_generation_seconds/min": min(generation_seconds),
+                    "training/rollout_request_generation_seconds/max": max(generation_seconds),
+                    "training/rollout_group_completion_seconds/min": min(completion_values),
+                    "training/rollout_group_completion_seconds/p95": completion_values[p95_index],
+                    "training/rollout_group_completion_seconds/max": max(completion_values),
+                    "training/rollout_group_tail_seconds": max(completion_values) - min(completion_values),
+                    "training/rollout_preemptions": sum(known_preemptions) if known_preemptions else -1,
+                    "training/rollout_train_overlap_seconds": 0.0,
+                    "training/rollout_effective_concurrency": (
+                        sum(generation_seconds) / timing_raw["gen"]
+                        if timing_raw.get("gen", 0) > 0
+                        else 0.0
+                    ),
+                }
+            )
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 

@@ -43,6 +43,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
+from verl.trainer.ppo.v1.policy_identity import canonical_digest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -80,6 +81,15 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(importlib.metadata.version("vllm"))
 _RESET_PREFIX_CACHE_KWARGS = build_vllm_prefix_cache_reset_kwargs(_VLLM_VERSION)
+
+
+def effective_sampling_digest(sampling_params: SamplingParams) -> str:
+    """Digest every normalized vLLM SamplingParams field actually sent to the engine."""
+
+    fields = getattr(sampling_params, "__struct_fields__", ())
+    if not fields:
+        raise RuntimeError("vLLM SamplingParams does not expose its normalized fields")
+    return canonical_digest({field: getattr(sampling_params, field) for field in fields})
 
 
 if _VLLM_VERSION > version.parse("0.11.0"):
@@ -264,8 +274,12 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        self.cuda_visible_devices = cuda_visible_devices
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self.behavior_policy_identity = None
+        self.weight_update_state = "uninitialized"
+        self.weight_update_failure = None
         self._warned_missing_spec_decode_stats = False
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
@@ -314,6 +328,31 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    def get_runtime_metadata(self) -> dict[str, Any]:
+        context = ray.get_runtime_context()
+        tokenizer_mode = self.config.engine_kwargs.get("vllm", {}).get("tokenizer_mode")
+        return {
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "node_id": str(context.get_node_id()),
+            "actor_id": str(context.get_actor_id()),
+            "actor_name": context.get_actor_name(),
+            "pid": os.getpid(),
+            "cuda_visible_devices": self.cuda_visible_devices.split(","),
+            "http_address": self._server_address,
+            "http_port": self._server_port,
+            "master_port": self._master_port,
+            "dp_rpc_port": self._dp_rpc_port,
+            "dp_master_port": self._dp_master_port,
+            "capacity": {
+                "capacity_mode": "recurrent-state-no-kv-cache" if tokenizer_mode == "rwkv" else "kv-cache",
+                "kv_cache_applicable": tokenizer_mode != "rwkv",
+                "max_num_seqs": int(self.config.max_num_seqs),
+                "max_num_batched_tokens": int(self.config.max_num_batched_tokens),
+                "gpu_memory_utilization": float(self.config.gpu_memory_utilization),
+            },
+        }
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -635,12 +674,19 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
+        expected_policy_identity: Optional[dict[str, Any]] = None,
+        expected_sampling_digest: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        if self.weight_update_state != "active":
+            raise RuntimeError(
+                "rollout server cannot generate while weight publication state is "
+                f"{self.weight_update_state!r}"
+            )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -651,9 +697,26 @@ class vLLMHttpServer:
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
+                expected_policy_identity=expected_policy_identity,
+                expected_sampling_digest=expected_sampling_digest,
+            )
+        prompt_ids = normalize_token_ids(prompt_ids)
+        requested_sampling_digest = canonical_digest(sampling_params)
+        if expected_sampling_digest is not None and requested_sampling_digest != expected_sampling_digest:
+            raise RuntimeError(
+                "rollout request sampling digest changed before server execution: "
+                f"expected={expected_sampling_digest} actual={requested_sampling_digest}"
             )
 
-        prompt_ids = normalize_token_ids(prompt_ids)
+        if expected_policy_identity is not None:
+            if self.behavior_policy_identity is None:
+                raise RuntimeError("rollout server has no published behavior-policy identity")
+            actual = {key: self.behavior_policy_identity.get(key) for key in expected_policy_identity}
+            if actual != expected_policy_identity:
+                raise RuntimeError(
+                    "rollout request behavior-policy identity does not match the loaded server policy: "
+                    f"expected={expected_policy_identity} actual={actual}"
+                )
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
@@ -713,6 +776,7 @@ class vLLMHttpServer:
         )
         detect_rollout_repetition = sampling_params.get("repetition_detection") is not None
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        request_sampling_digest = effective_sampling_digest(sampling_params)
         stream_is_cumulative = sampling_params.output_kind == RequestOutputKind.CUMULATIVE
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -774,7 +838,13 @@ class vLLMHttpServer:
                 repetition_truncation_length = None
             assert final_res is not None
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {
+            "global_steps": self.global_steps,
+            "requested_sampling_digest": requested_sampling_digest,
+            "request_sampling_digest": request_sampling_digest,
+        }
+        if self.behavior_policy_identity is not None:
+            extra_fields.update(self.behavior_policy_identity)
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -906,6 +976,8 @@ class vLLMHttpServer:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
+        expected_policy_identity: Optional[dict[str, Any]] = None,
+        expected_sampling_digest: Optional[str] = None,
     ) -> TokenOutput:
         """Run prefill locally, then decode on a selected peer."""
         decode_peer = self._select_decode_peer()
@@ -934,6 +1006,7 @@ class vLLMHttpServer:
             mm_processor_kwargs=mm_processor_kwargs,
             priority=priority,
             kv_transfer_params=prefill_kv_params,
+            expected_policy_identity=expected_policy_identity,
         )
         if is_mooncake:
             # Mooncake does not return decode params from the prefill leg.
@@ -960,6 +1033,8 @@ class vLLMHttpServer:
             mm_processor_kwargs=mm_processor_kwargs,
             priority=priority,
             kv_transfer_params=decode_kv_params,
+            expected_policy_identity=expected_policy_identity,
+            expected_sampling_digest=expected_sampling_digest,
         )
 
     async def wake_up(self, tags: list[str] | None = None):
@@ -973,8 +1048,10 @@ class vLLMHttpServer:
             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
             await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            # Directly call engine to wake up without sync weights.
-            await self.engine.wake_up(tags=self._get_wake_up_tags())
+            # Preserve the two-phase memory lifecycle: restore the discarded
+            # weight storage first, publish the replacement weights, and only
+            # then restore the request cache.
+            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
@@ -987,12 +1064,32 @@ class vLLMHttpServer:
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
-        if self.rollout_mode == RolloutMode.HYBRID:
-            await self._sleep_hybrid()
-        elif self.rollout_mode == RolloutMode.COLOCATED:
-            await self.engine.sleep(level=1)
-        elif self.rollout_mode == RolloutMode.STANDALONE:
+        if self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+            return
+
+        if self.weight_update_state in {"updating", "poisoned"}:
+            raise RuntimeError(
+                "cannot sleep rollout server while weight publication state is "
+                f"{self.weight_update_state!r}"
+            )
+        # vLLM level-2 wake remaps empty weight storage.  Hide the published
+        # identity before sleeping so no request can observe sleeping or empty
+        # tensors before the next complete actor refresh.
+        self.behavior_policy_identity = None
+        self.weight_update_failure = None
+        self.weight_update_state = "sleeping"
+        try:
+            if self.rollout_mode == RolloutMode.HYBRID:
+                await self._sleep_hybrid()
+            elif self.rollout_mode == RolloutMode.COLOCATED:
+                # Full-weight colocated training republishes every actor tensor
+                # before the next rollout. Level 2 can therefore discard the old
+                # inference weights while optimizer state is materialized.
+                await self._sleep_full_weight_sync()
+        except BaseException as exc:
+            await self.poison_weight_update(f"sleep failed: {exc!r}")
+            raise
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -1033,6 +1130,53 @@ class vLLMHttpServer:
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
+
+    async def stage_behavior_policy_identity(self, policy_identity: dict[str, Any]):
+        """Stage identity after weights finish, but before cache wake completes."""
+        if self.weight_update_state != "updating":
+            raise RuntimeError(
+                "cannot stage behavior-policy identity while weight update state is "
+                f"{self.weight_update_state!r}"
+            )
+        self.behavior_policy_identity = dict(policy_identity)
+        self.weight_update_failure = None
+        self.weight_update_state = "weights_ready"
+
+    async def begin_weight_update(self):
+        """Hide the old identity before any live tensor can be overwritten."""
+        if self.weight_update_state == "poisoned":
+            raise RuntimeError(
+                "rollout server is poisoned by a failed weight update and must reload"
+            )
+        if self.weight_update_state == "updating":
+            raise RuntimeError("rollout server weight update is already active")
+        self.behavior_policy_identity = None
+        self.weight_update_failure = None
+        self.weight_update_state = "updating"
+
+    async def finish_weight_update_without_identity(self):
+        """Stage a non-strict update while keeping identity metadata absent."""
+        if self.weight_update_state != "updating":
+            raise RuntimeError(
+                "cannot finish weight update while state is "
+                f"{self.weight_update_state!r}"
+            )
+        self.weight_update_state = "weights_ready"
+
+    async def activate_weight_update(self):
+        """Allow generation only after weights and request cache are both ready."""
+        if self.weight_update_state != "weights_ready":
+            raise RuntimeError(
+                "cannot activate rollout weights while state is "
+                f"{self.weight_update_state!r}"
+            )
+        self.weight_update_state = "active"
+
+    async def poison_weight_update(self, reason: str):
+        """Permanently reject generation after a partial in-place update."""
+        self.behavior_policy_identity = None
+        self.weight_update_failure = str(reason)
+        self.weight_update_state = "poisoned"
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
@@ -1295,8 +1439,8 @@ class vLLMHttpServer:
         """Return the tags passed to engine.wake_up(). Default includes kv_cache."""
         return ["kv_cache", "weights"]
 
-    async def _sleep_hybrid(self):
-        """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
+    async def _sleep_full_weight_sync(self):
+        """Sleep before a full actor-weight refresh.
 
         Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
         that sleep is properly propagated to all data-parallel worker processes.
@@ -1321,6 +1465,11 @@ class vLLMHttpServer:
         await self.engine.sleep(level=sleep_level)
         if _VLLM_VERSION >= version.parse("0.17.0"):
             await self.engine.reset_encoder_cache()
+
+    async def _sleep_hybrid(self):
+        """Backward-compatible entry point for hybrid full-weight sleep."""
+
+        await self._sleep_full_weight_sync()
 
 
 class vLLMReplica(RolloutReplica):
@@ -1416,6 +1565,9 @@ class vLLMReplica(RolloutReplica):
 
         # get http server address from first server
         server_address, server_port = await self.servers[0].get_server_address.remote()
+        self.runtime_metadata = await asyncio.gather(
+            *[server.get_runtime_metadata.remote() for server in self.servers]
+        )
         self._server_handle = self.servers[0]
         self._server_address = (
             f"[{server_address}]:{server_port}"

@@ -21,6 +21,27 @@ from verl.utils.profiler.config import NsightToolConfig, ProfilerConfig
 from verl.utils.profiler.profile import DistProfiler
 
 
+class TestNvtxColors(unittest.TestCase):
+    def test_extended_named_colors_do_not_require_matplotlib(self):
+        from verl.utils.profiler.nvtx_profile import mark_annotate, mark_start_range
+
+        with patch("verl.utils.profiler.nvtx_profile.nvtx.start_range") as mock_start:
+            mark_start_range(message="ref", color="olive")
+            mock_start.assert_called_once_with(message="ref", color="#808000", domain=None, category=None)
+
+        with patch("verl.utils.profiler.nvtx_profile.nvtx.annotate") as mock_annotate:
+            decorator = mark_annotate(message="adv", color="brown")
+            decorator(lambda: None)
+            mock_annotate.assert_called_once_with("adv", color="#a52a2a", domain=None, category=None)
+
+    def test_hex_and_unknown_colors_are_preserved(self):
+        from verl.utils.profiler.nvtx_profile import _normalize_color
+
+        self.assertEqual(_normalize_color("#123456"), "#123456")
+        self.assertEqual(_normalize_color("custom-color"), "custom-color")
+        self.assertIsNone(_normalize_color(None))
+
+
 class TestProfilerConfig(unittest.TestCase):
     def test_config_init(self):
         import os
