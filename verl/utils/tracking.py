@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from contextlib import contextmanager
 from enum import Enum
 from functools import partial
@@ -418,9 +419,14 @@ class FileLogger:
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
         print(f"Creating file logger at {os.path.abspath(self.filepath)}")
         self.fp = open(self.filepath, "wb", buffering=0)
+        self.started_monotonic = time.monotonic()
 
     def log(self, data, step):
-        data = {"step": step, "data": data}
+        data = {
+            "step": step,
+            "elapsed_seconds": time.monotonic() - self.started_monotonic,
+            "data": data,
+        }
         self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
 
     def finish(self):
