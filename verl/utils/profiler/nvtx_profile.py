@@ -24,7 +24,6 @@ from verl.plugin.platform import get_platform
 from .config import NsightToolConfig
 from .profile import DistProfiler, ProfilerConfig
 
-
 # ``nvtx`` only resolves a small built-in color set without matplotlib.  VERL
 # uses additional CSS color names (for example ``olive`` and ``brown``), and a
 # profiler run must not acquire a heavyweight plotting dependency merely to
