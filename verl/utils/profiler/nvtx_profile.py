@@ -29,27 +29,27 @@ from .profile import DistProfiler, ProfilerConfig
 # uses additional CSS color names (for example ``olive`` and ``brown``), and a
 # profiler run must not acquire a heavyweight plotting dependency merely to
 # encode an NVTX attribute.
-_NVTX_COLOR_HEX = {
-    "black": "#000000",
-    "blue": "#0000ff",
-    "brown": "#a52a2a",
-    "cyan": "#00ffff",
-    "gray": "#808080",
-    "green": "#008000",
-    "grey": "#808080",
-    "olive": "#808000",
-    "orange": "#ffa500",
-    "pink": "#ffc0cb",
-    "purple": "#800080",
-    "red": "#ff0000",
-    "yellow": "#ffff00",
+_NVTX_COLOR_RGB = {
+    "black": 0x000000,
+    "blue": 0x0000FF,
+    "brown": 0xA52A2A,
+    "cyan": 0x00FFFF,
+    "gray": 0x808080,
+    "green": 0x008000,
+    "grey": 0x808080,
+    "olive": 0x808000,
+    "orange": 0xFFA500,
+    "pink": 0xFFC0CB,
+    "purple": 0x800080,
+    "red": 0xFF0000,
+    "yellow": 0xFFFF00,
 }
 
 
-def _normalize_color(color: Optional[str]) -> Optional[str]:
+def _normalize_color(color: Optional[str]) -> Optional[str | int]:
     if color is None:
         return None
-    return _NVTX_COLOR_HEX.get(color.lower(), color)
+    return _NVTX_COLOR_RGB.get(color.lower(), color)
 
 
 def mark_start_range(
