@@ -355,6 +355,7 @@ class PPOTrainer(ABC):
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
+                self.logger.finish()
                 return
 
         current_epoch = self.global_steps // self.steps_per_epoch
@@ -427,14 +428,17 @@ class PPOTrainer(ABC):
             SkipManager.set_step(self.global_steps)
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
             if is_last_step:
+                self.on_train_end()
                 self._shutdown_dump_executor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
+                self.logger.finish()
                 return
 
         self.on_train_end()
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
+        self.logger.finish()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         train_batch_size = self.config.data.train_batch_size

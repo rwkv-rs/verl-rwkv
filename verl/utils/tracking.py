@@ -59,6 +59,7 @@ class Tracking:
     ]
 
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
+        self._finished = False
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -191,7 +192,11 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def __del__(self):
+    def finish(self):
+        """Flush every tracking backend exactly once."""
+        if self._finished:
+            return
+        self._finished = True
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
         if "swanlab" in self.logger:
@@ -338,6 +343,12 @@ class RLInsightLogger:
             cls._registered_metrics.add(metric_key)
         except Exception:
             logger.exception("[rl-insight] Failed to register metrics endpoint")
+
+    def __del__(self):
+        try:
+            self.finish()
+        except Exception:
+            logger.exception("Failed to finish tracking backends during object cleanup")
 
 
 class ClearMLLogger:
