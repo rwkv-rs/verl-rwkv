@@ -255,3 +255,24 @@ def test_agent_loop_training_sampling_params_keep_rollout_logprobs():
     sampling_params = build_agent_loop_sampling_params(config, validate=False)
 
     assert sampling_params["logprobs"] is True
+
+
+def test_agent_loop_fixed_length_training_disables_repetition_abort():
+    config = OmegaConf.create(
+        {
+            "temperature": 1.0,
+            "top_p": 0.8,
+            "top_k": 32,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "penalty_decay": 0.996,
+            "calculate_log_probs": True,
+            "ignore_eos": True,
+            "val_kwargs": {},
+        }
+    )
+
+    sampling_params = build_agent_loop_sampling_params(config, validate=False)
+
+    assert sampling_params["logprobs"] is True
+    assert sampling_params["repetition_detection"] is None

@@ -98,8 +98,10 @@ def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str
         penalty_decay=sampling_value(sampling_config, "penalty_decay", RAPID_PENALTY_DECAY_DEFAULT),
         logprobs=logprobs,
     )
-    if validate:
-        # Match offline eval: validation should not add rollout-only repetition aborts.
+    if validate or sampling_value(config, "ignore_eos", False):
+        # Validation must match offline eval. Fixed-length training rollouts must
+        # also disable repetition aborts: ignore_eos=True is an exact-length
+        # contract, so neither EOS nor the repetition detector may stop early.
         sampling_params["repetition_detection"] = None
     return sampling_params
 
