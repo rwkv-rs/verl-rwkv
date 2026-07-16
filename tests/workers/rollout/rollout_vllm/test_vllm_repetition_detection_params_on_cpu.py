@@ -101,6 +101,14 @@ def test_rollout_server_keeps_explicit_rwkv_stop_params():
     assert sampling_params == {"stop": [], "stop_token_ids": [123]}
 
 
+def test_rollout_server_skips_rwkv_default_stops_when_ignoring_eos():
+    sampling_params: dict[str, Any] = {"ignore_eos": True}
+
+    _apply_rwkv_default_stop_params(sampling_params, _ModelConfig())
+
+    assert sampling_params == {"ignore_eos": True}
+
+
 def test_rollout_server_does_not_apply_rwkv_stop_params_to_other_models():
     sampling_params: dict[str, Any] = {}
 

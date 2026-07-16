@@ -126,6 +126,8 @@ def _rollout_output_kind(*, needs_generation_logprobs: bool, needs_prompt_logpro
 def _apply_rwkv_default_stop_params(sampling_params: dict[str, Any], model_config: Any) -> None:
     if not is_rwkv_model_config(model_config):
         return
+    if sampling_params.get("ignore_eos", False):
+        return
     sampling_params.setdefault("stop", list(RWKV_DEFAULT_STOPS))
     sampling_params.setdefault("stop_token_ids", list(RWKV_DEFAULT_STOP_TOKEN_IDS))
 
