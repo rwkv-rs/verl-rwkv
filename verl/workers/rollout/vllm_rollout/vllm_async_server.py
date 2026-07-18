@@ -13,10 +13,12 @@
 # limitations under the License.
 import argparse
 import asyncio
+import importlib.metadata
 import inspect
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Callable, Optional
@@ -31,7 +33,12 @@ from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
-from vllm.outputs import RequestOutput
+from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
+from vllm.tokenizers.rwkv_defaults import (
+    RWKV_DEFAULT_STOP_TOKEN_IDS,
+    RWKV_DEFAULT_STOPS,
+    is_rwkv_model_config,
+)
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -39,12 +46,25 @@ from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.ngram_repetition import (
+    NGramRepetitionDetector,
+    consume_token_stream,
+    consume_until_repetition,
+    repetition_extra_fields,
+    vllm_repetition_detection_config,
+)
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.utils import (
+    get_max_position_embeddings,
+    get_vision_placeholder_token_ids,
+    qwen2_5_vl_dedup_image_tokens,
+    run_uvicorn,
+)
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -58,7 +78,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     reset_vllm_weight_update_caches,
 )
 
-_VLLM_VERSION = version.parse(vllm.__version__)
+_VLLM_VERSION = version.parse(importlib.metadata.version("vllm"))
 _RESET_PREFIX_CACHE_KWARGS = build_vllm_prefix_cache_reset_kwargs(_VLLM_VERSION)
 
 
@@ -85,6 +105,33 @@ logger.setLevel(logging.INFO)
 
 
 RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
+
+
+def _rollout_output_kind(*, needs_generation_logprobs: bool, needs_prompt_logprobs: bool) -> RequestOutputKind:
+    if needs_generation_logprobs or needs_prompt_logprobs:
+        return RequestOutputKind.CUMULATIVE
+    return RequestOutputKind.DELTA
+
+
+def _apply_rwkv_default_stop_params(sampling_params: dict[str, Any], model_config: Any) -> None:
+    if not is_rwkv_model_config(model_config):
+        return
+    sampling_params.setdefault("stop", list(RWKV_DEFAULT_STOPS))
+    sampling_params.setdefault("stop_token_ids", list(RWKV_DEFAULT_STOP_TOKEN_IDS))
+
+
+def _token_to_bytes_getter(tokenizer: Any) -> Callable[[int], bytes] | None:
+    idx2token = getattr(tokenizer, "idx2token", None)
+    if idx2token is None:
+        return None
+
+    def token_to_bytes(token_id: int) -> bytes:
+        token = idx2token[int(token_id)]
+        if isinstance(token, bytes):
+            return token
+        return bytes(token)
+
+    return token_to_bytes
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -157,6 +204,8 @@ class vLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        disaggregation_role: str = "null",
+        disaggregation_kv_transfer_config: Optional[dict] = None,
     ):
         """
         Args:
@@ -168,7 +217,23 @@ class vLLMHttpServer:
             gpus_per_node (int): number of gpus per node.
             nnodes (int): number of nodes.
             cuda_visible_devices (str): cuda visible devices.
+            disaggregation_role: PD role, or ``"null"`` for normal rollout.
+            disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
         """
+        if disaggregation_role not in ("null", "prefill", "decode"):
+            raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
+        if disaggregation_role != "null" and disaggregation_kv_transfer_config is None:
+            raise ValueError(
+                f"disaggregation_role={disaggregation_role!r} requires disaggregation_kv_transfer_config to be set"
+            )
+        self._disaggregation_role = disaggregation_role
+        self._disaggregation_kv_transfer_config = disaggregation_kv_transfer_config
+        # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
+        self._pd_decode_peers: list[ActorHandle] = []
+        self._pd_prefill_side_channel_port: Optional[int] = None
+        self._pd_prefill_engine_id: Optional[str] = None
+        self._pd_peer_idx: int = 0
+
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
         # Forward the Ray job id into the vLLM worker subprocess so the
@@ -269,6 +334,20 @@ class vLLMHttpServer:
             args=args,
             kwargs=kwargs,
         )
+
+    async def set_pd_peer(
+        self,
+        decode_peers: list,
+        prefill_side_channel_port: int,
+        prefill_engine_id: str,
+    ) -> None:
+        assert self._disaggregation_role == "prefill", (
+            f"set_pd_peer must be called on the prefill server (got role={self._disaggregation_role!r})"
+        )
+        assert isinstance(decode_peers, list) and decode_peers, "decode_peers must be a non-empty list"
+        self._pd_decode_peers = list(decode_peers)
+        self._pd_prefill_side_channel_port = prefill_side_channel_port
+        self._pd_prefill_engine_id = prefill_engine_id
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -425,7 +504,23 @@ class vLLMHttpServer:
             args.update(lora_args)
 
         if self.config.enable_rollout_routing_replay:
+            # R3 (Rollout Router Replay) relies on vLLM's ``enable_return_routed_experts``
+            # path (RoutedExpertsManager / RoutedExpertsCapturer), which is only correct
+            # for hybrid-attention MoE models (e.g. Qwen3.5, whose linear + full attention
+            # layout produces >1 KV-cache group) starting from vLLM 0.22.0. Earlier
+            # releases either lack the feature or under-size the routed-experts host
+            # buffer and crash with an IndexError. Fail fast with an actionable message
+            # instead of surfacing an opaque runtime error deep inside vLLM.
+            if _VLLM_VERSION < version.parse("0.22.0"):
+                raise RuntimeError(
+                    "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
+                    f"(installed: {_VLLM_VERSION}). Upgrade vLLM (e.g. `pip install -U "
+                    "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
+                )
             args.update({"enable_return_routed_experts": True})
+
+        if self._disaggregation_role != "null":
+            args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
@@ -469,8 +564,14 @@ class vLLMHttpServer:
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
+        # A sampled <|image_pad|>/<|video_pad|> has no image behind it, and every consumer of the
+        # sequence assumes it does. Mask them out with the OOV tail, so the policy cannot pick one.
         await engine_client.collective_rpc(
-            method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
+            method="monkey_patch_model",
+            kwargs={
+                "vocab_size": len(self.model_config.tokenizer),
+                "banned_token_ids": get_vision_placeholder_token_ids(self.model_config.processor),
+            },
         )
 
         build_app_sig = inspect.signature(build_app)
@@ -533,8 +634,25 @@ class vLLMHttpServer:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
+        kv_transfer_params: Optional[dict] = None,
     ) -> TokenOutput:
-        """Generate sequence with token-in-token-out."""
+        """Generate sequence with token-in-token-out.
+
+        Args:
+            kv_transfer_params: vLLM KV-transfer payload for PD requests.
+        """
+        if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+            return await self._pd_dispatch(
+                prompt_ids,
+                sampling_params,
+                request_id,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                priority=priority,
+            )
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -570,13 +688,32 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        generation_logprobs_requested = bool(sampling_params.pop("logprobs", False))
+        prompt_logprobs_requested = sampling_params.get("prompt_logprobs", None) is not None
+        sampling_params["logprobs"] = 0 if generation_logprobs_requested else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        _apply_rwkv_default_stop_params(sampling_params, self.model_config)
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
+
+        if kv_transfer_params is not None:
+            extra_args = dict(sampling_params.pop("extra_args", None) or {})
+            extra_args["kv_transfer_params"] = kv_transfer_params
+            sampling_params["extra_args"] = extra_args
+
+        sampling_params["output_kind"] = _rollout_output_kind(
+            needs_generation_logprobs=generation_logprobs_requested,
+            needs_prompt_logprobs=prompt_logprobs_requested,
+        )
+        sampling_params.setdefault(
+            "repetition_detection",
+            RepetitionDetectionParams(**vllm_repetition_detection_config()),
+        )
+        detect_rollout_repetition = sampling_params.get("repetition_detection") is not None
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        stream_is_cumulative = sampling_params.output_kind == RequestOutputKind.CUMULATIVE
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -604,19 +741,38 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        generator = self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-        )
+        with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
 
-        # Get final response
-        final_res: Optional[RequestOutput] = None
-        async for output in generator:
-            final_res = output
-        assert final_res is not None
+            async def abort_current_request() -> dict[str, Any]:
+                return await self.abort_request(request_id, reset_prefix_cache=False)
+
+            repetition_detector = None
+            if detect_rollout_repetition:
+                repetition_detector = NGramRepetitionDetector(
+                    token_to_bytes=_token_to_bytes_getter(self.model_config.tokenizer),
+                )
+                final_res, repetition_truncation_length, observed_token_ids = await consume_until_repetition(
+                    generator,
+                    get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],
+                    abort_request=abort_current_request,
+                    detector=repetition_detector,
+                    cumulative=stream_is_cumulative,
+                )
+            else:
+                final_res, observed_token_ids = await consume_token_stream(
+                    generator,
+                    get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],
+                    cumulative=stream_is_cumulative,
+                )
+                repetition_truncation_length = None
+            assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
@@ -636,18 +792,66 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
-        token_ids = final_res.outputs[0].token_ids
+        finish_reason = final_res.outputs[0].finish_reason
+        stop_reason_raw = final_res.outputs[0].stop_reason
+        extra_fields["finish_reason"] = finish_reason
+        extra_fields["backend_stop_reason"] = stop_reason_raw
+        engine_repetition_truncated = finish_reason == "repetition" or stop_reason_raw == "repetition_detected"
+        original_response_length = (
+            len(observed_token_ids) if observed_token_ids else len(final_res.outputs[0].token_ids)
+        )
+        if repetition_truncation_length is not None:
+            assert repetition_detector is not None
+            token_ids = observed_token_ids[:repetition_truncation_length]
+            logger.info(
+                "Truncated request %s after repetition/anomaly detection: "
+                "reason=%s observed_length=%s truncation_length=%s",
+                request_id,
+                repetition_detector.matched_reason,
+                original_response_length,
+                repetition_truncation_length,
+            )
+            extra_fields.update(
+                repetition_extra_fields(
+                    truncated=True,
+                    truncation_length=repetition_truncation_length,
+                    original_response_length=original_response_length,
+                    matched_rule=repetition_detector.matched_rule,
+                    matched_reason=repetition_detector.matched_reason,
+                    matched_text_stats=repetition_detector.matched_text_stats or repetition_detector.last_text_stats,
+                )
+            )
+        else:
+            token_ids = observed_token_ids or final_res.outputs[0].token_ids
+            truncation_length = len(token_ids) if engine_repetition_truncated else None
+            extra_fields.update(
+                repetition_extra_fields(
+                    truncated=engine_repetition_truncated,
+                    truncation_length=truncation_length,
+                    original_response_length=original_response_length,
+                    matched_reason="engine_repetition" if engine_repetition_truncated else None,
+                    matched_text_stats=(
+                        repetition_detector.last_text_stats if repetition_detector is not None else None
+                    ),
+                )
+            )
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            log_probs = [
+                logprobs[token_ids[i]].logprob
+                for i, logprobs in enumerate(final_res.outputs[0].logprobs[: len(token_ids)])
+            ]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
+            if repetition_truncation_length is not None and routed_experts is not None:
+                routed_experts = routed_experts[: len(prompt_ids) + len(token_ids)]
 
         # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
+        if repetition_truncation_length is not None or engine_repetition_truncated:
+            stop_reason = "repetition_truncated"
+        elif finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
             stop_reason = "completed"
@@ -658,6 +862,10 @@ class vLLMHttpServer:
 
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
+
+        response_kv_transfer_params = getattr(final_res, "kv_transfer_params", None)
+        if response_kv_transfer_params is not None:
+            extra_fields["kv_transfer_params"] = response_kv_transfer_params
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
@@ -680,6 +888,78 @@ class vLLMHttpServer:
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
+        )
+
+    def _select_decode_peer(self) -> ActorHandle:
+        """Round-robin across decode peers."""
+        peer = self._pd_decode_peers[self._pd_peer_idx % len(self._pd_decode_peers)]
+        self._pd_peer_idx += 1
+        return peer
+
+    async def _pd_dispatch(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        priority: int = 0,
+    ) -> TokenOutput:
+        """Run prefill locally, then decode on a selected peer."""
+        decode_peer = self._select_decode_peer()
+        connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
+        is_mooncake = connector == "MooncakeConnector"
+
+        # Prefill only materializes KV; discard its single generated token.
+        prefill_sp = dict(sampling_params)
+        prefill_sp.pop("max_tokens", None)
+        prefill_sp.pop("max_new_tokens", None)
+        prefill_sp["max_tokens"] = 1
+        transfer_id = uuid.uuid4().hex
+        prefill_kv_params = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "transfer_id": transfer_id,
+        }
+
+        prefill_out = await self.generate(
+            prompt_ids,
+            prefill_sp,
+            f"{request_id}_P",
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            priority=priority,
+            kv_transfer_params=prefill_kv_params,
+        )
+        if is_mooncake:
+            # Mooncake does not return decode params from the prefill leg.
+            decode_kv_params = {
+                "do_remote_decode": False,
+                "do_remote_prefill": True,
+                "remote_engine_id": self._pd_prefill_engine_id,
+                # Single-node PD uses Mooncake's local bootstrap address.
+                "remote_bootstrap_addr": f"http://127.0.0.1:{self._pd_prefill_side_channel_port}",
+                "transfer_id": transfer_id,
+            }
+        else:
+            decode_kv_params = prefill_out.extra_fields.get("kv_transfer_params")
+            if decode_kv_params is None:
+                raise RuntimeError(f"PD prefill leg returned no kv_transfer_params (request_id={request_id})")
+
+        return await decode_peer.generate.remote(
+            prompt_ids,
+            dict(sampling_params),
+            f"{request_id}_D",
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            priority=priority,
+            kv_transfer_params=decode_kv_params,
         )
 
     async def wake_up(self, tags: list[str] | None = None):
@@ -916,8 +1196,11 @@ class vLLMHttpServer:
         return "vllm"
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
-        """Mutate engine_kwargs in-place before the CLI args dict is built. No-op by default."""
-        pass
+        """Mutate engine_kwargs in-place before the CLI args dict is built."""
+        if _VLLM_VERSION < version.parse("0.22.0"):
+            # Work around multimodal processor cache desync across pause/resume.
+            # See: https://github.com/vllm-project/vllm/pull/43001/
+            engine_kwargs.setdefault("mm_processor_cache_gb", 0)
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
@@ -935,11 +1218,6 @@ class vLLMHttpServer:
         """Process quantization config. Returns (quantization_str, hf_overrides)."""
         quantization = self.config.quantization
         hf_overrides = {}
-
-        if is_torch_npu_available(check_device=False):
-            from verl.utils.vllm.npu_vllm_patch import check_vllm_ascend_before_server_launch
-
-            check_vllm_ascend_before_server_launch()
 
         # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
@@ -990,6 +1268,11 @@ class vLLMHttpServer:
                 apply_vllm_fp8_patches()
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+
+        model_quantization_config = getattr(self.model_config.hf_config, "quantization_config", {}) or {}
+        if quantization is None and model_quantization_config.get("quant_method") == "fp8":
+            apply_vllm_fp8_patches()
+            os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
 
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file

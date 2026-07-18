@@ -58,9 +58,7 @@ def test_import_rwkv_lm_uses_flat_train_sys_path_and_cwd(tmp_path):
     _write_required_train_files(tmp_path)
     _write(
         tmp_path / "src/import_probe.py",
-        "from pathlib import Path\n"
-        "CWD = Path.cwd()\n"
-        "VALUE = 'rwkv-lm'\n",
+        "from pathlib import Path\nCWD = Path.cwd()\nVALUE = 'rwkv-lm'\n",
     )
     _clear_modules("src", "src.import_probe")
 
@@ -74,8 +72,7 @@ def test_import_rwkv_lm_patches_native_env_only_during_import(tmp_path, monkeypa
     _write_required_train_files(tmp_path)
     _write(
         tmp_path / "src/env_probe.py",
-        "import os\n"
-        "VALUE = os.environ['RWKV_HEAD_SIZE']\n",
+        "import os\nVALUE = os.environ['RWKV_HEAD_SIZE']\n",
     )
     _clear_modules("src", "src.env_probe")
     monkeypatch.delenv("RWKV_HEAD_SIZE", raising=False)

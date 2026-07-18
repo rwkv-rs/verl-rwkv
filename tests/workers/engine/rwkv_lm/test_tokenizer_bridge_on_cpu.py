@@ -14,9 +14,15 @@
 
 import importlib.util
 import pickle
+import sys
 from pathlib import Path
 
 from omegaconf import OmegaConf
+
+VERL_ROOT = Path(__file__).resolve().parents[4]
+VLLM_RWKV_PATH = VERL_ROOT.parents[2] / "src" / "infer" / "vllm-rwkv"
+if str(VLLM_RWKV_PATH) not in sys.path:
+    sys.path.insert(0, str(VLLM_RWKV_PATH))
 
 
 def _load_tokenizer_module():
@@ -39,6 +45,10 @@ class FakeTokenizer:
         if tokenize:
             return [ord(char) for char in text]
         return text
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        special_suffix = "" if skip_special_tokens else "|special"
+        return ",".join(str(int(token_id)) for token_id in token_ids) + special_suffix
 
 
 def test_build_rwkv_tokenizer_instantiates_vllm_tokenizer_for_custom_vocab():
@@ -101,6 +111,21 @@ def test_pickleable_rwkv_tokenizer_supports_padding_for_agent_loop():
     }
 
 
+def test_pickleable_rwkv_tokenizer_supports_batch_decode_for_rollout_dump():
+    import torch
+
+    import verl.models.rwkv.tokenizer as tokenizer_module
+
+    tokenizer = tokenizer_module.build_rwkv_tokenizer(
+        tokenizer_cls=FakeTokenizer,
+        pickleable=True,
+    )
+
+    decoded = tokenizer.batch_decode(torch.tensor([[1, 2], [3, 4]]), skip_special_tokens=True)
+
+    assert decoded == ["1,2", "3,4"]
+
+
 def test_pickleable_rwkv_tokenizer_accepts_hf_chat_template_kwargs():
     import verl.models.rwkv.tokenizer as tokenizer_module
 
@@ -152,9 +177,103 @@ def test_pickleable_rwkv_tokenizer_falls_back_to_plain_text_without_chat_templat
         return_dict=True,
     )
 
-    expected_prompt = "User: solve\n\nAssistant: <think"
+    expected_prompt = "System: ignore\n\nUser: solve\n\nAssistant: <think"
     assert output["input_ids"] == [ord(char) for char in expected_prompt]
     assert output["attention_mask"] == [1] * len(output["input_ids"])
+
+
+def test_pickleable_rwkv_tokenizer_strips_dapo_math_prompt_wrapper():
+    import verl.models.rwkv.tokenizer as tokenizer_module
+
+    class PlainTokenizer:
+        eos_token_id = 0
+        vocab_size = 256
+
+        def apply_chat_template(self, *args, **kwargs):
+            raise NotImplementedError("no chat template")
+
+        def encode(self, text):
+            return [ord(char) for char in text]
+
+        def __len__(self):
+            return self.vocab_size
+
+    tokenizer = tokenizer_module.build_rwkv_tokenizer(
+        tokenizer_cls=PlainTokenizer,
+        pickleable=True,
+    )
+    problem = "已知 x+y=3, 求 x。"
+    wrapped_problem = (
+        "Solve the following math problem step by step. The last line of your response should be of the form "
+        "Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n"
+        f"{problem}\n"
+        'Remember to put your answer on its own line after "Answer:".'
+    )
+
+    output = tokenizer.apply_chat_template(
+        [{"role": "user", "content": wrapped_problem}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    assert output == f"User: {problem}\n\nAssistant: <think"
+    assert "Solve the following math problem" not in output
+    assert "Remember to put your answer" not in output
+
+
+def test_pickleable_rwkv_tokenizer_can_render_fake_think_prompt():
+    import verl.models.rwkv.tokenizer as tokenizer_module
+
+    class PlainTokenizer:
+        eos_token_id = 0
+        vocab_size = 256
+
+        def apply_chat_template(self, *args, **kwargs):
+            raise NotImplementedError("no chat template")
+
+        def encode(self, text):
+            return [ord(char) for char in text]
+
+        def __len__(self):
+            return self.vocab_size
+
+    tokenizer = tokenizer_module.build_rwkv_tokenizer(
+        tokenizer_cls=PlainTokenizer,
+        pickleable=True,
+    )
+
+    output = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "solve"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        rwkv_generation_prompt="fake_think",
+    )
+
+    assert output == "User: solve\n\nAssistant: <think></think"
+
+
+def test_pickleable_rwkv_tokenizer_uses_native_rwkv_bos_for_chat_prompts():
+    import verl.models.rwkv.tokenizer as tokenizer_module
+
+    tokenizer = tokenizer_module.build_rwkv_tokenizer(pickleable=True)
+
+    token_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "solve"}],
+        tokenize=True,
+        add_generation_prompt=True,
+        rwkv_generation_prompt="fake_think",
+    )
+    raw_token_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "solve"}],
+        tokenize=True,
+        add_generation_prompt=True,
+        rwkv_generation_prompt="fake_think",
+        add_special_tokens=False,
+    )
+
+    assert token_ids[0] == 0
+    assert raw_token_ids[0] != 0
+    assert tokenizer.decode(token_ids) == "User: solve\n\nAssistant: <think></think"
 
 
 def test_pickleable_rwkv_tokenizer_preserves_native_bos_policy():

@@ -19,7 +19,8 @@ from types import SimpleNamespace
 
 
 def _load_engine_module(name: str):
-    path = Path(f"verl/workers/engine/rwkv_lm/{name}.py")
+    verl_root = Path(__file__).resolve().parents[4]
+    path = verl_root / f"verl/workers/engine/rwkv_lm/{name}.py"
     spec = importlib.util.spec_from_file_location(f"rwkv_lm_{name}_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -64,6 +65,47 @@ def test_rwkv_lm_args_apply_verl_config_overrides_without_rewriting_native_names
     assert args.head_chunk == 4096
     assert args.grad_cp == 1
     assert args.real_bsz == 8
+
+
+def test_rwkv_lm_args_enable_infctx_chunk_ctx_and_env():
+    args_module = _load_engine_module("args")
+    env_module = _load_engine_module("env")
+    engine_config = SimpleNamespace(
+        precision="bf16",
+        ctx_len=2048,
+        head_size=64,
+        grad_cp=0,
+        infctx=True,
+        chunk_ctx=512,
+    )
+
+    args = args_module.build_rwkv_lm_args(engine_config=engine_config)
+    env = env_module.build_rwkv_lm_env(args)
+
+    assert args.ctx_len == 2048
+    assert args.grad_cp == 0
+    assert args.train_type == "infctx"
+    assert args.chunk_ctx == 512
+    assert env["RWKV_JIT_ON"] == "1"
+    assert env["RWKV_TRAIN_TYPE"] == "infctx"
+    assert env["RWKV_CHUNK_CTX"] == "512"
+
+
+def test_rwkv_lm_args_enable_grad_cp_by_default_for_infctx():
+    args_module = _load_engine_module("args")
+    engine_config = SimpleNamespace(
+        precision="bf16",
+        ctx_len=2048,
+        head_size=64,
+        grad_cp=None,
+        infctx=True,
+        chunk_ctx=512,
+    )
+
+    args = args_module.build_rwkv_lm_args(engine_config=engine_config)
+
+    assert args.grad_cp == 1
+    assert args.train_type == "infctx"
 
 
 def test_rwkv_lm_args_infer_native_shape_from_checkpoint(tmp_path, monkeypatch):
@@ -126,6 +168,8 @@ def test_rwkv_lm_env_matches_native_train_py_assignments(monkeypatch):
         head_chunk=0,
         precision="bf16",
         strategy="auto",
+        train_type="none",
+        chunk_ctx=0,
     )
 
     env = env_module.build_rwkv_lm_env(args)
@@ -138,6 +182,8 @@ def test_rwkv_lm_env_matches_native_train_py_assignments(monkeypatch):
         "RWKV_HEAD_L2WRAP_CE_CHUNK": "0",
         "RWKV_FLOAT_MODE": "bf16",
         "RWKV_JIT_ON": "1",
+        "RWKV_TRAIN_TYPE": "none",
+        "RWKV_CHUNK_CTX": "0",
     }
 
     monkeypatch.delenv("RWKV_CTXLEN", raising=False)
@@ -157,6 +203,8 @@ def test_rwkv_lm_env_disables_jit_for_deepspeed_stage_3():
         head_chunk=0,
         precision="bf16",
         strategy="deepspeed_stage_3",
+        train_type="none",
+        chunk_ctx=0,
     )
 
     assert env_module.build_rwkv_lm_env(args)["RWKV_JIT_ON"] == "0"

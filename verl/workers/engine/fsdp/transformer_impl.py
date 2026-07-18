@@ -668,6 +668,9 @@ class FSDPEngine(BaseEngine):
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    # Training discards model_output (train_batch pops it); keeping it accumulates
+                    # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
+                    meta_info.pop("model_output", None)
 
             output_lst.append(meta_info)
 
@@ -814,13 +817,55 @@ class FSDPEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
+    def get_per_tensor_param_shard(self, **kwargs):
+        """Like :meth:`get_per_tensor_param`, but yields each rank's *local* FSDP shard
+        instead of all-gathering the full tensor -- used by the ``delta_sharded``
+        checkpoint engine, which diffs on shards and gathers only the changes.
+
+        Yields ``(name, local_flat_shard_bf16, within_param_flat_offset, full_numel,
+        full_shape, contributes)``. Non-LoRA base path only.
+        """
+
+        # FSDP1's (SHARDED_)STATE_DICT export runs through the unshard machinery and
+        # asserts flat params are GPU-resident; FSDP2 state_dict() only collects
+        # DTensor refs and the generator below stages each shard lazily.
+        _needs_staging = fsdp_version(self.module) == 1
+        if _needs_staging and not self._uses_fsdp2_cpu_offload_policy:
+            load_fsdp_model_to_gpu(self.module)
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        if _needs_staging and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.module)
+
+        device = get_device_id()
+
+        from ..spec import ShardSpec
+
+        def _gen():
+            for name, param in params.items():
+                spec = ShardSpec.from_param(param)
+                p = param.to(device, non_blocking=True)
+                if p.is_floating_point():
+                    p = p.to(torch.bfloat16, non_blocking=True)
+                local = p.to_local() if hasattr(p, "to_local") else p
+                yield name, local.reshape(-1), spec
+
+        return _gen(), None
+
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
         # leaves the module half-moved and crashes state_dict() below (#5995). The
         # per-DTensor .to(device).full_tensor() below still produces GPU tensors.
-        if not self._uses_fsdp2_cpu_offload_policy:
+        #
+        # FSDP2 state_dict() only collects DTensor refs and the generator below already
+        # stages each shard lazily via .to(device).full_tensor(), so the whole-shard
+        # round trip is only needed for FSDP1 (state_dict unshards on-device) and LoRA
+        # (adapter merge does real weight math on the module).
+        _is_peft = hasattr(getattr(self.module, "_fsdp_wrapped_module", self.module), "peft_config")
+        _skip_staging = fsdp_version(self.module) == 2 and not _is_peft
+        if not self._uses_fsdp2_cpu_offload_policy and not _skip_staging:
             load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
@@ -840,16 +885,18 @@ class FSDPEngine(BaseEngine):
                 if not base_sync_done:
                     params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
             else:  # merge lora
-                with merged_lora_context(self.module, backup_adapters=True):
-                    params = self.module.state_dict()
-                    params = normalize_peft_param_name(params)
+                # state_dict() aliases the live parameter storage and merged_lora_context
+                # restores the un-merged base weights on exit, so tensors must be
+                # materialized while the context is still open (inside the generator).
+                # Materializing after exit silently sends base weights without adapters.
+                return self._merged_lora_per_tensor_param(), None
         else:
             params = self.module.state_dict()
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
-        if self._is_offload_param:
+        if self._is_offload_param and not _skip_staging:
             offload_fsdp_model_to_cpu(self.module)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
@@ -892,6 +939,37 @@ class FSDPEngine(BaseEngine):
 
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
+
+    def _merged_lora_per_tensor_param(self):
+        """Stream merged (base + LoRA) weights for rollout weight sync.
+
+        ``state_dict()`` returns tensors that alias the live FSDP parameter
+        storage, and ``merged_lora_context`` restores the un-merged base
+        weights when it exits. The context therefore must stay open until the
+        consumer has materialized every tensor: ``DTensor.full_tensor()``
+        produces a copy, so yielded tensors remain valid after the restore.
+        Consuming a state_dict captured inside the context after the context
+        has exited would silently send base weights without the adapters.
+        """
+        device = get_device_id()
+        try:
+            with merged_lora_context(self.module, backup_adapters=True):
+                params = normalize_peft_param_name(self.module.state_dict())
+                params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+                for name, param in params.items():
+                    yield (
+                        name,
+                        param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                        if isinstance(param, DTensor)
+                        # clone: plain tensors also alias module storage, and bucketed
+                        # senders may flush after the restore has already run
+                        else param.detach().clone(),
+                    )
+        finally:
+            log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.module)
+            log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
     def disable_adapter(self) -> ContextManager:
         return self.module.disable_adapter()

@@ -78,7 +78,7 @@ def _normalize_gathered_metric_values(values):
         return values
     if isinstance(values[0], Metric):
         return Metric.aggregate_dp(values)
-    if isinstance(values[0], (list, tuple)):
+    if isinstance(values[0], list | tuple):
         return list(chain.from_iterable(values))
     return values
 
@@ -707,9 +707,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
-            return
+            # The sharded delta engine diffs each rank's local FSDP shard (no all-gather),
+            # so it consumes the sharded param generator instead of the full-tensor one.
+            if effective_mode == "delta_sharded":
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param_shard()
+            else:
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            return metrics or {}
 
         set_expandable_segments(False)
         log_gpu_memory_usage("Before resume weights", logger=logger)

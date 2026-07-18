@@ -22,6 +22,15 @@ ctx_len: null
 # RWKV head size passed to rwkv-lm
 head_size: null
 
+# Native RWKV gradient checkpointing. Defaults to enabled when infctx is enabled.
+grad_cp: null
+
+# Enable native RWKV infinite-context training by splitting ctx_len into chunks.
+infctx: false
+
+# RWKV sequence chunk length used when infctx is enabled. Must be divisible by 16.
+chunk_ctx: null
+
 # Whether the native rwkv-lm CUDA extension should be compiled by the future adapter
 compile_cuda: true
 

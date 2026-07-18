@@ -145,7 +145,13 @@ def get_vllm_max_lora_rank(lora_rank: int):
 
 
 # https://github.com/vllm-project/vllm/issues/13175
-def monkey_patch_compute_logits(model, vocab_size: int):
+def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Optional[list[int]] = None):
+    """Mask the tokens the sampler must never pick.
+
+    Beyond the out-of-vocabulary tail, `banned_token_ids` covers tokens that live *inside* the
+    vocabulary yet are still illegal to generate: the vision placeholders, which are meaningless
+    unless a real image or video sits behind them. See `get_vision_placeholder_token_ids`.
+    """
     original_compute_logits = model.compute_logits
 
     def compute_logits(
@@ -155,6 +161,8 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     ) -> torch.Tensor:
         logits = original_compute_logits(*args, **kwargs)
         logits[..., vocab_size:] = float("-inf")
+        if banned_token_ids:
+            logits[..., banned_token_ids] = float("-inf")
         return logits
 
     model.compute_logits = MethodType(compute_logits, model)
@@ -192,11 +200,12 @@ class vLLMColocateWorkerExtension:
 
         # 1. patch for Lora
         VLLMHijack.hijack()
-        # 2. patch online fp8 quant
-        if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1":
+        vllm_config = kwargs.get("vllm_config")
+        # 2. patch online fp8 quant. Some models, including DeepSeek-V4, get
+        # fp8 from the HF config rather than an explicit rollout quantization arg.
+        if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1" or is_fp8_model(vllm_config):
             apply_vllm_fp8_patches()
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
-        vllm_config = kwargs.get("vllm_config")
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
         _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
         _is_modelopt_qat = type(quant_config).__name__ == "ModelOptNvFp4Config"
@@ -257,10 +266,10 @@ class vLLMColocateWorkerExtension:
             if draft_cfg is not None:
                 yield self._get_drafter_model(), draft_cfg
 
-    def monkey_patch_model(self, vocab_size: int):
+    def monkey_patch_model(self, vocab_size: int, banned_token_ids: Optional[list[int]] = None):
         for model in self._iter_all_models():
-            # patch compute_logits to avoid sampling OOV token
-            monkey_patch_compute_logits(model, vocab_size)
+            # patch compute_logits to avoid sampling OOV and other illegal tokens
+            monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
@@ -299,6 +308,12 @@ class vLLMColocateWorkerExtension:
                 patch_vllm_moe_model_weight_loader(model)
 
         assert self.device is not None
+        quant_reload_state = False
+        if is_fp8_model(self.model_runner.vllm_config) and not (peft_config and base_sync_done):
+            from verl.utils.vllm.vllm_fp8_utils import prepare_quanted_weights_for_loading
+
+            quant_reload_state = prepare_quanted_weights_for_loading(self.model_runner)
+
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
             device=self.device,
@@ -316,7 +331,10 @@ class vLLMColocateWorkerExtension:
         try:
             receiver.receive_weights(
                 on_bucket_received=lambda weights: self._update_weights(
-                    weights, peft_config=peft_config, base_sync_done=base_sync_done
+                    weights,
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
+                    quant_prepared=bool(quant_reload_state),
                 )
             )
             if transactional_weight_update:
@@ -344,6 +362,11 @@ class vLLMColocateWorkerExtension:
 
             modelopt_process_weights_after_loading(self.model_runner.model)
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
+        elif quant_reload_state:
+            from verl.utils.vllm.vllm_fp8_utils import process_quanted_weights_after_loading
+
+            process_quanted_weights_after_loading(self.model_runner, quant_reload_state)
+            logger.info("FP8/MXFP4: process_weights_after_loading completed")
         elif use_standard_weight_load:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -363,7 +386,13 @@ class vLLMColocateWorkerExtension:
             apply_buffer_updates(model, buffer_updates)
         return loaded
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        peft_config: dict,
+        base_sync_done: bool,
+        quant_prepared: bool = False,
+    ):
         if peft_config and base_sync_done:
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
             # past this callback, so views into the freed/overwritten buffer crash later (#6454).
@@ -384,10 +413,13 @@ class vLLMColocateWorkerExtension:
             if is_fp8_model(self.model_runner.vllm_config):
                 logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(param_updates, self.model_runner) if param_updates else []
+                reload_kwargs = {"prepare_model": not quant_prepared, "process_model": not quant_prepared}
+                loaded_params = (
+                    load_quanted_weights(param_updates, self.model_runner, **reload_kwargs) if param_updates else []
+                )
                 # Keep the draft model in sync when present.
                 if self._use_mtp_drafter_weight_sync() and param_updates:
-                    load_quanted_weights(param_updates, self.model_runner, is_drafter=True)
+                    load_quanted_weights(param_updates, self.model_runner, is_drafter=True, **reload_kwargs)
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"
@@ -404,15 +436,20 @@ class vLLMColocateWorkerExtension:
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.
+
         Uses Ray job id + replica_rank + rollout-local rank to match the sender
         side and avoid cross-job collisions on shared hosts.
+        In PD mode, each engine actor's local ranks start at 0; the optional
+        VERL_ZMQ_BASE_TRAINER_RANK offset maps them back to trainer ranks.
         """
         replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
         job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         parallel_config = getattr(vllm_config, "parallel_config", None)
         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
-        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{local_rank}.sock"
+        trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
+        trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
+        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
 
 
 class SuppressSignalInThread:

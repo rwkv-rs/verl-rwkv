@@ -29,7 +29,9 @@ import ray
 import torch
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf, open_dict
+from packaging.version import InvalidVersion, Version
 from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import KVBatchMeta
@@ -70,7 +72,7 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
-from verl.trainer.ppo.v1.utils import compute_advantage_for_multi_trajectories
+from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.trainer.tokenizer import build_ppo_tokenizer_and_processor
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -82,6 +84,7 @@ from verl.utils.import_utils import load_extern_type
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.config import CriticConfig, DistillationConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
@@ -98,6 +101,19 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _tq_supports_checkpoint() -> bool:
+    """Whether the installed TransferQueue can snapshot/restore its state for checkpoint consistency."""
+    try:
+        version_supported = Version(getattr(tq, "__version__", "")) >= Version("0.1.9")
+    except InvalidVersion:
+        return False
+    return (
+        version_supported
+        and callable(getattr(tq, "save_checkpoint", None))
+        and callable(getattr(tq, "load_checkpoint", None))
+    )
 
 
 class PPOTrainer(ABC):
@@ -140,6 +156,7 @@ class PPOTrainer(ABC):
             max_off_policy_threshold=sampler_config.max_off_policy_threshold,
             max_off_policy_strategy=sampler_config.max_off_policy_strategy,
             sampler_kwargs=sampler_config.sampler_kwargs,
+            refill_fn=self._add_prompts_to_generate,
         )
 
     def init(self):
@@ -311,6 +328,9 @@ class PPOTrainer(ABC):
         """
         self.agent_loop_manager = agent_loop_manager
 
+        # initialize SkipManager for V1 rollout skip support
+        SkipManager.init(self.config)
+
         self.logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -334,11 +354,14 @@ class PPOTrainer(ABC):
                 self._shutdown_dump_executor()
                 return
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        current_epoch = self.global_steps // self.steps_per_epoch
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
+        # SkipManager skips warmup batches in async trainers, so it doesn't conflict with reissue.
+        SkipManager.set_step(self.global_steps)
+        self._reissue_inflight_prompts()
         self.prev_step_profile = False
         self.curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -370,6 +393,7 @@ class PPOTrainer(ABC):
                         self._save_checkpoint()
 
                 self.on_step_end()
+                metrics.update(self._consume_sync_metrics())
 
             # 4. validate
             if self.config.trainer.test_freq > 0 and (
@@ -397,7 +421,8 @@ class PPOTrainer(ABC):
             self.logger.log(data=metrics, step=self.global_steps)
             progress_bar.update(1)
             self.global_steps += 1
-            current_epoch = (self.global_steps - 1) // len(self.train_dataloader)
+            SkipManager.set_step(self.global_steps)
+            current_epoch = (self.global_steps - 1) // self.steps_per_epoch
             if is_last_step:
                 self._shutdown_dump_executor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
@@ -409,53 +434,79 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
-        # 1. add batch to generate
-        self._add_batch_to_generate()
+        train_batch_size = self.config.data.train_batch_size
+        assert train_batch_size % self.parameter_sync_step == 0, (
+            f"train_batch_size ({train_batch_size}) must be divisible by "
+            f"parameter_sync_step ({self.parameter_sync_step})"
+        )
+        sample_batch_size = train_batch_size // self.parameter_sync_step
 
-        # 2. sample batch from replay buffer
+        # regular feed: stream one train batch worth of prompts for this step
+        with marked_timer("feed", timing_raw):
+            self._add_batch_to_generate()
+
+        metrics_aggregator = MetricsAggregator()
+        combined_keys: list = []
+        combined_tags: list = []
+        combined_partition_id = "train"
+        for _ in range(self.parameter_sync_step):
+            iter_metrics: dict = {}
+            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
+            combined_keys.extend(batch.keys)
+            combined_tags.extend(batch.tags)
+            combined_partition_id = batch.partition_id
+
+        metrics.update(metrics_aggregator.get_aggregated_metrics())
+        return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
+
+    def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
+        """Run a single local update: sample one mini-batch and perform the full PPO pipeline once."""
+        # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
             batch, off_policy_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps,
                 partition_id="train",
-                batch_size=self.config.data.train_batch_size,
+                batch_size=sample_batch_size,
             )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
-        # 3. [OPTIONAL] compute reward score with colocated reward model
+        # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
-        # 4. balance batch across data parallel groups
+        # 3. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
 
-        # 5. compute old_log_prob
+        # 4. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
             batch = self._compute_old_log_prob(batch, metrics=metrics)
 
-        # 6. [OPTIONAL] compute ref_log_prob
+        # 5. [OPTIONAL] compute ref_log_prob
         if self.use_reference_policy:
             with marked_timer("ref", timing_raw, color="olive"):
                 batch = self._compute_ref_log_prob(batch, metrics=metrics)
 
-        # 7. [OPTIONAL] compute critic values
+        # 6. [OPTIONAL] compute critic values
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
                 batch = self._compute_values(batch, metrics=metrics)
 
-        # 8. compute advantage and return
+        # 7. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
 
-        # 9. [OPTIONAL] update critic
+        # 8. [OPTIONAL] update critic
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
                 batch = self._update_critic(batch, metrics=metrics)
 
-        # 10. update actor
+        # 9. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
@@ -493,6 +544,13 @@ class PPOTrainer(ABC):
         """Called at the end of each training step."""
         return
 
+    def _consume_sync_metrics(self) -> dict:
+        """Weight-sync stats stashed by ``on_step_end`` (e.g. the delta engines'
+        changed ratio / wire payload), merged into this step's logged metrics."""
+        metrics = getattr(self, "_pending_sync_metrics", None) or {}
+        self._pending_sync_metrics = {}
+        return metrics
+
     def on_sample_begin(self):
         """Called at the beginning of sampling batch from replay buffer."""
         return
@@ -527,9 +585,25 @@ class PPOTrainer(ABC):
             max_samples=self.config.data.get("val_max_samples", -1),
         )
 
+        # Async drop refills an arbitrary number of dropped prompts, which must divide gen_batch_size,
+        # so force gen_batch_size=1.
+        if self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop":
+            user_gen_batch_size = self.config.data.get("gen_batch_size", None)
+            if user_gen_batch_size not in (None, 1):
+                logger.warning(
+                    f"data.gen_batch_size={user_gen_batch_size} is overridden to 1: the async 'drop' "
+                    f"off-policy strategy refills an arbitrary number of prompts, which requires gen_batch_size=1."
+                )
+            elif user_gen_batch_size is None:
+                logger.info("data.gen_batch_size defaulted to 1 for the async 'drop' off-policy strategy.")
+            with open_dict(self.config):
+                self.config.data.gen_batch_size = 1
+
+        # use gen_batch_size as the batch size for the dataloader if set, otherwise use train_batch_size
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.train_batch_size,
+            batch_size=gen_batch_size,
             num_workers=self.config.data["dataloader_num_workers"],
             drop_last=True,
             collate_fn=collate_fn,
@@ -549,20 +623,26 @@ class PPOTrainer(ABC):
             f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
         )
 
+        self.steps_per_epoch = len(self.train_dataset) // self.config.data.train_batch_size
+
         # adjust total_training_steps
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = self.steps_per_epoch * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
         self.total_training_steps = total_training_steps
         logger.info(f"Total training steps: {self.total_training_steps}")
 
+        # The LR scheduler steps once per local update, and each global step performs
+        # ``parameter_sync_step`` local updates (see ``PPOTrainer.step``). The optimizer's
+        # schedule horizon must therefore count optimizer updates.
+        optim_total_training_steps = total_training_steps * self.parameter_sync_step
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = optim_total_training_steps
                 if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = total_training_steps
+                    self.config.critic.optim.total_training_steps = optim_total_training_steps
         except Exception as e:
             logger.warning(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
@@ -672,6 +752,52 @@ class PPOTrainer(ABC):
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+        # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
+        # deferred to fit() to use the agent_loop_manager.
+        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+            tq_ckpt_path = os.path.join(global_step_folder, "transfer_queue")
+            if os.path.exists(tq_ckpt_path):
+                logger.info(f"Loading TransferQueue state from {tq_ckpt_path}")
+                tq.load_checkpoint(tq_ckpt_path)
+
+    def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+        """Restart checkpointed pending/running prompt groups from their persisted prompt data."""
+        if self.trainer_mode == "sync" or not _tq_supports_checkpoint():
+            return 0
+        data = tq.kv_list(partition_id)
+        if not data:
+            return 0
+        items = data.get(partition_id, {})
+        inflight_uids = [
+            key
+            for key, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("status") in ("pending", "running")
+        ]
+        if not inflight_uids:
+            return 0
+
+        batch = tq.kv_batch_get(keys=inflight_uids, partition_id=partition_id)
+        inflight_uid_set = set(inflight_uids)
+        old_trajectory_keys = [
+            key
+            for key, tag in items.items()
+            if not tag.get("is_prompt", False) and key.split("_", 1)[0] in inflight_uid_set
+        ]
+        if old_trajectory_keys:
+            tq.kv_clear(keys=old_trajectory_keys, partition_id=partition_id)
+
+        # Treat this as a new dispatch attempt for the resumed training step.
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in inflight_uids]
+        tq.kv_batch_put(keys=inflight_uids, partition_id=partition_id, tags=tags)
+        self.agent_loop_manager.generate_sequences(batch)
+
+        logger.info(
+            f"Re-issued {len(inflight_uids)} in-flight prompts for step {self.global_steps}; "
+            f"cleared {len(old_trajectory_keys)} old trajectories from partition {partition_id}"
+        )
+        return len(inflight_uids)
+
     def _save_checkpoint(self):
         """Save actor, critic, and dataloader checkpoints to local (and optionally remote) storage."""
         from verl.utils.fs import local_mkdir_safe
@@ -725,6 +851,16 @@ class PPOTrainer(ABC):
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
 
+        # save TransferQueue state for async modes so in-flight prompts (already fetched from the
+        # dataloader but not yet trained into this checkpoint's weights) survive a restart:
+        # finished trajectories are restored as-is, pending/running prompts are re-issued on resume.
+        # Requires a TransferQueue release with checkpoint support (see _tq_supports_checkpoint).
+        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+            tq.save_checkpoint(
+                os.path.join(local_global_step_folder, "transfer_queue"),
+                metadata={"global_steps": self.global_steps},
+            )
+
         # write latest checkpointed iteration tracker for atomic resume
         actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
         if actor_ckpt_cfg.get("async_save", False):
@@ -761,7 +897,9 @@ class PPOTrainer(ABC):
             tu.assign_non_tensor_data(batch, "validate", True)
             # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker.
             # global_steps is required by ReplayBuffer's metadata sync / staleness ordering.
-            tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps}] * len(batch)
+            tags = [
+                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
+            ]
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
 
@@ -1090,8 +1228,8 @@ class PPOTrainer(ABC):
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
-    def _add_batch_to_generate(self):
-        """Sample a batch from dataloader and add to AgentLoopManager."""
+    def _fetch_one_gen_batch(self) -> TensorDict:
+        """Fetch one ``gen_batch_size`` chunk from the dataloader."""
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
@@ -1101,15 +1239,53 @@ class PPOTrainer(ABC):
             batch_dict = next(self.train_dataloader_it)
 
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
-        batch = tu.get_tensordict(batch_dict)
+        return tu.get_tensordict(batch_dict)
+
+    def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
+        """Fetch and coalesce the requested number of prompts."""
+        train_batch_size = self.config.data.train_batch_size
+        if num_prompts is None:
+            num_prompts = train_batch_size
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or train_batch_size
+        if num_prompts <= 0 or num_prompts % gen_batch_size != 0:
+            raise ValueError(
+                f"num_prompts ({num_prompts}) must be a positive multiple of gen_batch_size "
+                f"({gen_batch_size}); it is submitted in whole gen_batch_size dataloader fetches."
+            )
+
+        chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
+        batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        return batch
 
-        # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker
-        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps}] * len(batch)
-        tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
+    def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
+        """Register prompts in TransferQueue and dispatch them for generation."""
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
+        if self.trainer_mode != "sync":
+            tq.kv_batch_put(
+                keys=list(batch["uid"]),
+                partition_id="train",
+                tags=tags,
+                # Persist prompt data for async checkpoint recovery.
+                # TODO: maybe let workers do it?
+                fields=batch.select(*[key for key in batch.keys() if not isinstance(batch.get(key), NonTensorData)]),
+            )
+        else:
+            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
-        # add batch to agent loop manager
         self.agent_loop_manager.generate_sequences(batch)
+        return len(batch)
+
+    def _add_prompts_to_generate(self, num_prompts: int) -> int:
+        """Add an exact number of prompts to the AgentLoopManager."""
+        batch = self._next_train_batch(num_prompts)
+        return self._submit_batch_to_rollout(batch)
+
+    @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
+    def _add_batch_to_generate(self):
+        """Add one training batch to the AgentLoopManager."""
+        batch = self._next_train_batch()
+        self._submit_batch_to_rollout(batch)
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
         """Compute the reward score with a colocated reward model."""
@@ -1538,17 +1714,20 @@ class PPOTrainer(ABC):
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
 
         # 5. off-policy staleness metrics
+        #   global_steps is the model weight version (one update_weights per global_step), and
+        #   min/max_global_steps are the versions a trajectory was generated across, so all quantities
+        #   below are already in model-version units.
         #   - trajectory_spans: how many distinct model versions a single trajectory was
         #     generated across (1 == fully generated on a single version). This captures the
         #     within-trajectory policy inconsistency caused by partial rollout / continuation.
-        #   - trajectory_staleness: how many training steps the trajectory lags behind the
+        #   - trajectory_staleness: how many model versions the trajectory lags behind the
         #     *current* policy. A trajectory spans versions [min_global_steps, max_global_steps],
         #     so the lag is a range: the freshest weights used give the lower bound
         #     (global_steps - max_global_steps) and the oldest weights the worst case
         #     (global_steps - min_global_steps). We log the lower bound as the primary metric.
-        trajectory_spans = (max_global_steps - min_global_steps + 1) / self.parameter_sync_step
-        trajectory_staleness = ((global_steps - 1) - max_global_steps) / self.parameter_sync_step
-        trajectory_staleness_worst = ((global_steps - 1) - min_global_steps) / self.parameter_sync_step
+        trajectory_spans = max_global_steps - min_global_steps + 1
+        trajectory_staleness = (global_steps - 1) - max_global_steps
+        trajectory_staleness_worst = (global_steps - 1) - min_global_steps
         metrics.update(
             {
                 "training/off_policy/trajectory_spans/mean": trajectory_spans.mean(),

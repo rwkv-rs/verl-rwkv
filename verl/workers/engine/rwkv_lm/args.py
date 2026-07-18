@@ -66,6 +66,8 @@ RWKV_LM_TRAIN_ARG_DEFAULTS: dict[str, Any] = {
     "my_testing": "x070",
     "kernel": "",
     "my_exit_tokens": 0,
+    "train_type": "none",
+    "chunk_ctx": 0,
 }
 
 RWKV_LM_LIGHTNING_ARG_DEFAULTS: dict[str, Any] = {
@@ -192,7 +194,13 @@ def _apply_engine_config(values: dict[str, Any], engine_config: Any) -> None:
     _set_if_not_none(values, "ctx_len", _get(engine_config, "ctx_len"))
     _set_if_not_none(values, "head_size", _get(engine_config, "head_size"))
     _set_if_not_none(values, "precision", _get(engine_config, "precision"))
-    _set_if_not_none(values, "grad_cp", _get(engine_config, "grad_cp"))
+    grad_cp = _get(engine_config, "grad_cp")
+    _set_if_not_none(values, "grad_cp", grad_cp)
+    if _get(engine_config, "infctx", False):
+        values["train_type"] = "infctx"
+        if grad_cp is None:
+            values["grad_cp"] = 1
+        _set_if_not_none(values, "chunk_ctx", _get(engine_config, "chunk_ctx"))
 
 
 def _apply_optimizer_config(values: dict[str, Any], optimizer_config: Any) -> None:
@@ -224,6 +232,15 @@ def finalize_rwkv_lm_args(args: SimpleNamespace) -> SimpleNamespace:
     args.max_epochs = -1
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+    if args.train_type == "infctx":
+        if int(args.chunk_ctx) <= 0:
+            raise ValueError("infctx requires chunk_ctx > 0")
+        if int(args.chunk_ctx) >= int(args.ctx_len):
+            raise ValueError("infctx requires chunk_ctx < ctx_len")
+        if int(args.chunk_ctx) % 16 != 0:
+            raise ValueError("infctx chunk_ctx must be divisible by RWKV CUDA chunk length 16")
+    else:
+        args.chunk_ctx = int(args.chunk_ctx or 0)
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:

@@ -15,7 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
-from omegaconf import MISSING
+from omegaconf import MISSING, DictConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
@@ -40,6 +40,10 @@ class SamplingConfig(BaseConfig):
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    penalty_decay: float = 0.996
+    logprobs: Optional[bool] = None
     do_sample: bool = True
     n: int = 1
 
@@ -165,7 +169,9 @@ class RolloutConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    penalty_decay: float = 0.996
 
     # Whether to enable full determinism for reproducibility.
     full_determinism: bool = False
@@ -324,8 +330,6 @@ class RolloutConfig(BaseConfig):
         if isinstance(self.disaggregation, dict):
             object.__setattr__(self, "disaggregation", DisaggregationConfig(**self.disaggregation))
         elif not isinstance(self.disaggregation, DisaggregationConfig):
-            from omegaconf import DictConfig, OmegaConf
-
             if not isinstance(self.disaggregation, DictConfig):
                 raise TypeError(
                     f"rollout.disaggregation must be dict, DictConfig, or DisaggregationConfig; "
@@ -337,8 +341,7 @@ class RolloutConfig(BaseConfig):
                 DisaggregationConfig(**OmegaConf.to_container(self.disaggregation, resolve=True)),
             )
 
-        if self.disaggregation.enabled and self.name != "sglang":
+        if self.disaggregation.enabled and self.name not in ("sglang", "vllm"):
             raise ValueError(
-                f"rollout.disaggregation.enabled=True is currently only supported with "
-                f"rollout.name='sglang'; got {self.name!r}. (vLLM PD is a tracked follow-up.)"
+                f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )

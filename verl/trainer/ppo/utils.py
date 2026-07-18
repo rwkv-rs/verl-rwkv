@@ -15,7 +15,7 @@
 import warnings
 from enum import Enum
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from verl.single_controller.base import Worker
 from verl.trainer.distillation import is_distillation_enabled
@@ -124,13 +124,20 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)
+    dataset_config = data_config
+    if not is_train and data_config.get("val_apply_chat_template_kwargs", None):
+        dataset_config = OmegaConf.create(OmegaConf.to_container(data_config, resolve=False))
+        train_kwargs = dict(dataset_config.get("apply_chat_template_kwargs", {}) or {})
+        train_kwargs.update(dict(dataset_config.get("val_apply_chat_template_kwargs", {}) or {}))
+        with open_dict(dataset_config):
+            dataset_config.apply_chat_template_kwargs = train_kwargs
 
     # Instantiate the dataset using the determined dataset class
     dataset = dataset_cls(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
-        config=data_config,
+        config=dataset_config,
         max_samples=max_samples,
     )
 
