@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from omegaconf import OmegaConf
 import pytest
+from omegaconf import OmegaConf
 
 
 def test_rwkv_native_rollout_model_config_uses_vllm_pth_config(tmp_path):

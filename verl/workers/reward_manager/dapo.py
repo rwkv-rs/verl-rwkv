@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from typing import Any
 
 import torch
 
@@ -65,7 +66,7 @@ class DAPORewardManager(AbstractRewardManager):
             return reward_from_rm_scores
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        reward_extra_info = defaultdict(list)
+        reward_extra_info: defaultdict[str, list[Any]] = defaultdict(list)
 
         already_print_data_sources = {}
 
@@ -101,6 +102,7 @@ class DAPORewardManager(AbstractRewardManager):
             extra_info["rollout_reward_scores"] = rollout_reward_scores
 
             repetition_truncated = is_repetition_truncated(data_item.non_tensor_batch)
+            score: float
             if repetition_truncated:
                 result = {"score": 0.0, "acc": 0.0}
                 score = 0.0
@@ -112,7 +114,6 @@ class DAPORewardManager(AbstractRewardManager):
                     extra_info=extra_info,
                 )
 
-                score: float
                 if isinstance(result, dict):
                     score = result["score"]
                     result = dict(result)

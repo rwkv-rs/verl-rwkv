@@ -14,10 +14,10 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections import Counter
 from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
-import re
 from typing import TypeVar
 
 import zstandard as zstd
@@ -229,9 +229,7 @@ class NGramRepetitionDetector:
         if zstd_window_bytes <= 0:
             raise ValueError(f"zstd_window_bytes must be positive, got {zstd_window_bytes}")
         if zstd_window_min_total_bytes <= 0:
-            raise ValueError(
-                f"zstd_window_min_total_bytes must be positive, got {zstd_window_min_total_bytes}"
-            )
+            raise ValueError(f"zstd_window_min_total_bytes must be positive, got {zstd_window_min_total_bytes}")
         if zstd_window_min_ratio < 0:
             raise ValueError(f"zstd_window_min_ratio must be non-negative, got {zstd_window_min_ratio}")
         if script_window_chars <= 0:
@@ -407,7 +405,10 @@ class NGramRepetitionDetector:
             return self._text_next_token_index, "script_mix", stats
         if script_window_stats["script_mix_detected"]:
             return self._text_next_token_index, "script_window_mix", stats
-        if len(payload) >= self.text_ngram_min_bytes and text_ngram_stats["text_ngram_max_count"] >= self.text_ngram_min_count:
+        if (
+            len(payload) >= self.text_ngram_min_bytes
+            and text_ngram_stats["text_ngram_max_count"] >= self.text_ngram_min_count
+        ):
             return self._text_next_token_index, "text_ngram_repetition", stats
 
         return None
@@ -475,9 +476,7 @@ class NGramRepetitionDetector:
                 "ratio": count / total if total else 0.0,
             }
             for script, count in suspicious_counts.items()
-            if total
-            and count >= self.script_dense_min_count
-            and count / total >= self.script_dense_min_ratio
+            if total and count >= self.script_dense_min_count and count / total >= self.script_dense_min_ratio
         ]
         broad_script_mix = (
             total >= self.script_min_chars

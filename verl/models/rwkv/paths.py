@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-
 RWKV_LM_ENV = "RWKV_LM_PATH"
 
 RWKV_LM_REQUIRED_FILES = (

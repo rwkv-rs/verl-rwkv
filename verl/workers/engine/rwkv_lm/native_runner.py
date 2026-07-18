@@ -29,7 +29,6 @@ from .args import build_rwkv_lm_args
 from .checkpoint import load_rwkv_lm_checkpoint
 from .env import build_rwkv_lm_env, rwkv_lm_env
 
-
 NativeImporter = Callable[..., ModuleType]
 CheckpointLoader = Callable[..., dict[str, Any]]
 
@@ -55,8 +54,7 @@ def _validate_rwkv_lm_runtime() -> None:
         metadata.version("deepspeed")
     except metadata.PackageNotFoundError as exc:
         raise ModuleNotFoundError(
-            "native rwkv-lm requires deepspeed; install or upgrade it with "
-            "`uv pip install --upgrade deepspeed`."
+            "native rwkv-lm requires deepspeed; install or upgrade it with `uv pip install --upgrade deepspeed`."
         ) from exc
 
 

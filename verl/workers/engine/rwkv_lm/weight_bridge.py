@@ -17,7 +17,6 @@ from typing import Any
 
 import torch
 
-
 RWKV_LM_ROLLOUT_WEIGHT_DTYPE = torch.bfloat16
 
 

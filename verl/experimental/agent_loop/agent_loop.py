@@ -80,6 +80,8 @@ RAPID_PENALTY_DECAY_DEFAULT = 0.996
 
 
 def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str, Any]:
+    """Build sampling parameters for training or validation agent loops."""
+
     def sampling_value(sampling_config: Any, key: str, default: Any) -> Any:
         if hasattr(sampling_config, "get"):
             return sampling_config.get(key, default)
@@ -93,9 +95,7 @@ def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str
         top_k=sampling_config.top_k,
         presence_penalty=sampling_value(sampling_config, "presence_penalty", 0.0),
         repetition_penalty=sampling_value(sampling_config, "repetition_penalty", 1.0),
-        penalty_decay=sampling_value(
-            sampling_config, "penalty_decay", RAPID_PENALTY_DECAY_DEFAULT
-        ),
+        penalty_decay=sampling_value(sampling_config, "penalty_decay", RAPID_PENALTY_DECAY_DEFAULT),
         logprobs=logprobs,
     )
     if validate:
@@ -291,9 +291,7 @@ class AgentLoopBase(ABC):
         self.processor = processor
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
-        self.apply_chat_template_kwargs = dict(
-            self.data_config.get("apply_chat_template_kwargs", {}) or {}
-        )
+        self.apply_chat_template_kwargs = dict(self.data_config.get("apply_chat_template_kwargs", {}) or {})
         self.val_apply_chat_template_kwargs = dict(self.apply_chat_template_kwargs)
         self.val_apply_chat_template_kwargs.update(
             dict(self.data_config.get("val_apply_chat_template_kwargs", {}) or {})
@@ -328,9 +326,7 @@ class AgentLoopBase(ABC):
             # Turn separator dropped when the model stops at the assistant close token; restored at
             # turn boundaries in ``ToolAgentLoop._handle_processing_tools_state``.
             self.turn_separator = initialize_turn_separator(processing_class, **self.apply_chat_template_kwargs)
-            self.val_system_prompt = initialize_system_prompt(
-                processing_class, **self.val_apply_chat_template_kwargs
-            )
+            self.val_system_prompt = initialize_system_prompt(processing_class, **self.val_apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:

@@ -78,7 +78,7 @@ def _normalize_gathered_metric_values(values):
         return values
     if isinstance(values[0], Metric):
         return Metric.aggregate_dp(values)
-    if isinstance(values[0], (list, tuple)):
+    if isinstance(values[0], list | tuple):
         return list(chain.from_iterable(values))
     return values
 

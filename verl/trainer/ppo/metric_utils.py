@@ -624,7 +624,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["response_repetition/truncated_ratio"] = float(np.mean(repetition_truncated.astype(np.float32)))
         metrics["response_repetition/truncated_count"] = float(np.sum(repetition_truncated.astype(np.float32)))
 
-    matched_reasons = [str(value) for value in _iter_non_tensor_values(batch, "repetition_matched_reason") or () if value]
+    matched_reasons = [
+        str(value) for value in _iter_non_tensor_values(batch, "repetition_matched_reason") or () if value
+    ]
     if matched_reasons:
         reason_denominator = int(repetition_truncated.size) if repetition_truncated.size > 0 else len(matched_reasons)
         for reason in sorted(set(matched_reasons)):
@@ -661,9 +663,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["response_repetition/suspicious_script_ratio_mean"] = float(np.mean(suspicious_script_ratio))
         metrics["response_repetition/suspicious_script_ratio_max"] = float(np.max(suspicious_script_ratio))
 
-    script_window_suspicious_ratio = _numeric_non_tensor_values(
-        batch, "repetition_script_window_suspicious_ratio"
-    )
+    script_window_suspicious_ratio = _numeric_non_tensor_values(batch, "repetition_script_window_suspicious_ratio")
     if script_window_suspicious_ratio.size > 0:
         metrics["response_repetition/script_window_suspicious_ratio_mean"] = float(
             np.mean(script_window_suspicious_ratio)

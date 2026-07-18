@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 
 def _load_engine_module(name: str):
-    verl_root = Path(__file__).resolve().parents[2]
+    verl_root = Path(__file__).resolve().parents[4]
     path = verl_root / f"verl/workers/engine/rwkv_lm/{name}.py"
     spec = importlib.util.spec_from_file_location(f"rwkv_lm_{name}_test", path)
     module = importlib.util.module_from_spec(spec)

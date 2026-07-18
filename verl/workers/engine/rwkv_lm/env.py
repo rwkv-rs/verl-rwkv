@@ -24,7 +24,6 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-
 RWKV_LM_ENV_KEYS = (
     "RWKV_MY_TESTING",
     "RWKV_KERNEL",

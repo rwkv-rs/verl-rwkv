@@ -19,7 +19,8 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-VLLM_RWKV_PATH = Path(__file__).resolve().parents[5] / "src" / "infer" / "vllm-rwkv"
+VERL_ROOT = Path(__file__).resolve().parents[4]
+VLLM_RWKV_PATH = VERL_ROOT.parents[2] / "src" / "infer" / "vllm-rwkv"
 if str(VLLM_RWKV_PATH) not in sys.path:
     sys.path.insert(0, str(VLLM_RWKV_PATH))
 

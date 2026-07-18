@@ -20,7 +20,6 @@ from typing import Any
 
 from omegaconf import DictConfig
 
-
 RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
 
 

@@ -65,7 +65,7 @@ class PickleableRWKVTokenizer:
 
     @property
     def vocab_size(self) -> int:
-        return int(getattr(self._tokenizer, "vocab_size"))
+        return int(self._tokenizer.vocab_size)
 
     def __len__(self) -> int:
         return len(self._tokenizer)
@@ -97,9 +97,7 @@ class PickleableRWKVTokenizer:
             if tools is not None:
                 template_kwargs["tools"] = tools
             if "rwkv_generation_prompt" in kwargs:
-                template_kwargs["rwkv_generation_prompt"] = kwargs[
-                    "rwkv_generation_prompt"
-                ]
+                template_kwargs["rwkv_generation_prompt"] = kwargs["rwkv_generation_prompt"]
             if "add_special_tokens" in kwargs:
                 template_kwargs["add_special_tokens"] = kwargs["add_special_tokens"]
             output = self._tokenizer.apply_chat_template(

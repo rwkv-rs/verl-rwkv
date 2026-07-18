@@ -24,7 +24,7 @@ from tensordict import TensorDict
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
-from verl.utils.device import get_device_name
+from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, restore_dynamic_batch
 from verl.workers.config import HFModelConfig, RWKVLMEngineConfig, RWKVLMOptimizerConfig
@@ -302,9 +302,10 @@ class RWKVLMEngine(BaseEngine):
                 for key, value in state.items():
                     if hasattr(value, "to"):
                         state[key] = value.to(device)
-        if device == "cpu" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+        torch_device = get_torch_device()
+        if device == "cpu" and torch_device.is_available():
+            torch_device.empty_cache()
+            torch_device.ipc_collect()
 
     def save_checkpoint(
         self,
@@ -351,12 +352,12 @@ class RWKVLMEngine(BaseEngine):
     def _normalize_optimizers(self, optimizers: Any) -> tuple[Any, Any]:
         if isinstance(optimizers, tuple) and len(optimizers) == 2:
             optimizer, scheduler = optimizers
-            if isinstance(optimizer, (list, tuple)):
+            if isinstance(optimizer, list | tuple):
                 optimizer = optimizer[0] if optimizer else None
-            if isinstance(scheduler, (list, tuple)):
+            if isinstance(scheduler, list | tuple):
                 scheduler = scheduler[0] if scheduler else None
             return optimizer, scheduler
-        if isinstance(optimizers, (list, tuple)):
+        if isinstance(optimizers, list | tuple):
             return optimizers[0] if optimizers else None, None
         return optimizers, None
 
@@ -574,8 +575,7 @@ class RWKVLMEngine(BaseEngine):
             )
         if int(log_probs.size(-1)) != response_length:
             raise RuntimeError(
-                f"RWKV infctx chunked log-prob path produced {log_probs.size(-1)} tokens, "
-                f"expected {response_length}."
+                f"RWKV infctx chunked log-prob path produced {log_probs.size(-1)} tokens, expected {response_length}."
             )
         return build_verl_loss_model_output(log_probs=log_probs)
 

@@ -100,8 +100,7 @@ def test_text_detector_truncates_low_zstd_ratio_repetition():
 def test_text_detector_truncates_low_zstd_ratio_recent_window():
     text = (
         "This prefix contains enough normal mathematical prose before the model starts looping. " * 20
-        + "gcd(a, ar) gcd(a, ar) gcd(a, ar) "
-        * 80
+        + "gcd(a, ar) gcd(a, ar) gcd(a, ar) " * 80
     ).encode("utf-8")
     token_ids = list(text)
     detector = NGramRepetitionDetector(
@@ -146,10 +145,7 @@ def test_text_detector_does_not_truncate_high_zstd_ratio_by_default():
 
 
 def test_text_detector_treats_mathematical_styled_letters_as_allowed_scripts():
-    text = (
-        "We use styled math letters such as 𝒙, 𝔸, ℝ, 𝛼, 𝜷, and 𝝅 in a normal derivation. "
-        * 12
-    ).encode("utf-8")
+    text = ("We use styled math letters such as 𝒙, 𝔸, ℝ, 𝛼, 𝜷, and 𝝅 in a normal derivation. " * 12).encode("utf-8")
     token_ids = list(text)
     detector = NGramRepetitionDetector(
         rules=[(16, 1000)],
@@ -167,12 +163,7 @@ def test_text_detector_treats_mathematical_styled_letters_as_allowed_scripts():
 
 
 def test_text_detector_truncates_multilingual_script_soup():
-    text = (
-        "We start by solving the equation carefully. "
-        * 12
-        + "한жا日 "
-        * 18
-    ).encode("utf-8")
+    text = ("We start by solving the equation carefully. " * 12 + "한жا日 " * 18).encode("utf-8")
     token_ids = list(text)
     detector = NGramRepetitionDetector(
         rules=[(16, 1000)],
@@ -192,9 +183,7 @@ def test_text_detector_truncates_multilingual_script_soup():
 
 def test_text_detector_truncates_late_multilingual_script_soup():
     text = (
-        " ".join(f"prefix{index}" for index in range(4000))
-        + " "
-        + ("한" * 4 + "ж" * 4 + "ا" * 4 + "ก" * 4 + " ") * 3
+        " ".join(f"prefix{index}" for index in range(4000)) + " " + ("한" * 4 + "ж" * 4 + "ا" * 4 + "ก" * 4 + " ") * 3
     ).encode("utf-8")
     token_ids = list(text)
     detector = NGramRepetitionDetector(
@@ -218,11 +207,7 @@ def test_text_detector_truncates_late_multilingual_script_soup():
 
 
 def test_text_detector_truncates_dense_single_suspicious_script_window():
-    text = (
-        " ".join(f"prefix{index}" for index in range(400))
-        + " "
-        + "ж" * 20
-    ).encode("utf-8")
+    text = (" ".join(f"prefix{index}" for index in range(400)) + " " + "ж" * 20).encode("utf-8")
     token_ids = list(text)
     detector = NGramRepetitionDetector(
         rules=[(16, 1000)],
@@ -243,11 +228,9 @@ def test_text_detector_truncates_dense_single_suspicious_script_window():
 
 
 def test_text_detector_truncates_long_text_ngram_repetition():
-    text = (
-        " ".join(f"prefix{index}" for index in range(300))
-        + "wait let us check the same case again "
-        * 14
-    ).encode("utf-8")
+    text = (" ".join(f"prefix{index}" for index in range(300)) + "wait let us check the same case again " * 14).encode(
+        "utf-8"
+    )
     token_ids = list(text)
     detector = NGramRepetitionDetector(
         rules=[(16, 1000)],
@@ -273,8 +256,7 @@ def test_text_detector_records_reasoning_markers_without_truncating():
     text = (
         " ".join(f"prefix{index}" for index in range(300))
         + " "
-        + "Wait, maybe this is wrong. Alternatively, let's start over. "
-        * 8
+        + "Wait, maybe this is wrong. Alternatively, let's start over. " * 8
     ).encode("utf-8")
     token_ids = list(text)
     detector = NGramRepetitionDetector(

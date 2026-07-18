@@ -33,7 +33,6 @@ from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
-from vllm.outputs import RequestOutput
 from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
 from vllm.tokenizers.rwkv_defaults import (
     RWKV_DEFAULT_STOP_TOKEN_IDS,
@@ -797,9 +796,7 @@ class vLLMHttpServer:
         stop_reason_raw = final_res.outputs[0].stop_reason
         extra_fields["finish_reason"] = finish_reason
         extra_fields["backend_stop_reason"] = stop_reason_raw
-        engine_repetition_truncated = (
-            finish_reason == "repetition" or stop_reason_raw == "repetition_detected"
-        )
+        engine_repetition_truncated = finish_reason == "repetition" or stop_reason_raw == "repetition_detected"
         original_response_length = (
             len(observed_token_ids) if observed_token_ids else len(final_res.outputs[0].token_ids)
         )
@@ -821,8 +818,7 @@ class vLLMHttpServer:
                     original_response_length=original_response_length,
                     matched_rule=repetition_detector.matched_rule,
                     matched_reason=repetition_detector.matched_reason,
-                    matched_text_stats=repetition_detector.matched_text_stats
-                    or repetition_detector.last_text_stats,
+                    matched_text_stats=repetition_detector.matched_text_stats or repetition_detector.last_text_stats,
                 )
             )
         else:
