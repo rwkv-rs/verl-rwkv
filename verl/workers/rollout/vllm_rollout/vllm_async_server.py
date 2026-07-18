@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import importlib.metadata
 import inspect
 import json
 import logging
@@ -78,7 +79,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     reset_vllm_weight_update_caches,
 )
 
-_VLLM_VERSION = version.parse(vllm.__version__)
+_VLLM_VERSION = version.parse(importlib.metadata.version("vllm"))
 _RESET_PREFIX_CACHE_KWARGS = build_vllm_prefix_cache_reset_kwargs(_VLLM_VERSION)
 
 
@@ -514,7 +515,7 @@ class vLLMHttpServer:
             if _VLLM_VERSION < version.parse("0.22.0"):
                 raise RuntimeError(
                     "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
-                    f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
+                    f"(installed: {_VLLM_VERSION}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
             args.update({"enable_return_routed_experts": True})
