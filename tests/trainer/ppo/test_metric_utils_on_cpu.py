@@ -382,6 +382,21 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertEqual(metrics["response_repetition/unclosed_think_count"], 1.0)
         self.assertEqual(metrics["response_repetition/replacement_count_max"], 3.0)
 
+    def test_compute_data_metrics_reports_disjoint_truncation_rates(self):
+        self.batch.non_tensor_batch = {
+            "finish_reason": np.array(["length", "length"], dtype=object),
+            "repetition_truncated": np.array([False, True], dtype=object),
+        }
+
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+
+        self.assertEqual(metrics["response_truncation/repetition_ratio"], 0.5)
+        self.assertEqual(metrics["response_truncation/repetition_count"], 1.0)
+        self.assertEqual(metrics["response_truncation/max_length_ratio"], 0.5)
+        self.assertEqual(metrics["response_truncation/max_length_count"], 1.0)
+        self.assertEqual(metrics["response_truncation/any_ratio"], 1.0)
+        self.assertEqual(metrics["response_truncation/any_count"], 2.0)
+
 
 class TestComputeTimingMetrics(unittest.TestCase):
     """Tests for the compute_timing_metrics function."""

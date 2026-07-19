@@ -186,6 +186,7 @@ class RWKVLMEngine(BaseEngine):
                 data=data,
                 dp_group=self.get_data_parallel_group(),
                 same_micro_num_in_dp=True,
+                allow_oversized_singleton=True,
             )
             output_lst = [
                 self._forward_backward_micro_batch(micro_batch, loss_function, forward_only=forward_only)
@@ -556,9 +557,7 @@ class RWKVLMEngine(BaseEngine):
                         # log_softmax reduction. Match that definition exactly;
                         # BF16 fused cross entropy over the 65k RWKV vocabulary
                         # is not a like-for-like behavior-policy probability.
-                        log_probs = logprobs_from_logits_v2(
-                            logits=response_logits.float(), labels=response_labels
-                        )
+                        log_probs = logprobs_from_logits_v2(logits=response_logits.float(), labels=response_labels)
                         flat_indices = (offsets[:-1].unsqueeze(1) + positions.unsqueeze(0))[target_mask]
                         if full_log_probs is None:
                             full_log_probs = log_probs.new_zeros(int(offsets[-1].item()))
@@ -634,9 +633,7 @@ class RWKVLMEngine(BaseEngine):
                         self.model.head(hidden[:, local_start:local_end]),
                         data,
                     )
-                    log_probs = logprobs_from_logits_v2(
-                        logits=response_logits.float(), labels=response_labels
-                    )
+                    log_probs = logprobs_from_logits_v2(logits=response_logits.float(), labels=response_labels)
                     log_prob_chunks.append(log_probs)
                     if calculate_entropy:
                         entropy_chunks.append(verl_F.entropy_from_logits(response_logits))

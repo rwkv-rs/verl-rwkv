@@ -686,8 +686,7 @@ class vLLMHttpServer:
         """
         if self.weight_update_state != "active":
             raise RuntimeError(
-                "rollout server cannot generate while weight publication state is "
-                f"{self.weight_update_state!r}"
+                f"rollout server cannot generate while weight publication state is {self.weight_update_state!r}"
             )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
@@ -925,8 +924,10 @@ class vLLMHttpServer:
             stop_reason = "repetition_truncated"
         elif finish_reason == "abort":
             stop_reason = "aborted"
-        elif finish_reason in ("stop", "length"):
+        elif finish_reason == "stop":
             stop_reason = "completed"
+        elif finish_reason == "length":
+            stop_reason = "max_length_truncated"
         else:
             stop_reason = finish_reason  # for more stop reason in the future
 
@@ -1072,8 +1073,7 @@ class vLLMHttpServer:
 
         if self.weight_update_state in {"updating", "poisoned"}:
             raise RuntimeError(
-                "cannot sleep rollout server while weight publication state is "
-                f"{self.weight_update_state!r}"
+                f"cannot sleep rollout server while weight publication state is {self.weight_update_state!r}"
             )
         # vLLM level-2 wake remaps empty weight storage.  Hide the published
         # identity before sleeping so no request can observe sleeping or empty
@@ -1137,8 +1137,7 @@ class vLLMHttpServer:
         """Stage identity after weights finish, but before cache wake completes."""
         if self.weight_update_state != "updating":
             raise RuntimeError(
-                "cannot stage behavior-policy identity while weight update state is "
-                f"{self.weight_update_state!r}"
+                f"cannot stage behavior-policy identity while weight update state is {self.weight_update_state!r}"
             )
         self.behavior_policy_identity = dict(policy_identity)
         self.weight_update_failure = None
@@ -1147,9 +1146,7 @@ class vLLMHttpServer:
     async def begin_weight_update(self):
         """Hide the old identity before any live tensor can be overwritten."""
         if self.weight_update_state == "poisoned":
-            raise RuntimeError(
-                "rollout server is poisoned by a failed weight update and must reload"
-            )
+            raise RuntimeError("rollout server is poisoned by a failed weight update and must reload")
         if self.weight_update_state == "updating":
             raise RuntimeError("rollout server weight update is already active")
         self.behavior_policy_identity = None
@@ -1159,19 +1156,13 @@ class vLLMHttpServer:
     async def finish_weight_update_without_identity(self):
         """Stage a non-strict update while keeping identity metadata absent."""
         if self.weight_update_state != "updating":
-            raise RuntimeError(
-                "cannot finish weight update while state is "
-                f"{self.weight_update_state!r}"
-            )
+            raise RuntimeError(f"cannot finish weight update while state is {self.weight_update_state!r}")
         self.weight_update_state = "weights_ready"
 
     async def activate_weight_update(self):
         """Allow generation only after weights and request cache are both ready."""
         if self.weight_update_state != "weights_ready":
-            raise RuntimeError(
-                "cannot activate rollout weights while state is "
-                f"{self.weight_update_state!r}"
-            )
+            raise RuntimeError(f"cannot activate rollout weights while state is {self.weight_update_state!r}")
         self.weight_update_state = "active"
 
     async def poison_weight_update(self, reason: str):
@@ -1567,9 +1558,7 @@ class vLLMReplica(RolloutReplica):
 
         # get http server address from first server
         server_address, server_port = await self.servers[0].get_server_address.remote()
-        self.runtime_metadata = await asyncio.gather(
-            *[server.get_runtime_metadata.remote() for server in self.servers]
-        )
+        self.runtime_metadata = await asyncio.gather(*[server.get_runtime_metadata.remote() for server in self.servers])
         self._server_handle = self.servers[0]
         self._server_address = (
             f"[{server_address}]:{server_port}"

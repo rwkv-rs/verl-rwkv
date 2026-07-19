@@ -624,6 +624,25 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["response_repetition/truncated_ratio"] = float(np.mean(repetition_truncated.astype(np.float32)))
         metrics["response_repetition/truncated_count"] = float(np.sum(repetition_truncated.astype(np.float32)))
 
+    finish_reasons = [value for value in _iter_non_tensor_values(batch, "finish_reason") or ()]
+    if finish_reasons:
+        denominator = int(response_length.numel())
+        finish_reasons = (finish_reasons + [None] * denominator)[:denominator]
+        repetition_mask = np.zeros(denominator, dtype=np.bool_)
+        repetition_count = min(denominator, repetition_truncated.size)
+        repetition_mask[:repetition_count] = repetition_truncated[:repetition_count]
+        max_length_mask = (
+            np.asarray([reason == "length" for reason in finish_reasons], dtype=np.bool_) & ~repetition_mask
+        )
+        any_truncation_mask = repetition_mask | max_length_mask
+        for name, mask in (
+            ("repetition", repetition_mask),
+            ("max_length", max_length_mask),
+            ("any", any_truncation_mask),
+        ):
+            metrics[f"response_truncation/{name}_ratio"] = float(np.mean(mask.astype(np.float32)))
+            metrics[f"response_truncation/{name}_count"] = float(np.sum(mask.astype(np.float32)))
+
     matched_reasons = [
         str(value) for value in _iter_non_tensor_values(batch, "repetition_matched_reason") or () if value
     ]
