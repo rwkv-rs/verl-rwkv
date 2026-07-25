@@ -70,6 +70,7 @@ from verl.trainer.ppo.utils import (
     need_critic,
     need_reference_policy,
     need_teacher_policy,
+    resolve_automatic_sequence_lengths,
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
@@ -596,6 +597,7 @@ class PPOTrainer(ABC):
             is_train=False,
             max_samples=self.config.data.get("val_max_samples", -1),
         )
+        resolve_automatic_sequence_lengths(self.config, self.train_dataset, self.val_dataset)
 
         # Async drop refills an arbitrary number of dropped prompts, which must divide gen_batch_size,
         # so force gen_batch_size=1.
@@ -1655,9 +1657,7 @@ class PPOTrainer(ABC):
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
         batch_tags = batch.tags
-        non_padding_mask = np.array(
-            [not tag.get("is_padding", False) for tag in batch_tags], dtype=bool
-        )
+        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch_tags], dtype=bool)
         fields = [
             "prompts",
             "responses",
@@ -1728,9 +1728,7 @@ class PPOTrainer(ABC):
         actual_prompt_tokens = int(prompt_length[non_padding_mask].sum().item()) if actual_samples else 0
         actual_response_tokens = int(response_length[non_padding_mask].sum().item()) if actual_samples else 0
         actual_total_tokens = actual_prompt_tokens + actual_response_tokens
-        actual_policy_loss_tokens = (
-            int(metrics_batch.batch["response_mask"].sum().item()) if actual_samples else 0
-        )
+        actual_policy_loss_tokens = int(metrics_batch.batch["response_mask"].sum().item()) if actual_samples else 0
         metrics.update(
             {
                 "training/actual_samples": actual_samples,
@@ -1753,9 +1751,7 @@ class PPOTrainer(ABC):
         # ``batch`` above is intentionally replaced by the metric DataProto;
         # keep using the original TransferQueue tags captured before that
         # conversion for strict policy identity and rollout-tail metrics.
-        identity_tags = [
-            tag for tag in batch_tags if not tag.get("is_padding", False)
-        ]
+        identity_tags = [tag for tag in batch_tags if not tag.get("is_padding", False)]
         if identity_tags and all(tag.get("policy_version") is not None for tag in identity_tags):
             policy_versions = {tag["policy_version"] for tag in identity_tags}
             weight_digests = {tag["weight_digest"] for tag in identity_tags}
@@ -1791,9 +1787,7 @@ class PPOTrainer(ABC):
                     "training/rollout_preemptions": sum(known_preemptions) if known_preemptions else -1,
                     "training/rollout_train_overlap_seconds": 0.0,
                     "training/rollout_effective_concurrency": (
-                        sum(generation_seconds) / timing_raw["gen"]
-                        if timing_raw.get("gen", 0) > 0
-                        else 0.0
+                        sum(generation_seconds) / timing_raw["gen"] if timing_raw.get("gen", 0) > 0 else 0.0
                     ),
                 }
             )

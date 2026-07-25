@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Strict on-policy behavior-policy identity and round state machine.
 
 ``global_steps`` is an execution-loop counter in V1.  It is deliberately not
@@ -161,9 +175,7 @@ class StrictOnPolicyRound:
                     f"expected={identity.as_dict()} actual={acknowledged.as_dict()}"
                 )
 
-    def publish_initial(
-        self, identity: BehaviorPolicyIdentity, acknowledgements: Iterable[Mapping[str, Any]]
-    ) -> None:
+    def publish_initial(self, identity: BehaviorPolicyIdentity, acknowledgements: Iterable[Mapping[str, Any]]) -> None:
         if self.phase is not RoundPhase.UNINITIALIZED:
             raise PolicyIdentityError(f"initial publication is invalid in phase {self.phase.value}")
         self._validate_acknowledgements(identity, acknowledgements)
@@ -223,9 +235,7 @@ class StrictOnPolicyRound:
         raise PolicyIdentityError(reason)
 
 
-def validate_behavior_policy_batch(
-    tags: Iterable[Mapping[str, Any]], *, expected: BehaviorPolicyIdentity
-) -> None:
+def validate_behavior_policy_batch(tags: Iterable[Mapping[str, Any]], *, expected: BehaviorPolicyIdentity) -> None:
     """Validate complete prompt groups and one immutable behavior identity."""
 
     tags = list(tags)
@@ -267,6 +277,5 @@ def validate_behavior_policy_batch(
         indices = {tag["response_index"] for tag in group_tags}
         if len(group_tags) != group_size or indices != set(range(group_size)):
             raise PolicyIdentityError(
-                f"prompt group {group_id} is incomplete: expected {group_size} responses, "
-                f"got indices {sorted(indices)}"
+                f"prompt group {group_id} is incomplete: expected {group_size} responses, got indices {sorted(indices)}"
             )

@@ -524,9 +524,7 @@ class CheckpointEngineManager:
 
         # 5. update weights of all workers
         results = ray.get(
-            actor_wg.update_weights(
-                global_steps=global_steps, mode=self.backend, policy_identity=policy_identity
-            )
+            actor_wg.update_weights(global_steps=global_steps, mode=self.backend, policy_identity=policy_identity)
             + rollout.update_weights(global_steps=global_steps, policy_identity=policy_identity)
         )
         # The sender workers return the engine's per-sync metrics (empty for

@@ -212,6 +212,7 @@ def test_agent_loop_validation_sampling_params_include_penalties():
             "top_p": 0.8,
             "top_k": 32,
             "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
             "repetition_penalty": 1.0,
             "penalty_decay": 0.996,
             "calculate_log_probs": True,
@@ -220,6 +221,7 @@ def test_agent_loop_validation_sampling_params_include_penalties():
                 "top_p": 0.35,
                 "top_k": 40,
                 "presence_penalty": 0.65,
+                "frequency_penalty": 0.1,
                 "repetition_penalty": 0.25,
                 "penalty_decay": 0.99,
             },
@@ -232,6 +234,7 @@ def test_agent_loop_validation_sampling_params_include_penalties():
     assert sampling_params["top_p"] == 0.35
     assert sampling_params["top_k"] == 40
     assert sampling_params["presence_penalty"] == 0.65
+    assert sampling_params["frequency_penalty"] == 0.1
     assert sampling_params["repetition_penalty"] == 0.25
     assert sampling_params["penalty_decay"] == 0.99
     assert sampling_params["logprobs"] is None
@@ -245,6 +248,7 @@ def test_agent_loop_training_sampling_params_keep_rollout_logprobs():
             "top_p": 0.8,
             "top_k": 32,
             "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
             "repetition_penalty": 1.0,
             "penalty_decay": 0.996,
             "calculate_log_probs": True,
@@ -255,24 +259,5 @@ def test_agent_loop_training_sampling_params_keep_rollout_logprobs():
     sampling_params = build_agent_loop_sampling_params(config, validate=False)
 
     assert sampling_params["logprobs"] is True
-
-
-def test_agent_loop_fixed_length_training_disables_repetition_abort():
-    config = OmegaConf.create(
-        {
-            "temperature": 1.0,
-            "top_p": 0.8,
-            "top_k": 32,
-            "presence_penalty": 0.0,
-            "repetition_penalty": 1.0,
-            "penalty_decay": 0.996,
-            "calculate_log_probs": True,
-            "ignore_eos": True,
-            "val_kwargs": {},
-        }
-    )
-
-    sampling_params = build_agent_loop_sampling_params(config, validate=False)
-
-    assert sampling_params["logprobs"] is True
-    assert sampling_params["repetition_detection"] is None
+    assert sampling_params["frequency_penalty"] == 0.0
+    assert "repetition_detection" not in sampling_params

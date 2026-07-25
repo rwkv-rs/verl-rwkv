@@ -118,12 +118,8 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     selected_rollout_probs = torch.exp(selected_rollout_log_probs)
     max_diff_index = int(torch.argmax(rollout_probs_diff).item())
     actor_leads_mask = response_mask_bool[:, :-1] & response_mask_bool[:, 1:]
-    actor_leads_corr = pearson_correlation_coefficient(
-        actor_probs[:, :-1], rollout_probs[:, 1:], actor_leads_mask
-    )
-    rollout_leads_corr = pearson_correlation_coefficient(
-        actor_probs[:, 1:], rollout_probs[:, :-1], actor_leads_mask
-    )
+    actor_leads_corr = pearson_correlation_coefficient(actor_probs[:, :-1], rollout_probs[:, 1:], actor_leads_mask)
+    rollout_leads_corr = pearson_correlation_coefficient(actor_probs[:, 1:], rollout_probs[:, :-1], actor_leads_mask)
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),

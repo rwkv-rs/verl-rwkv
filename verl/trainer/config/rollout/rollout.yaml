@@ -25,6 +25,9 @@ top_p: 1
 # Presence penalty for vLLM/RWKV rapid-sampling. Default 0.0 keeps old behavior.
 presence_penalty: 0.0
 
+# Frequency penalty for generated tokens. Default 0.0 keeps old behavior.
+frequency_penalty: 0.0
+
 # Repetition penalty for vLLM/RWKV rapid-sampling. Default 1.0 keeps old behavior.
 repetition_penalty: 1.0
 
@@ -174,6 +177,9 @@ val_kwargs:
 
   # Presence penalty for vLLM/RWKV rapid-sampling.
   presence_penalty: 0.0
+
+  # Frequency penalty for generated tokens.
+  frequency_penalty: 0.0
 
   # Repetition penalty for vLLM/RWKV rapid-sampling.
   repetition_penalty: 1.0

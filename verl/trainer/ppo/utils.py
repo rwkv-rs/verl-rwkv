@@ -124,9 +124,15 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)
-    dataset_config = data_config
+    prompt_key_config = "train_prompt_key" if is_train else "val_prompt_key"
+    prompt_key = data_config.get(
+        prompt_key_config,
+        data_config.get("prompt_key", "prompt"),
+    )
+    dataset_config = OmegaConf.create(OmegaConf.to_container(data_config, resolve=False))
+    with open_dict(dataset_config):
+        dataset_config.prompt_key = prompt_key
     if not is_train and data_config.get("val_apply_chat_template_kwargs", None):
-        dataset_config = OmegaConf.create(OmegaConf.to_container(data_config, resolve=False))
         train_kwargs = dict(dataset_config.get("apply_chat_template_kwargs", {}) or {})
         train_kwargs.update(dict(dataset_config.get("val_apply_chat_template_kwargs", {}) or {}))
         with open_dict(dataset_config):
@@ -142,6 +148,53 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     )
 
     return dataset
+
+
+def resolve_automatic_sequence_lengths(config: DictConfig, *datasets) -> tuple[int, int] | None:
+    """Resolve prompt/response lengths from the selected, templated datasets.
+
+    The CLI supplies only the model context derived from the checkpoint name.
+    Dataset construction measures every selected prompt after applying its train
+    or validation chat template. This function publishes the shared maximum
+    before any actor or rollout worker starts.
+    """
+
+    if not config.data.get("derive_sequence_lengths", False):
+        return None
+
+    context_length = int(config.data.model_context_length)
+    measured_lengths = [
+        int(dataset.max_templated_prompt_length)
+        for dataset in datasets
+        if dataset is not None and hasattr(dataset, "max_templated_prompt_length")
+    ]
+    if len(measured_lengths) != len([dataset for dataset in datasets if dataset is not None]):
+        raise RuntimeError(
+            "automatic sequence-length derivation requires every dataset to expose max_templated_prompt_length"
+        )
+    if not measured_lengths:
+        raise RuntimeError("automatic sequence-length derivation requires at least one dataset")
+
+    max_prompt_length = max(measured_lengths)
+    max_response_length = context_length - max_prompt_length
+    if max_response_length <= 0:
+        raise RuntimeError(
+            "the longest templated dataset prompt does not leave room for a response: "
+            f"context={context_length}, max_prompt={max_prompt_length}"
+        )
+
+    with open_dict(config):
+        config.data.max_prompt_length = max_prompt_length
+        config.data.max_response_length = max_response_length
+        config.actor_rollout_ref.rollout.prompt_length = max_prompt_length
+        config.actor_rollout_ref.rollout.response_length = max_response_length
+
+    print(
+        "resolved automatic sequence lengths: "
+        f"context={context_length}, max_prompt={max_prompt_length}, "
+        f"max_response={max_response_length}"
+    )
+    return max_prompt_length, max_response_length
 
 
 def create_rl_sampler(data_config, dataset):

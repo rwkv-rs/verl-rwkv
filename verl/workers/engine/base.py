@@ -136,9 +136,7 @@ class BaseEngine:
             outputs["metrics"]["grad_norm"] = grad_norm
             outputs["metrics"].update({f"timing/{key}": value for key, value in timing.items()})
             optimizer_timing = getattr(self, "last_optimizer_timing", {})
-            outputs["metrics"].update(
-                {f"timing/{key}": value for key, value in optimizer_timing.items()}
-            )
+            outputs["metrics"].update({f"timing/{key}": value for key, value in optimizer_timing.items()})
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:

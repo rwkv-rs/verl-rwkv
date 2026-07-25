@@ -291,8 +291,7 @@ class ServerAdapter(BaseRollout):
                 use_shm=self.use_shm,
             )
             if _should_expand_vllm_moe_params() and not (
-                kwargs.get("peft_config") is not None
-                and kwargs.get("base_sync_done", False)
+                kwargs.get("peft_config") is not None and kwargs.get("base_sync_done", False)
             ):
                 weights = _iter_vllm_compatible_moe_params(weights)
             await sender.async_send_weights(weights)
@@ -307,9 +306,7 @@ class ServerAdapter(BaseRollout):
                 if global_steps is not None:
                     await self.server_handle.set_global_steps.remote(global_steps)
                 if policy_identity is not None:
-                    await self.server_handle.stage_behavior_policy_identity.remote(
-                        policy_identity
-                    )
+                    await self.server_handle.stage_behavior_policy_identity.remote(policy_identity)
                 else:
                     await self.server_handle.finish_weight_update_without_identity.remote()
         except BaseException as exc:
@@ -317,9 +314,7 @@ class ServerAdapter(BaseRollout):
                 try:
                     await self.server_handle.poison_weight_update.remote(repr(exc))
                 except BaseException:
-                    logger.exception(
-                        "failed to mark rollout server poisoned after weight update error"
-                    )
+                    logger.exception("failed to mark rollout server poisoned after weight update error")
             raise
 
         if self.replica_rank == 0 and self.rollout_rank == 0:

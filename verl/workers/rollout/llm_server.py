@@ -62,6 +62,7 @@ def resolve_rollout_topology(
         )
     return gpus_per_replica, world_size // gpus_per_replica
 
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -502,9 +503,7 @@ class LLMServerManager:
             raise RuntimeError(f"rollout replicas returned duplicate endpoints: {self.server_addresses}")
         deployments = [metadata for replica in self.rollout_replicas for metadata in replica.runtime_metadata]
         gpu_bindings = [
-            (deployment["node_id"], gpu)
-            for deployment in deployments
-            for gpu in deployment["cuda_visible_devices"]
+            (deployment["node_id"], gpu) for deployment in deployments for gpu in deployment["cuda_visible_devices"]
         ]
         if len(gpu_bindings) != world_size or len(gpu_bindings) != len(set(gpu_bindings)):
             raise RuntimeError(

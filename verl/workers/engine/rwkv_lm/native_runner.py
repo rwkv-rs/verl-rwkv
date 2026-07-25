@@ -28,6 +28,8 @@ from typing import Any
 
 import torch
 
+from verl.utils.device import get_device_name, is_device_available
+
 from .args import build_rwkv_lm_args
 from .checkpoint import load_rwkv_lm_checkpoint
 from .env import build_rwkv_lm_env, rwkv_lm_env
@@ -126,10 +128,10 @@ class NativeRWKVLMRunner:
         model_module = self.model_module
         if model_module is None:
             model_module, _ = self.import_native_modules()
-        direct_cuda_construction = (
-            not bool(getattr(self.engine_config, "param_offload", False)) and torch.cuda.is_available()
+        direct_accelerator_construction = (
+            not bool(getattr(self.engine_config, "param_offload", False)) and is_device_available()
         )
-        device_context = torch.device("cuda") if direct_cuda_construction else nullcontext()
+        device_context = torch.device(get_device_name()) if direct_accelerator_construction else nullcontext()
         with rwkv_lm_env(self.args, extra_env=self._engine_native_env()), device_context:
             model = model_module.RWKV(self.args)
         if self.args.load_model:

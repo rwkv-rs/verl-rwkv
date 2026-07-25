@@ -503,6 +503,7 @@ class RayPPOTrainer:
             "top_p",
             "top_k",
             "presence_penalty",
+            "frequency_penalty",
             "repetition_penalty",
             "penalty_decay",
             "logprobs",

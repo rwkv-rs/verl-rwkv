@@ -194,76 +194,79 @@ class RLHFDataset(Dataset):
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
+    def _templated_prompt_length(self, doc: dict) -> int:
+        """Return the rollout-visible prompt length after applying the chat template."""
+
+        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+        if self.tool_schemas is not None:
+            apply_kwargs["tools"] = self.tool_schemas
+
+        if self.processor is not None:
+            messages = self._build_messages(doc, key=self.prompt_key)
+            raw_prompt = self.processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
+            )
+            images, videos, audios = self._process_multi_modal_info(messages, self.image_patch_size, self.config)
+            if images is None and videos is None and audios is None:
+                token_ids = self.processor.tokenizer(
+                    text=raw_prompt,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                )["input_ids"]
+            else:
+                token_ids = build_multimodal_processor_inputs(
+                    self.processor,
+                    text=[raw_prompt],
+                    images=images,
+                    videos=videos,
+                    audio=audios,
+                    mm_processor_kwargs=self.mm_processor_kwargs,
+                )["input_ids"][0]
+        else:
+            # Keep explicit tokenization to avoid transformers version default changes.
+            apply_kwargs.pop("tokenize", None)
+            apply_kwargs.pop("return_dict", None)
+            apply_kwargs.pop("return_tensors", None)
+            token_ids = self.tokenizer.apply_chat_template(
+                doc[self.prompt_key],
+                add_generation_prompt=True,
+                tokenize=True,
+                **apply_kwargs,
+            )
+
+        normalized = normalize_token_ids(token_ids)
+        prefix_token_id = self.config.get("prompt_prefix_token_id", None)
+        if prefix_token_id is not None and (not normalized or normalized[0] != int(prefix_token_id)):
+            return len(normalized) + 1
+        return len(normalized)
+
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
+        if self.config.get("derive_sequence_lengths", False):
+            length_column = "__verl_templated_prompt_length"
+            measured = dataframe.map(
+                lambda doc: {length_column: self._templated_prompt_length(doc)},
+                num_proc=self.num_workers,
+                desc="Measuring templated prompt lengths",
+            )
+            if len(measured) == 0:
+                raise ValueError("cannot derive sequence lengths from an empty dataset")
+            self.max_templated_prompt_length = max(int(value) for value in measured[length_column])
+            print(
+                "maximum templated prompt length: "
+                f"{self.max_templated_prompt_length} tokens across {len(measured)} samples"
+            )
+            return measured.remove_columns(length_column)
+
         # filter out too long prompts
         if self.filter_overlong_prompts:
-            tokenizer = self.tokenizer
-            processor = self.processor
-            prompt_key = self.prompt_key
 
-            if processor is not None:
-
-                def doc2len(doc) -> int:
-                    try:
-                        messages = self._build_messages(doc, key=self.prompt_key)
-                        # pass tool schemas if available so the processor can format prompts
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        raw_prompt = self.processor.apply_chat_template(
-                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
-                        )
-                        images, videos, audios = self._process_multi_modal_info(
-                            messages, self.image_patch_size, self.config
-                        )
-                        if images is None and videos is None and audios is None:
-                            # only text prompt
-                            return len(
-                                processor.tokenizer(
-                                    text=raw_prompt,
-                                    add_special_tokens=False,  # avoid adding special tokens
-                                    return_attention_mask=False,
-                                )["input_ids"]
-                            )
-                        else:
-                            # multi-modal prompt
-                            return len(
-                                build_multimodal_processor_inputs(
-                                    processor,
-                                    text=[raw_prompt],
-                                    images=images,
-                                    videos=videos,
-                                    audio=audios,
-                                    mm_processor_kwargs=self.mm_processor_kwargs,
-                                )["input_ids"][0]
-                            )
-                    except Exception:
-                        print("Error processing one of the samples, skipping...")
-                        traceback.print_exc()
-                        return self.max_prompt_length + 1
-
-            else:
-
-                def doc2len(doc) -> int:
-                    try:
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        # Keep explicit tokenization to avoid transformers version default changes.
-                        apply_kwargs.pop("tokenize", None)
-                        apply_kwargs.pop("return_dict", None)
-                        apply_kwargs.pop("return_tensors", None)
-
-                        tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
-                        )
-                        return len(normalize_token_ids(tokenized_prompt))
-                    except Exception:
-                        print("Error processing one of the samples, skipping...")
-                        traceback.print_exc()
-                        return self.max_prompt_length + 1
+            def doc2len(doc) -> int:
+                try:
+                    return self._templated_prompt_length(doc)
+                except Exception:
+                    print("Error processing one of the samples, skipping...")
+                    traceback.print_exc()
+                    return self.max_prompt_length + 1
 
             dataframe = dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,

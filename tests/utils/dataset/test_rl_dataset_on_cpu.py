@@ -15,7 +15,9 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
+import datasets
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -54,6 +56,8 @@ def test_create_rl_dataset_uses_validation_chat_template_kwargs_for_eval(monkeyp
 
     config = OmegaConf.create(
         {
+            "train_prompt_key": "source_prompt",
+            "val_prompt_key": "prompt",
             "apply_chat_template_kwargs": {
                 "rwkv_generation_prompt": "open_think",
                 "shared_key": "shared_value",
@@ -68,9 +72,100 @@ def test_create_rl_dataset_uses_validation_chat_template_kwargs_for_eval(monkeyp
     create_rl_dataset(["validation.parquet"], config, tokenizer=None, processor=None, is_train=False)
 
     assert captured_configs[0].apply_chat_template_kwargs.rwkv_generation_prompt == "open_think"
+    assert captured_configs[0].prompt_key == "source_prompt"
     assert captured_configs[1].apply_chat_template_kwargs.rwkv_generation_prompt == "fake_think"
     assert captured_configs[1].apply_chat_template_kwargs.shared_key == "shared_value"
+    assert captured_configs[1].prompt_key == "prompt"
     assert config.apply_chat_template_kwargs.rwkv_generation_prompt == "open_think"
+    assert "prompt_key" not in config
+
+
+def test_automatic_sequence_lengths_use_maximum_templated_prompt_across_datasets():
+    from verl.trainer.ppo.utils import resolve_automatic_sequence_lengths
+
+    config = OmegaConf.create(
+        {
+            "data": {
+                "derive_sequence_lengths": True,
+                "model_context_length": 100,
+                "max_prompt_length": None,
+                "max_response_length": None,
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "prompt_length": None,
+                    "response_length": None,
+                }
+            },
+        }
+    )
+
+    assert resolve_automatic_sequence_lengths(
+        config,
+        SimpleNamespace(max_templated_prompt_length=31),
+        SimpleNamespace(max_templated_prompt_length=43),
+    ) == (43, 57)
+    assert config.data.max_prompt_length == 43
+    assert config.data.max_response_length == 57
+    assert config.actor_rollout_ref.rollout.prompt_length == 43
+    assert config.actor_rollout_ref.rollout.response_length == 57
+
+
+def test_automatic_sequence_lengths_reject_prompt_that_consumes_context():
+    from verl.trainer.ppo.utils import resolve_automatic_sequence_lengths
+
+    config = OmegaConf.create(
+        {
+            "data": {
+                "derive_sequence_lengths": True,
+                "model_context_length": 43,
+                "max_prompt_length": None,
+                "max_response_length": None,
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "prompt_length": None,
+                    "response_length": None,
+                }
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="does not leave room for a response"):
+        resolve_automatic_sequence_lengths(
+            config,
+            SimpleNamespace(max_templated_prompt_length=43),
+        )
+
+
+def test_dataset_auto_length_measurement_does_not_filter_prompts():
+    class FakeTokenizer:
+        @staticmethod
+        def apply_chat_template(messages, **kwargs):
+            del kwargs
+            return list(range(1, len(messages[0]["content"]) + 1))
+
+    dataset = RLHFDataset.__new__(RLHFDataset)
+    dataset.config = OmegaConf.create({"derive_sequence_lengths": True, "prompt_prefix_token_id": 0})
+    dataset.num_workers = None
+    dataset.tokenizer = FakeTokenizer()
+    dataset.processor = None
+    dataset.prompt_key = "prompt"
+    dataset.apply_chat_template_kwargs = {}
+    dataset.tool_schemas = None
+    dataset.max_prompt_length = 1
+
+    dataframe = datasets.Dataset.from_list(
+        [
+            {"prompt": [{"role": "user", "content": "abc"}]},
+            {"prompt": [{"role": "user", "content": "abcdefgh"}]},
+        ]
+    )
+
+    measured = dataset.maybe_filter_out_long_prompts(dataframe)
+
+    assert len(measured) == 2
+    assert dataset.max_templated_prompt_length == 9
 
 
 def get_gsm8k_data():

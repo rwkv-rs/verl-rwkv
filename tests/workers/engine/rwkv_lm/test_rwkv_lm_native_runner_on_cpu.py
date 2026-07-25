@@ -117,7 +117,8 @@ def test_native_runner_constructs_non_offloaded_model_directly_on_cuda(monkeypat
     def importer(module_name, **kwargs):
         return model_module if module_name == "src.model" else trainer_module
 
-    monkeypatch.setattr(runner_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runner_module, "is_device_available", lambda: True)
+    monkeypatch.setattr(runner_module, "get_device_name", lambda: "cuda")
     monkeypatch.setattr(runner_module.torch, "device", FakeDeviceContext)
     runner = runner_module.NativeRWKVLMRunner(
         engine_config=SimpleNamespace(param_offload=False),

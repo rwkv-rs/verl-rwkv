@@ -94,14 +94,14 @@ def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str
         top_p=sampling_config.top_p,
         top_k=sampling_config.top_k,
         presence_penalty=sampling_value(sampling_config, "presence_penalty", 0.0),
+        frequency_penalty=sampling_value(sampling_config, "frequency_penalty", 0.0),
         repetition_penalty=sampling_value(sampling_config, "repetition_penalty", 1.0),
         penalty_decay=sampling_value(sampling_config, "penalty_decay", RAPID_PENALTY_DECAY_DEFAULT),
         logprobs=logprobs,
     )
-    if validate or sampling_value(config, "ignore_eos", False):
-        # Validation must match offline eval. Fixed-length training rollouts must
-        # also disable repetition aborts: ignore_eos=True is an exact-length
-        # contract, so neither EOS nor the repetition detector may stop early.
+    if validate:
+        # Validation matches the offline evaluator, which does not enable the
+        # rollout-only repetition detector.
         sampling_params["repetition_detection"] = None
     return sampling_params
 
@@ -117,9 +117,10 @@ def _prompt_with_single_prefix_token(
     if not prompt_ids or prompt_ids[0] != prefix_token_id:
         prompt_ids = [prefix_token_id, *prompt_ids]
     if max_length is not None and len(prompt_ids) > max_length:
-        if max_length < 1:
-            raise ValueError("Prompt prefix requires max_length >= 1")
-        prompt_ids = [prompt_ids[0], *prompt_ids[-(max_length - 1) :]]
+        raise ValueError(
+            f"Prompt with required prefix has {len(prompt_ids)} tokens, exceeding "
+            f"dataset-derived max_length={max_length}; prefix insertion never truncates"
+        )
     return prompt_ids
 
 
@@ -436,12 +437,12 @@ class AgentLoopBase(ABC):
     def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
-            logger.warning(
-                "Prompt of %d tokens exceeds rollout.prompt_length=%d; left-truncating.",
-                len(prompt_ids),
-                prompt_length,
+            raise ValueError(
+                f"Templated prompt produced {len(prompt_ids)} tokens, exceeding the "
+                f"dataset-derived rollout.prompt_length={prompt_length}. This indicates "
+                "that dataset measurement and rollout templating diverged; prompts are "
+                "never silently truncated."
             )
-            return prompt_ids[-prompt_length:]
         return prompt_ids
 
     async def apply_chat_template(

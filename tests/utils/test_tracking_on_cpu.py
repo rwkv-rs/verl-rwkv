@@ -16,7 +16,15 @@ import sys
 import types
 from unittest.mock import MagicMock, patch
 
-from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+
+
+class _Backend:
+    def __init__(self):
+        self.finish_calls = []
+
+    def finish(self, **kwargs):
+        self.finish_calls.append(kwargs)
 
 
 def test_validation_generations_logger_logs_trackio_traces():
@@ -46,3 +54,15 @@ def test_validation_generations_logger_logs_trackio_traces():
     assert trace_kwargs["metadata"]["score"] == 0.5
     mock_trackio.log.assert_called_once()
     assert mock_trackio.log.call_args.kwargs["step"] == 7
+
+
+def test_tracking_finish_is_idempotent():
+    tracking = Tracking.__new__(Tracking)
+    tracking._finished = False
+    tracking.logger = {"wandb": _Backend(), "file": _Backend()}
+
+    tracking.finish()
+    tracking.finish()
+
+    assert tracking.logger["wandb"].finish_calls == [{"exit_code": 0}]
+    assert tracking.logger["file"].finish_calls == [{}]

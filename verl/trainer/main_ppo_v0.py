@@ -23,7 +23,13 @@ from omegaconf import OmegaConf
 
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
+from verl.trainer.ppo.utils import (
+    create_rl_dataset,
+    create_rl_sampler,
+    need_critic,
+    need_reference_policy,
+    resolve_automatic_sequence_lengths,
+)
 from verl.utils.config import validate_config
 
 
@@ -208,6 +214,7 @@ class TaskRunner(BaseTaskRunner):
             is_train=False,
             max_samples=config.data.get("val_max_samples", -1),
         )
+        resolve_automatic_sequence_lengths(config, train_dataset, val_dataset)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
