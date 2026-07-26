@@ -102,21 +102,25 @@ def _make_loop(
 
 
 @pytest.mark.asyncio
-async def test_single_turn_truncates_when_16gram_repeats_more_than_five_times():
+async def test_single_turn_truncates_when_16gram_repeats_three_times():
     ngram = list(range(16))
     generated = ngram * 6 + [999]
     loop = _make_loop(generated)
 
     output = await loop.run(sampling_params={}, raw_prompt=[{"role": "user", "content": "repeat"}])
 
-    assert output.response_ids == generated[:76]
-    assert output.response_mask == [1] * 76
-    assert output.response_logprobs == [-0.5] * 76
+    assert output.response_ids == generated[:48]
+    assert output.response_mask == [1] * 48
+    assert output.response_logprobs == [-0.5] * 48
     assert output.extra_fields["source"] == "fake_server"
     assert output.extra_fields["repetition_truncated"] is True
-    assert output.extra_fields["repetition_ngram_size"] == 16
-    assert output.extra_fields["repetition_ngram_count_threshold"] == 5
-    assert output.extra_fields["repetition_truncation_length"] == 76
+    assert output.extra_fields["repetition_ngram_size"] == 64
+    assert output.extra_fields["repetition_ngram_count_threshold"] == 3
+    assert output.extra_fields["repetition_truncation_length"] == 48
+    assert output.extra_fields["repetition_matched_rule"] == {
+        "ngram_size": 16,
+        "min_count": 3,
+    }
     assert output.extra_fields["original_response_length"] == len(generated)
 
 
@@ -128,17 +132,24 @@ async def test_single_turn_truncates_severe_short_ngram_repetition():
 
     output = await loop.run(sampling_params={}, raw_prompt=[{"role": "user", "content": "repeat"}])
 
-    assert output.response_ids == generated[:44]
-    assert output.response_mask == [1] * 44
+    assert output.response_ids == generated[:24]
+    assert output.response_mask == [1] * 24
     assert output.extra_fields["repetition_truncated"] is True
-    assert output.extra_fields["repetition_truncation_length"] == 44
-    assert {"ngram_size": 12, "min_count": 5} in output.extra_fields["repetition_detection_rules"]
+    assert output.extra_fields["repetition_truncation_length"] == 24
+    assert output.extra_fields["repetition_detection_rules"] == [
+        {
+            "mode": "consecutive",
+            "min_pattern_size": 4,
+            "max_pattern_size": 64,
+            "min_count": 3,
+        }
+    ]
 
 
 @pytest.mark.asyncio
 async def test_single_turn_keeps_response_below_default_repetition_thresholds():
     ngram = list(range(16))
-    generated = ngram * 4 + [999]
+    generated = ngram * 2 + [999]
     loop = _make_loop(generated)
 
     output = await loop.run(sampling_params={}, raw_prompt=[{"role": "user", "content": "repeat"}])
@@ -148,6 +159,25 @@ async def test_single_turn_keeps_response_below_default_repetition_thresholds():
     assert output.response_logprobs == [-0.5] * len(generated)
     assert output.extra_fields["repetition_truncated"] is False
     assert output.extra_fields["original_response_length"] == len(generated)
+
+
+@pytest.mark.asyncio
+async def test_single_turn_keeps_nonadjacent_repeated_math_expressions():
+    expression = [101, 102, 103, 104]
+    generated = [
+        token_id
+        for step in range(20)
+        for token_id in (*expression, 1000 + step)
+    ]
+    loop = _make_loop(generated)
+
+    output = await loop.run(
+        sampling_params={},
+        raw_prompt=[{"role": "user", "content": "enumerate k"}],
+    )
+
+    assert output.response_ids == generated
+    assert output.extra_fields["repetition_truncated"] is False
 
 
 @pytest.mark.asyncio

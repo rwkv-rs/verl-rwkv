@@ -439,9 +439,7 @@ class AgentLoopBase(ABC):
         if len(prompt_ids) > prompt_length:
             raise ValueError(
                 f"Templated prompt produced {len(prompt_ids)} tokens, exceeding the "
-                f"dataset-derived rollout.prompt_length={prompt_length}. This indicates "
-                "that dataset measurement and rollout templating diverged; prompts are "
-                "never silently truncated."
+                f"model context limit={prompt_length}; prompts are never silently truncated."
             )
         return prompt_ids
 
@@ -511,11 +509,10 @@ class AgentLoopBase(ABC):
             system_prompt = self.val_system_prompt if validate else self.system_prompt
             prompt_ids = prompt_ids[len(system_prompt) :]
 
-        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
-        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
-        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
-        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
-        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
+        # ``rollout.prompt_length`` is the model context envelope. Each request
+        # independently receives the remaining context as its response budget.
+        # Multimodal prompts cannot be sliced because placeholder tokens must
+        # remain aligned 1:1 with ``multi_modal_inputs`` features.
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
             if images or videos or audios:

@@ -48,13 +48,14 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.ngram_repetition import (
-    NGramRepetitionDetector,
+    ConsecutiveRepetitionDetector,
     consume_token_stream,
     consume_until_repetition,
     repetition_extra_fields,
     vllm_repetition_detection_config,
 )
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
+from verl.utils.request_budget import resolve_request_max_tokens
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
@@ -84,12 +85,24 @@ _RESET_PREFIX_CACHE_KWARGS = build_vllm_prefix_cache_reset_kwargs(_VLLM_VERSION)
 
 
 def effective_sampling_digest(sampling_params: SamplingParams) -> str:
-    """Digest every normalized vLLM SamplingParams field actually sent to the engine."""
+    """Digest normalized behavior-policy sampling fields sent to the engine.
+
+    ``max_tokens`` is a deterministic capacity bound derived independently
+    from each request's tokenized prompt. It is not a sampling-policy choice
+    and therefore must not make otherwise identical prompt groups look like
+    mixed behavior policies.
+    """
 
     fields = getattr(sampling_params, "__struct_fields__", ())
     if not fields:
         raise RuntimeError("vLLM SamplingParams does not expose its normalized fields")
-    return canonical_digest({field: getattr(sampling_params, field) for field in fields})
+    return canonical_digest(
+        {
+            field: getattr(sampling_params, field)
+            for field in fields
+            if field != "max_tokens"
+        }
+    )
 
 
 if _VLLM_VERSION > version.parse("0.11.0"):
@@ -130,20 +143,6 @@ def _apply_rwkv_default_stop_params(sampling_params: dict[str, Any], model_confi
         return
     sampling_params.setdefault("stop", list(RWKV_DEFAULT_STOPS))
     sampling_params.setdefault("stop_token_ids", list(RWKV_DEFAULT_STOP_TOKEN_IDS))
-
-
-def _token_to_bytes_getter(tokenizer: Any) -> Callable[[int], bytes] | None:
-    idx2token = getattr(tokenizer, "idx2token", None)
-    if idx2token is None:
-        return None
-
-    def token_to_bytes(token_id: int) -> bytes:
-        token = idx2token[int(token_id)]
-        if isinstance(token, bytes):
-            return token
-        return bytes(token)
-
-    return token_to_bytes
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -719,38 +718,19 @@ class vLLMHttpServer:
                     f"expected={expected_policy_identity} actual={actual}"
                 )
 
-        # Calculate the maximum possible new tokens based on available context space
-        # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
-        # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
-        # least one token of headroom to be able to generate at all.
-        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 1:
-            raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) leaves no room to generate within the "
-                f"model's maximum context length ({self.config.max_model_len}); need at least "
-                f"1 token of headroom."
-            )
-
-        # Determine max_tokens from sampling_params or use configured response_length as default
+        # Read an optional caller cap, then compute the real response budget
+        # independently from this request's tokenized prompt.
         if "max_tokens" in sampling_params:
-            max_tokens = sampling_params.pop("max_tokens")
+            requested_max_tokens = sampling_params.pop("max_tokens")
         elif "max_new_tokens" in sampling_params:
             # support sglang-style 'max_new_tokens' param
-            max_tokens = sampling_params.pop("max_new_tokens")
+            requested_max_tokens = sampling_params.pop("max_new_tokens")
         else:
-            # Default to a calculation that considers configured lengths
-            # Cap max_tokens by response_length to ensure tensor alignment,
-            # and by remaining budget to prevent OOM in multi-turn rollouts.
-            max_tokens = min(
-                self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
-            )
-
-        # Clamp max_tokens to the valid range [1, max_possible_tokens]. The lower bound
-        # is 1 because vLLM v0.20+ raises VLLMValidationError when max_tokens < 1.
-        max_tokens = max(1, min(max_tokens, max_possible_tokens))
-
-        assert 1 <= max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
+            requested_max_tokens = None
+        max_tokens = resolve_request_max_tokens(
+            max_model_len=self.config.max_model_len,
+            prompt_length=len(prompt_ids),
+            requested_max_tokens=requested_max_tokens,
         )
         generation_logprobs_requested = bool(sampling_params.pop("logprobs", False))
         prompt_logprobs_requested = sampling_params.get("prompt_logprobs", None) is not None
@@ -820,9 +800,7 @@ class vLLMHttpServer:
 
             repetition_detector = None
             if detect_rollout_repetition:
-                repetition_detector = NGramRepetitionDetector(
-                    token_to_bytes=_token_to_bytes_getter(self.model_config.tokenizer),
-                )
+                repetition_detector = ConsecutiveRepetitionDetector()
                 final_res, repetition_truncation_length, observed_token_ids = await consume_until_repetition(
                     generator,
                     get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],

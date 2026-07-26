@@ -61,7 +61,8 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
         "+data.train_prompt_key=source_prompt",
         "+data.val_prompt_key=prompt",
         "+data.model_context_length=8192",
-        "+data.derive_sequence_lengths=True",
+        "actor_rollout_ref.rollout.prompt_length=8192",
+        "actor_rollout_ref.rollout.response_length=8192",
         "actor_rollout_ref.model.path=/models/rwkv.pth",
         "actor_rollout_ref.model.rwkv_lm_path=/src/rwkv-lm",
         "actor_rollout_ref.actor.engine.rwkv_lm_path=/src/rwkv-lm",
@@ -105,8 +106,8 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
     assert cfg.actor_rollout_ref.rollout.val_kwargs.frequency_penalty == 0.1
     assert cfg.actor_rollout_ref.rollout.val_kwargs.repetition_penalty == 0.25
     assert cfg.actor_rollout_ref.rollout.val_kwargs.penalty_decay == 0.99
-    assert cfg.actor_rollout_ref.rollout.prompt_length is None
-    assert cfg.actor_rollout_ref.rollout.response_length is None
+    assert cfg.actor_rollout_ref.rollout.prompt_length == 8192
+    assert cfg.actor_rollout_ref.rollout.response_length == 8192
     assert "nano_vllm_rwkv" not in cfg.actor_rollout_ref.rollout.engine_kwargs
     assert cfg.actor_rollout_ref.rollout.val_kwargs.do_sample is False
     assert cfg.actor_rollout_ref.rollout.multi_turn.enable is False

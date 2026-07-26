@@ -258,6 +258,8 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if "binary_success" in data.batch:
+            adv_kwargs["binary_success"] = data.batch["binary_success"]
         # GDPO: pass raw data for per-dimension reward extraction
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch

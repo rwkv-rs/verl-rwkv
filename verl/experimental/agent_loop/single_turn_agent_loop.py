@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.trainer.ppo.v1.policy_identity import IDENTITY_TAG_KEYS, canonical_digest
-from verl.utils.ngram_repetition import NGramRepetitionDetector, repetition_extra_fields
+from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector, repetition_extra_fields
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -111,7 +111,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         truncation_length = None
         repetition_detector = None
         if repetition_detection_enabled:
-            repetition_detector = NGramRepetitionDetector()
+            repetition_detector = ConsecutiveRepetitionDetector()
             truncation_length = repetition_detector.observe(response_ids)
         if truncation_length is not None:
             assert repetition_detector is not None

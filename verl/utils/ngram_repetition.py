@@ -24,6 +24,9 @@ import zstandard as zstd
 
 DEFAULT_REPETITION_NGRAM_SIZE = 16
 DEFAULT_REPETITION_MAX_COUNT = 5
+DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE = 4
+DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE = 64
+DEFAULT_CONSECUTIVE_MIN_COUNT = 3
 DEFAULT_REPETITION_FALLBACK_MAX_TOKENS: int | None = None
 DEFAULT_REPETITION_TEXT_MIN_BYTES = 256
 DEFAULT_REPETITION_TEXT_CHECK_EVERY_TOKENS = 32
@@ -174,6 +177,60 @@ def _normalize_rules(rules: Sequence[tuple[int, int]]) -> tuple[tuple[int, int],
     if not normalized:
         raise ValueError("at least one repetition detection rule is required")
     return tuple(normalized)
+
+
+class ConsecutiveRepetitionDetector:
+    """Detect exact token blocks repeated consecutively at the generated tail."""
+
+    def __init__(
+        self,
+        *,
+        min_pattern_size: int = DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE,
+        max_pattern_size: int = DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+        min_count: int = DEFAULT_CONSECUTIVE_MIN_COUNT,
+    ) -> None:
+        if min_pattern_size <= 0:
+            raise ValueError(f"min_pattern_size must be positive, got {min_pattern_size}")
+        if max_pattern_size < min_pattern_size:
+            raise ValueError(
+                f"max_pattern_size must be >= min_pattern_size, got {max_pattern_size} < {min_pattern_size}"
+            )
+        if min_count < 2:
+            raise ValueError(f"min_count must be at least 2, got {min_count}")
+        self.min_pattern_size = min_pattern_size
+        self.max_pattern_size = max_pattern_size
+        self.min_count = min_count
+        self._next_length = min_pattern_size * min_count
+        self.truncation_length: int | None = None
+        self.matched_rule: tuple[int, int] | None = None
+        self.matched_reason: str | None = None
+        self.matched_text_stats: dict[str, object] = {}
+        self.last_text_stats: dict[str, object] = {}
+
+    def _tail_repeats(self, token_ids: Sequence[int], *, end: int, pattern_size: int) -> bool:
+        for offset in range(1, pattern_size + 1):
+            target_token = token_ids[end - offset]
+            for repeat_index in range(1, self.min_count):
+                if token_ids[end - repeat_index * pattern_size - offset] != target_token:
+                    return False
+        return True
+
+    def observe(self, token_ids: Sequence[int]) -> int | None:
+        if self.truncation_length is not None:
+            return self.truncation_length
+
+        while self._next_length <= len(token_ids):
+            end = self._next_length
+            max_pattern_size = min(self.max_pattern_size, end // self.min_count)
+            for pattern_size in range(self.min_pattern_size, max_pattern_size + 1):
+                if self._tail_repeats(token_ids, end=end, pattern_size=pattern_size):
+                    self.truncation_length = end
+                    self.matched_rule = (pattern_size, self.min_count)
+                    self.matched_reason = "consecutive_ngram"
+                    return end
+            self._next_length += 1
+
+        return None
 
 
 class NGramRepetitionDetector:
@@ -542,9 +599,9 @@ def repetition_extra_fields(
     truncated: bool,
     original_response_length: int,
     truncation_length: int | None = None,
-    ngram_size: int = DEFAULT_REPETITION_NGRAM_SIZE,
-    max_count: int = DEFAULT_REPETITION_MAX_COUNT,
-    rules: Sequence[tuple[int, int]] = DEFAULT_REPETITION_RULES,
+    ngram_size: int = DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+    max_count: int = DEFAULT_CONSECUTIVE_MIN_COUNT,
+    rules: Sequence[tuple[int, int]] | None = None,
     fallback_max_tokens: int | None = DEFAULT_REPETITION_FALLBACK_MAX_TOKENS,
     matched_rule: tuple[int, int] | None = None,
     matched_reason: str | None = None,
@@ -556,9 +613,21 @@ def repetition_extra_fields(
         "repetition_ngram_size": ngram_size,
         "repetition_ngram_count_threshold": max_count,
         "repetition_fallback_max_tokens": fallback_max_tokens,
-        "repetition_detection_rules": [
-            {"ngram_size": rule_ngram_size, "min_count": min_count} for rule_ngram_size, min_count in rules
-        ],
+        "repetition_detection_rules": (
+            [
+                {
+                    "mode": "consecutive",
+                    "min_pattern_size": DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE,
+                    "max_pattern_size": DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+                    "min_count": DEFAULT_CONSECUTIVE_MIN_COUNT,
+                }
+            ]
+            if rules is None
+            else [
+                {"ngram_size": rule_ngram_size, "min_count": min_count}
+                for rule_ngram_size, min_count in rules
+            ]
+        ),
         "repetition_matched_rule": (
             {"ngram_size": matched_rule[0], "min_count": matched_rule[1]} if matched_rule is not None else None
         ),
@@ -592,21 +661,15 @@ def repetition_extra_fields(
 
 def vllm_repetition_detection_config(
     *,
-    ngram_size: int = DEFAULT_REPETITION_NGRAM_SIZE,
-    max_count: int = DEFAULT_REPETITION_MAX_COUNT,
-    rules: Sequence[tuple[int, int]] | None = None,
+    min_pattern_size: int = DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE,
+    max_pattern_size: int = DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+    min_count: int = DEFAULT_CONSECUTIVE_MIN_COUNT,
 ) -> dict[str, object]:
-    if rules is None and ngram_size == DEFAULT_REPETITION_NGRAM_SIZE and max_count == DEFAULT_REPETITION_MAX_COUNT:
-        rules = DEFAULT_REPETITION_RULES
-    elif rules is None:
-        rules = ((ngram_size, max_count + 1),)
-    rules = _normalize_rules(rules)
     return {
-        "max_pattern_size": ngram_size,
-        "min_pattern_size": ngram_size,
-        "min_count": max_count + 1,
-        "mode": "occurrence",
-        "occurrence_rules": list(rules),
+        "max_pattern_size": max_pattern_size,
+        "min_pattern_size": min_pattern_size,
+        "min_count": min_count,
+        "mode": "consecutive",
     }
 
 
@@ -615,10 +678,10 @@ async def consume_until_repetition(
     *,
     get_token_ids: Callable[[T], Sequence[int]],
     abort_request: Callable[[], Awaitable[object]],
-    detector: NGramRepetitionDetector | None = None,
+    detector: ConsecutiveRepetitionDetector | NGramRepetitionDetector | None = None,
     cumulative: bool = False,
 ) -> tuple[T | None, int | None, list[int]]:
-    detector = detector or NGramRepetitionDetector()
+    detector = detector or ConsecutiveRepetitionDetector()
     final_output: T | None = None
     observed_token_ids: list[int] = []
 

@@ -225,7 +225,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
         await instance._init_agent_loop_workers()
         return instance
 
-    def generate_sequences(self, prompts: TensorDict) -> None:
+    @auto_await
+    async def generate_sequences(self, prompts: TensorDict) -> None:
         """
         Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
         into TransferQueue once an agent loop finished.
@@ -234,8 +235,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
             prompts (TensorDict): Input batch from train or validation dataset.
         """
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        ray.get(
-            [
+        await asyncio.gather(
+            *[
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]

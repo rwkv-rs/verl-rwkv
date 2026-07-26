@@ -241,22 +241,6 @@ class RLHFDataset(Dataset):
         return len(normalized)
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
-        if self.config.get("derive_sequence_lengths", False):
-            length_column = "__verl_templated_prompt_length"
-            measured = dataframe.map(
-                lambda doc: {length_column: self._templated_prompt_length(doc)},
-                num_proc=self.num_workers,
-                desc="Measuring templated prompt lengths",
-            )
-            if len(measured) == 0:
-                raise ValueError("cannot derive sequence lengths from an empty dataset")
-            self.max_templated_prompt_length = max(int(value) for value in measured[length_column])
-            print(
-                "maximum templated prompt length: "
-                f"{self.max_templated_prompt_length} tokens across {len(measured)} samples"
-            )
-            return measured.remove_columns(length_column)
-
         # filter out too long prompts
         if self.filter_overlong_prompts:
 

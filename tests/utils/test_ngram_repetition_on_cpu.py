@@ -19,13 +19,51 @@ from types import SimpleNamespace
 import pytest
 
 from verl.utils.ngram_repetition import (
+    DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+    DEFAULT_CONSECUTIVE_MIN_COUNT,
+    DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE,
     DEFAULT_REPETITION_MAX_COUNT,
     DEFAULT_REPETITION_NGRAM_SIZE,
     DEFAULT_REPETITION_RULES,
+    ConsecutiveRepetitionDetector,
     NGramRepetitionDetector,
     consume_token_stream,
     consume_until_repetition,
 )
+
+
+def test_consecutive_detector_ignores_nonadjacent_math_expressions():
+    expression = [101, 102, 103, 104, 105, 106]
+    generated: list[int] = []
+    for step in range(32):
+        generated.extend([*expression, 1000 + step])
+
+    detector = ConsecutiveRepetitionDetector()
+
+    assert detector.observe(generated) is None
+    assert detector.matched_reason is None
+
+
+def test_consecutive_detector_stops_at_third_complete_tail_block():
+    prefix = [900, 901, 902]
+    repeated_block = list(range(40))
+    generated = [*prefix, *repeated_block, *repeated_block, *repeated_block, 999]
+    detector = ConsecutiveRepetitionDetector()
+
+    truncation_length = detector.observe(generated)
+
+    assert truncation_length == len(prefix) + len(repeated_block) * 3
+    assert detector.matched_rule == (len(repeated_block), DEFAULT_CONSECUTIVE_MIN_COUNT)
+    assert detector.matched_reason == "consecutive_ngram"
+
+
+def test_consecutive_detector_honors_default_pattern_boundaries():
+    assert DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE == 4
+    assert DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE == 64
+    assert ConsecutiveRepetitionDetector().observe([1, 2, 3] * 3) is None
+    assert ConsecutiveRepetitionDetector().observe([1, 2, 3, 4] * 3) == 12
+    assert ConsecutiveRepetitionDetector().observe(list(range(64)) * 3) == 192
+    assert ConsecutiveRepetitionDetector().observe(list(range(65)) * 3) is None
 
 
 def test_ngram_repetition_detector_fires_on_the_sixth_16gram():

@@ -20,16 +20,18 @@ import pytest
 pytest.importorskip("ray")
 pytest.importorskip("vllm")
 
-from vllm.sampling_params import RequestOutputKind
+from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
 from vllm.tokenizers.rwkv_defaults import (
     RWKV_DEFAULT_STOP_TOKEN_IDS,
     RWKV_DEFAULT_STOPS,
 )
+from vllm.v1.core.sched.utils import check_sequence_repetition
 
 from verl.utils.ngram_repetition import (
-    DEFAULT_REPETITION_MAX_COUNT,
-    DEFAULT_REPETITION_NGRAM_SIZE,
-    DEFAULT_REPETITION_RULES,
+    DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+    DEFAULT_CONSECUTIVE_MIN_COUNT,
+    DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE,
+    ConsecutiveRepetitionDetector,
     vllm_repetition_detection_config,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
@@ -55,11 +57,38 @@ class _ModelConfig:
 def test_default_repetition_detection_matches_rollout_truncation_rule():
     params = vllm_repetition_detection_config()
 
-    assert params["max_pattern_size"] == DEFAULT_REPETITION_NGRAM_SIZE
-    assert params["min_pattern_size"] == DEFAULT_REPETITION_NGRAM_SIZE
-    assert params["min_count"] == DEFAULT_REPETITION_MAX_COUNT + 1
-    assert params["mode"] == "occurrence"
-    assert params["occurrence_rules"] == list(DEFAULT_REPETITION_RULES)
+    assert params["max_pattern_size"] == DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE
+    assert params["min_pattern_size"] == DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE
+    assert params["min_count"] == DEFAULT_CONSECUTIVE_MIN_COUNT
+    assert params["mode"] == "consecutive"
+    assert "occurrence_rules" not in params
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "detected"),
+    [
+        pytest.param(
+            [*range(40), *range(40), *range(40)],
+            True,
+            id="three-consecutive-blocks",
+        ),
+        pytest.param(
+            [
+                token_id
+                for step in range(32)
+                for token_id in (101, 102, 103, 104, 105, 106, 1000 + step)
+            ],
+            False,
+            id="nonadjacent-math-expression",
+        ),
+    ],
+)
+def test_verl_and_vllm_repetition_boundaries_match(token_ids, detected):
+    verl_detector = ConsecutiveRepetitionDetector()
+    vllm_params = RepetitionDetectionParams(**vllm_repetition_detection_config())
+
+    assert (verl_detector.observe(token_ids) is not None) is detected
+    assert check_sequence_repetition(token_ids, vllm_params) is detected
 
 
 @pytest.mark.parametrize(
