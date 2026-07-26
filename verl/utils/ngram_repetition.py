@@ -623,10 +623,7 @@ def repetition_extra_fields(
                 }
             ]
             if rules is None
-            else [
-                {"ngram_size": rule_ngram_size, "min_count": min_count}
-                for rule_ngram_size, min_count in rules
-            ]
+            else [{"ngram_size": rule_ngram_size, "min_count": min_count} for rule_ngram_size, min_count in rules]
         ),
         "repetition_matched_rule": (
             {"ngram_size": matched_rule[0], "min_count": matched_rule[1]} if matched_rule is not None else None

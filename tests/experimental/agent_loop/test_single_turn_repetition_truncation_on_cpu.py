@@ -164,11 +164,7 @@ async def test_single_turn_keeps_response_below_default_repetition_thresholds():
 @pytest.mark.asyncio
 async def test_single_turn_keeps_nonadjacent_repeated_math_expressions():
     expression = [101, 102, 103, 104]
-    generated = [
-        token_id
-        for step in range(20)
-        for token_id in (*expression, 1000 + step)
-    ]
+    generated = [token_id for step in range(20) for token_id in (*expression, 1000 + step)]
     loop = _make_loop(generated)
 
     output = await loop.run(

@@ -73,11 +73,7 @@ def test_default_repetition_detection_matches_rollout_truncation_rule():
             id="three-consecutive-blocks",
         ),
         pytest.param(
-            [
-                token_id
-                for step in range(32)
-                for token_id in (101, 102, 103, 104, 105, 106, 1000 + step)
-            ],
+            [token_id for step in range(32) for token_id in (101, 102, 103, 104, 105, 106, 1000 + step)],
             False,
             id="nonadjacent-math-expression",
         ),

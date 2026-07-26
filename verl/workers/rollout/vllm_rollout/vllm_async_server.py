@@ -96,13 +96,7 @@ def effective_sampling_digest(sampling_params: SamplingParams) -> str:
     fields = getattr(sampling_params, "__struct_fields__", ())
     if not fields:
         raise RuntimeError("vLLM SamplingParams does not expose its normalized fields")
-    return canonical_digest(
-        {
-            field: getattr(sampling_params, field)
-            for field in fields
-            if field != "max_tokens"
-        }
-    )
+    return canonical_digest({field: getattr(sampling_params, field) for field in fields if field != "max_tokens"})
 
 
 if _VLLM_VERSION > version.parse("0.11.0"):

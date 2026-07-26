@@ -376,9 +376,7 @@ class PPOTrainer(ABC):
         effective_group_sampling = self._effective_group_sampling_enabled()
         current_epoch = self.global_steps // self.steps_per_epoch
         progress_total = (
-            self.config.trainer.total_training_steps
-            if effective_group_sampling
-            else self.total_training_steps
+            self.config.trainer.total_training_steps if effective_group_sampling else self.total_training_steps
         )
         progress_bar = tqdm(total=progress_total, initial=self.global_steps, desc="Training Progress")
 

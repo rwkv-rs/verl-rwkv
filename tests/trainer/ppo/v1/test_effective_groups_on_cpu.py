@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections import defaultdict
 
 import pytest
@@ -37,9 +51,7 @@ def test_binary_success_matches_maxrl_reward_threshold():
         (None, 1, 0, 10, True, True),
     ],
 )
-def test_effective_training_stop_boundary(
-    step_limit, global_step, passes, target_passes, signal, expected
-):
+def test_effective_training_stop_boundary(step_limit, global_step, passes, target_passes, signal, expected):
     assert (
         effective_training_should_stop(
             global_step=global_step,
@@ -308,9 +320,7 @@ def _collector_fixture(monkeypatch, waves, *, graceful=False):
     trainer._effective_group_acceptance_rate = 1.0
     trainer._effective_sampling_totals = defaultdict(float)
     trainer.replay_buffer = Replay()
-    trainer.reward_loop_manager = type(
-        "RewardManager", (), {"reward_loop_worker_handles": [object()]}
-    )()
+    trainer.reward_loop_manager = type("RewardManager", (), {"reward_loop_worker_handles": [object()]})()
     trainer.global_steps = 1
     trainer._graceful_stop_requested = graceful
     trainer._add_prompts_to_generate = lambda count: count
