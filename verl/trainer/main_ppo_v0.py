@@ -23,7 +23,12 @@ from omegaconf import OmegaConf
 
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
+from verl.trainer.ppo.utils import (
+    create_rl_dataset,
+    create_rl_sampler,
+    need_critic,
+    need_reference_policy,
+)
 from verl.utils.config import validate_config
 
 

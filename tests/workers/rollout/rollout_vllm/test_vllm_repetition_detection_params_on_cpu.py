@@ -20,20 +20,22 @@ import pytest
 pytest.importorskip("ray")
 pytest.importorskip("vllm")
 
-from vllm.sampling_params import RequestOutputKind
+from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
 from vllm.tokenizers.rwkv_defaults import (
-    RWKV_DEFAULT_STOP_TOKEN_IDS,
-    RWKV_DEFAULT_STOPS,
+    RWKV_BOS_EOS_TOKEN_ID,
+    RWKV_PROMPT_TEMPLATE_ASSISTANT,
 )
+from vllm.v1.core.sched.utils import check_sequence_repetition
 
 from verl.utils.ngram_repetition import (
-    DEFAULT_REPETITION_MAX_COUNT,
-    DEFAULT_REPETITION_NGRAM_SIZE,
-    DEFAULT_REPETITION_RULES,
+    DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE,
+    DEFAULT_CONSECUTIVE_MIN_COUNT,
+    DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE,
+    ConsecutiveRepetitionDetector,
     vllm_repetition_detection_config,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
-    _apply_rwkv_default_stop_params,
+    _apply_rwkv_prompt_template_stops,
     _rollout_output_kind,
 )
 
@@ -55,11 +57,34 @@ class _ModelConfig:
 def test_default_repetition_detection_matches_rollout_truncation_rule():
     params = vllm_repetition_detection_config()
 
-    assert params["max_pattern_size"] == DEFAULT_REPETITION_NGRAM_SIZE
-    assert params["min_pattern_size"] == DEFAULT_REPETITION_NGRAM_SIZE
-    assert params["min_count"] == DEFAULT_REPETITION_MAX_COUNT + 1
-    assert params["mode"] == "occurrence"
-    assert params["occurrence_rules"] == list(DEFAULT_REPETITION_RULES)
+    assert params["max_pattern_size"] == DEFAULT_CONSECUTIVE_MAX_PATTERN_SIZE
+    assert params["min_pattern_size"] == DEFAULT_CONSECUTIVE_MIN_PATTERN_SIZE
+    assert params["min_count"] == DEFAULT_CONSECUTIVE_MIN_COUNT
+    assert params["mode"] == "consecutive"
+    assert "occurrence_rules" not in params
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "detected"),
+    [
+        pytest.param(
+            [*range(40), *range(40), *range(40)],
+            True,
+            id="three-consecutive-blocks",
+        ),
+        pytest.param(
+            [token_id for step in range(32) for token_id in (101, 102, 103, 104, 105, 106, 1000 + step)],
+            False,
+            id="nonadjacent-math-expression",
+        ),
+    ],
+)
+def test_verl_and_vllm_repetition_boundaries_match(token_ids, detected):
+    verl_detector = ConsecutiveRepetitionDetector()
+    vllm_params = RepetitionDetectionParams(**vllm_repetition_detection_config())
+
+    assert (verl_detector.observe(token_ids) is not None) is detected
+    assert check_sequence_repetition(token_ids, vllm_params) is detected
 
 
 @pytest.mark.parametrize(
@@ -84,27 +109,30 @@ def test_rollout_output_kind_uses_delta_only_when_logprobs_are_not_required(
     )
 
 
-def test_rollout_server_applies_rwkv_default_stop_params():
-    sampling_params: dict[str, Any] = {}
+def test_rollout_server_merges_rwkv_template_and_user_stops():
+    sampling_params: dict[str, Any] = {
+        "stop": ["END"],
+        "stop_token_ids": [123],
+        "ignore_eos": True,
+    }
 
-    _apply_rwkv_default_stop_params(sampling_params, _ModelConfig())
+    _apply_rwkv_prompt_template_stops(
+        sampling_params,
+        _ModelConfig(),
+        prompt_template=RWKV_PROMPT_TEMPLATE_ASSISTANT,
+    )
 
-    assert sampling_params["stop"] == list(RWKV_DEFAULT_STOPS)
-    assert sampling_params["stop_token_ids"] == list(RWKV_DEFAULT_STOP_TOKEN_IDS)
-
-
-def test_rollout_server_keeps_explicit_rwkv_stop_params():
-    sampling_params: dict[str, Any] = {"stop": [], "stop_token_ids": [123]}
-
-    _apply_rwkv_default_stop_params(sampling_params, _ModelConfig())
-
-    assert sampling_params == {"stop": [], "stop_token_ids": [123]}
+    assert sampling_params == {
+        "stop": ["\nUser:", "END"],
+        "stop_token_ids": [RWKV_BOS_EOS_TOKEN_ID, 123],
+        "ignore_eos": False,
+    }
 
 
 def test_rollout_server_does_not_apply_rwkv_stop_params_to_other_models():
     sampling_params: dict[str, Any] = {}
 
-    _apply_rwkv_default_stop_params(
+    _apply_rwkv_prompt_template_stops(
         sampling_params,
         _ModelConfig(tokenizer_mode="auto", hf_config=_HFConfig(model_type="llama")),
     )

@@ -25,6 +25,9 @@ top_p: 1
 # Presence penalty for vLLM/RWKV rapid-sampling. Default 0.0 keeps old behavior.
 presence_penalty: 0.0
 
+# Frequency penalty for generated tokens. Default 0.0 keeps old behavior.
+frequency_penalty: 0.0
+
 # Repetition penalty for vLLM/RWKV rapid-sampling. Default 1.0 keeps old behavior.
 repetition_penalty: 1.0
 
@@ -56,6 +59,10 @@ gpu_memory_utilization: 0.5
 
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False
+
+# RWKV native prompt-template identifier. The vLLM-RWKV template registry
+# derives the matching text stop and always enforces token 0 as BOS/EOS.
+rwkv_prompt_template: null
 
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
@@ -174,6 +181,9 @@ val_kwargs:
 
   # Presence penalty for vLLM/RWKV rapid-sampling.
   presence_penalty: 0.0
+
+  # Frequency penalty for generated tokens.
+  frequency_penalty: 0.0
 
   # Repetition penalty for vLLM/RWKV rapid-sampling.
   repetition_penalty: 1.0

@@ -142,7 +142,7 @@ def test_pickleable_rwkv_tokenizer_accepts_hf_chat_template_kwargs():
         return_dict=True,
     )
 
-    assert output["input_ids"] == [ord(char) for char in "user:hi|assistant:"]
+    assert output["input_ids"] == [0, *[ord(char) for char in "user:hi|assistant:"]]
     assert output["attention_mask"] == [1] * len(output["input_ids"])
 
 
@@ -156,7 +156,7 @@ def test_pickleable_rwkv_tokenizer_falls_back_to_plain_text_without_chat_templat
         def apply_chat_template(self, *args, **kwargs):
             raise NotImplementedError("no chat template")
 
-        def encode(self, text):
+        def encode(self, text, **kwargs):
             return [ord(char) for char in text]
 
         def __len__(self):
@@ -177,12 +177,12 @@ def test_pickleable_rwkv_tokenizer_falls_back_to_plain_text_without_chat_templat
         return_dict=True,
     )
 
-    expected_prompt = "System: ignore\n\nUser: solve\n\nAssistant: <think"
-    assert output["input_ids"] == [ord(char) for char in expected_prompt]
+    expected_prompt = "System✿ignore✿\nUser✿solve✿\nBot✿<think"
+    assert output["input_ids"] == [0, *[ord(char) for char in expected_prompt]]
     assert output["attention_mask"] == [1] * len(output["input_ids"])
 
 
-def test_pickleable_rwkv_tokenizer_strips_dapo_math_prompt_wrapper():
+def test_pickleable_rwkv_tokenizer_preserves_dataset_prompt_verbatim():
     import verl.models.rwkv.tokenizer as tokenizer_module
 
     class PlainTokenizer:
@@ -192,7 +192,7 @@ def test_pickleable_rwkv_tokenizer_strips_dapo_math_prompt_wrapper():
         def apply_chat_template(self, *args, **kwargs):
             raise NotImplementedError("no chat template")
 
-        def encode(self, text):
+        def encode(self, text, **kwargs):
             return [ord(char) for char in text]
 
         def __len__(self):
@@ -216,9 +216,7 @@ def test_pickleable_rwkv_tokenizer_strips_dapo_math_prompt_wrapper():
         add_generation_prompt=True,
     )
 
-    assert output == f"User: {problem}\n\nAssistant: <think"
-    assert "Solve the following math problem" not in output
-    assert "Remember to put your answer" not in output
+    assert output == f"User✿{wrapped_problem}✿\nBot✿<think"
 
 
 def test_pickleable_rwkv_tokenizer_can_render_fake_think_prompt():
@@ -231,7 +229,7 @@ def test_pickleable_rwkv_tokenizer_can_render_fake_think_prompt():
         def apply_chat_template(self, *args, **kwargs):
             raise NotImplementedError("no chat template")
 
-        def encode(self, text):
+        def encode(self, text, **kwargs):
             return [ord(char) for char in text]
 
         def __len__(self):
@@ -249,7 +247,7 @@ def test_pickleable_rwkv_tokenizer_can_render_fake_think_prompt():
         rwkv_generation_prompt="fake_think",
     )
 
-    assert output == "User: solve\n\nAssistant: <think></think"
+    assert output == "User✿solve✿\nBot✿<think></think"
 
 
 def test_pickleable_rwkv_tokenizer_uses_native_rwkv_bos_for_chat_prompts():
@@ -272,8 +270,10 @@ def test_pickleable_rwkv_tokenizer_uses_native_rwkv_bos_for_chat_prompts():
     )
 
     assert token_ids[0] == 0
-    assert raw_token_ids[0] != 0
-    assert tokenizer.decode(token_ids) == "User: solve\n\nAssistant: <think></think"
+    assert token_ids[1] != 0
+    assert raw_token_ids[0] == 0
+    assert raw_token_ids[1] != 0
+    assert tokenizer.decode(token_ids) == "User✿solve✿\nBot✿<think></think"
 
 
 def test_pickleable_rwkv_tokenizer_preserves_native_bos_policy():

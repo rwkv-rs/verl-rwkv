@@ -344,6 +344,21 @@ def test_maxrl_outcome_advantage_treats_nonpositive_rewards_as_failures():
     assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_maxrl_outcome_advantage_reuses_materialized_binary_success():
+    token_level_rewards = torch.tensor([[10.0], [10.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array(["a", "a"], dtype=object)
+
+    advantages, _ = compute_maxrl_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        binary_success=torch.tensor([True, False]),
+    )
+
+    assert torch.allclose(advantages, torch.tensor([[1.0], [-1.0]]), atol=1e-5)
+
+
 def test_ray_trainer_compute_advantage_dispatches_maxrl():
     token_level_rewards = torch.tensor([[1.0], [0.0], [1.0], [1.0], [0.0], [0.0]], dtype=torch.float32)
     response_mask = torch.ones_like(token_level_rewards)

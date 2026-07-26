@@ -13,6 +13,8 @@
 # limitations under the License.
 """Native rwkv-lm engine wrapper."""
 
+import ctypes
+import gc
 from collections.abc import Callable, Generator
 from contextlib import ContextDecorator, contextmanager, nullcontext
 from pathlib import Path
@@ -35,6 +37,20 @@ from .batch_bridge import build_verl_loss_model_output, extract_rwkv_lm_forward_
 from .checkpoint import load_rwkv_lm_checkpoint
 from .native_runner import NativeRWKVLMRunner
 from .weight_bridge import iter_rwkv_lm_state_dict_weights
+
+
+def release_cpu_checkpoint_memory() -> None:
+    """Release mmap/checkpoint pages and glibc arenas after the model reaches its target device."""
+
+    gc.collect()
+    try:
+        libc = ctypes.CDLL(None)
+        malloc_trim = libc.malloc_trim
+    except (AttributeError, OSError):
+        return
+    malloc_trim.argtypes = [ctypes.c_size_t]
+    malloc_trim.restype = ctypes.c_int
+    malloc_trim(0)
 
 
 class RWKVLMEngine(BaseEngine):
@@ -82,6 +98,7 @@ class RWKVLMEngine(BaseEngine):
             optimizer=False,
             grad=False,
         )
+        release_cpu_checkpoint_memory()
         try:
             trainer_attached = self.model.trainer is not None
         except Exception:
@@ -112,12 +129,28 @@ class RWKVLMEngine(BaseEngine):
     def optimizer_step(self):
         if self.optimizer is None:
             return None
-        self._sync_gradients()
+        from verl.utils.profiler import marked_timer
+
+        timing = {}
+        with marked_timer("gradient_communication", timing, color="blue"):
+            self._sync_gradients()
         grad_norm = None
         clip_grad = getattr(self.optimizer_config, "clip_grad", None)
-        if clip_grad and hasattr(torch.nn.utils, "clip_grad_norm_") and self.model is not None:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_grad)
-        self.optimizer.step()
+        with marked_timer("gradient_clip", timing, color="yellow"):
+            if clip_grad and hasattr(torch.nn.utils, "clip_grad_norm_") and self.model is not None:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_grad)
+        with marked_timer("optimizer", timing, color="green"):
+            self.optimizer.step()
+        # Weight publication follows immediately in the colocated strict-sync
+        # lifecycle.  Keeping a full model-sized gradient allocation alive until
+        # the next round needlessly competes with the resumed vLLM replica.
+        # The scalar grad norm has already been computed, so release gradients
+        # without changing optimizer or accumulation semantics.
+        # DeepSpeed FusedAdam exposes zero_grad(self) and already clears
+        # gradients to None; keep this call compatible with both it and torch
+        # optimizers instead of passing the torch-only set_to_none keyword.
+        self.optimizer.zero_grad()
+        self.last_optimizer_timing = timing
         return grad_norm
 
     def _sync_gradients(self) -> None:
@@ -153,6 +186,7 @@ class RWKVLMEngine(BaseEngine):
                 data=data,
                 dp_group=self.get_data_parallel_group(),
                 same_micro_num_in_dp=True,
+                allow_oversized_singleton=True,
             )
             output_lst = [
                 self._forward_backward_micro_batch(micro_batch, loss_function, forward_only=forward_only)
@@ -203,11 +237,13 @@ class RWKVLMEngine(BaseEngine):
 
     def _postprocess_micro_batch_outputs(self, output_lst: list[dict[str, Any]], *, indices, data: TensorDict) -> dict:
         if len(output_lst) == 1:
+            output_lst[0].setdefault("metrics", {})["actual_micro_batches"] = [1]
             return output_lst[0]
 
         metrics = {}
         for output in output_lst:
             append_to_dict(metrics, output.get("metrics", {}))
+        metrics["actual_micro_batches"] = [len(output_lst)]
 
         return {
             "model_output": self._merge_micro_batch_model_outputs(output_lst, indices=indices, data=data),
@@ -424,6 +460,27 @@ class RWKVLMEngine(BaseEngine):
             and hasattr(self.model, "head")
         )
 
+    def _scale_response_logits(
+        self,
+        logits: torch.Tensor,
+        data: TensorDict,
+        *,
+        sample_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+        if not isinstance(temperature, torch.Tensor):
+            return logits if temperature == 1.0 else logits / max(float(temperature), 1e-8)
+        temperature = temperature.to(device=logits.device, dtype=logits.dtype).reshape(-1)
+        if temperature.numel() == 1:
+            return logits / temperature.clamp(min=1e-8)
+        if sample_indices is not None:
+            return logits / temperature[sample_indices].clamp(min=1e-8).unsqueeze(-1)
+        if logits.dim() == 3 and temperature.numel() == logits.size(0):
+            return logits / temperature.clamp(min=1e-8).reshape(-1, 1, 1)
+        raise RuntimeError(
+            f"RWKV response temperature shape {tuple(temperature.shape)} does not match logits {tuple(logits.shape)}."
+        )
+
     def _forward_infctx_response_model_output(
         self,
         model_input_ids: Any,
@@ -432,7 +489,8 @@ class RWKVLMEngine(BaseEngine):
         *,
         original_seq_len: int | None = None,
     ) -> dict[str, Any]:
-        from verl.utils.torch_functional import logprobs_from_logits, logprobs_from_logits_v2
+        from verl.utils import torch_functional as verl_F
+        from verl.utils.torch_functional import logprobs_from_logits_v2
 
         responses = forward_batch.responses
         if hasattr(responses, "to"):
@@ -452,7 +510,9 @@ class RWKVLMEngine(BaseEngine):
                 state_dtype,
             )
 
+            calculate_entropy = tu.get_non_tensor_data(data=data, key="calculate_entropy", default=False)
             full_log_probs = None
+            full_entropy = None
             chunk_ctx = self._infctx_chunk_ctx()
             chunk_len = self._rwkv_chunk_len()
             max_needed_position = torch.where(response_lens > 0, sequence_lens - 1, sequence_lens.new_zeros(()))
@@ -486,19 +546,27 @@ class RWKVLMEngine(BaseEngine):
                     )
                     if has_response_logits:
                         label_tokens = model_input_ids[:, start + 1 : valid_end + 1]
-                        response_logits = self.model.head(hidden[:, :valid_T][target_mask])
+                        sample_indices = target_mask.nonzero(as_tuple=True)[0]
+                        response_logits = self._scale_response_logits(
+                            self.model.head(hidden[:, :valid_T][target_mask]),
+                            data,
+                            sample_indices=sample_indices,
+                        )
                         response_labels = label_tokens[target_mask]
-                        if (
-                            getattr(response_logits, "device", None) is not None
-                            and response_logits.device.type == "cpu"
-                        ):
-                            log_probs = logprobs_from_logits_v2(logits=response_logits, labels=response_labels)
-                        else:
-                            log_probs = logprobs_from_logits(logits=response_logits, labels=response_labels)
+                        # vLLM records sampled-token logprobs with an FP32
+                        # log_softmax reduction. Match that definition exactly;
+                        # BF16 fused cross entropy over the 65k RWKV vocabulary
+                        # is not a like-for-like behavior-policy probability.
+                        log_probs = logprobs_from_logits_v2(logits=response_logits.float(), labels=response_labels)
                         flat_indices = (offsets[:-1].unsqueeze(1) + positions.unsqueeze(0))[target_mask]
                         if full_log_probs is None:
                             full_log_probs = log_probs.new_zeros(int(offsets[-1].item()))
                         full_log_probs = full_log_probs.scatter(0, flat_indices, log_probs)
+                        if calculate_entropy:
+                            entropy = verl_F.entropy_from_logits(response_logits)
+                            if full_entropy is None:
+                                full_entropy = entropy.new_zeros(int(offsets[-1].item()))
+                            full_entropy = full_entropy.scatter(0, flat_indices, entropy)
 
                 shift_states = shift_states.detach()
                 wkv_states = wkv_states.detach()
@@ -509,9 +577,14 @@ class RWKVLMEngine(BaseEngine):
                     device=model_input_ids.device,
                     dtype=self._model_dtype() or torch.float32,
                 )
-            return build_verl_loss_model_output(
+            model_output = build_verl_loss_model_output(
                 log_probs=torch.nested.nested_tensor_from_jagged(full_log_probs, offsets),
             )
+            if calculate_entropy:
+                if full_entropy is None:
+                    full_entropy = full_log_probs.new_zeros(int(offsets[-1].item()))
+                model_output["entropy"] = torch.nested.nested_tensor_from_jagged(full_entropy, offsets)
+            return model_output
 
         response_length = int(responses.size(-1))
         sequence_length = original_seq_len if original_seq_len is not None else int(model_input_ids.size(-1))
@@ -525,7 +598,9 @@ class RWKVLMEngine(BaseEngine):
             state_dtype,
         )
 
+        calculate_entropy = tu.get_non_tensor_data(data=data, key="calculate_entropy", default=False)
         log_prob_chunks = []
+        entropy_chunks = []
         chunk_ctx = self._infctx_chunk_ctx()
         chunk_len = self._rwkv_chunk_len()
         forward_until = min(sequence_length, response_end)
@@ -554,12 +629,14 @@ class RWKVLMEngine(BaseEngine):
                     local_end = slice_end - start
                     response_offset = slice_start - response_start
                     response_labels = responses[:, response_offset : response_offset + (slice_end - slice_start)]
-                    response_logits = self.model.head(hidden[:, local_start:local_end])
-                    if getattr(response_logits, "device", None) is not None and response_logits.device.type == "cpu":
-                        log_probs = logprobs_from_logits_v2(logits=response_logits, labels=response_labels)
-                    else:
-                        log_probs = logprobs_from_logits(logits=response_logits, labels=response_labels)
+                    response_logits = self._scale_response_logits(
+                        self.model.head(hidden[:, local_start:local_end]),
+                        data,
+                    )
+                    log_probs = logprobs_from_logits_v2(logits=response_logits.float(), labels=response_labels)
                     log_prob_chunks.append(log_probs)
+                    if calculate_entropy:
+                        entropy_chunks.append(verl_F.entropy_from_logits(response_logits))
 
             shift_states = shift_states.detach()
             wkv_states = wkv_states.detach()
@@ -577,7 +654,12 @@ class RWKVLMEngine(BaseEngine):
             raise RuntimeError(
                 f"RWKV infctx chunked log-prob path produced {log_probs.size(-1)} tokens, expected {response_length}."
             )
-        return build_verl_loss_model_output(log_probs=log_probs)
+        model_output = build_verl_loss_model_output(log_probs=log_probs)
+        if calculate_entropy:
+            model_output["entropy"] = (
+                torch.cat(entropy_chunks, dim=1) if entropy_chunks else log_probs.new_empty(log_probs.shape)
+            )
+        return model_output
 
     def _infctx_packed_log_prob_layout(
         self,
@@ -716,7 +798,8 @@ class RWKVLMEngine(BaseEngine):
 
         responses = forward_batch.responses
         if responses is not None and hasattr(raw_output, "dim") and raw_output.dim() == 3:
-            from verl.utils.torch_functional import logprobs_from_logits, logprobs_from_logits_v2
+            from verl.utils import torch_functional as verl_F
+            from verl.utils.torch_functional import logprobs_from_logits_v2
 
             if hasattr(responses, "to"):
                 responses = responses.to(device=raw_output.device)
@@ -724,13 +807,21 @@ class RWKVLMEngine(BaseEngine):
             sequence_length = original_seq_len if original_seq_len is not None else raw_output.size(1)
             response_start = max(0, sequence_length - response_length - 1)
             response_logits = raw_output[:, response_start : response_start + response_length, :]
-            if getattr(response_logits, "device", None) is not None and response_logits.device.type == "cpu":
-                log_probs = logprobs_from_logits_v2(logits=response_logits, labels=responses)
-            else:
-                log_probs = logprobs_from_logits(logits=response_logits, labels=responses)
+            temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+            if isinstance(temperature, torch.Tensor):
+                temperature = temperature.to(device=response_logits.device, dtype=response_logits.dtype)
+                if temperature.numel() == 1:
+                    response_logits = response_logits / temperature.clamp(min=1e-8)
+                else:
+                    response_logits = response_logits / temperature.reshape(-1, 1, 1).clamp(min=1e-8)
+            elif temperature != 1.0:
+                response_logits = response_logits / max(float(temperature), 1e-8)
+            log_probs = logprobs_from_logits_v2(logits=response_logits.float(), labels=responses)
             model_output = build_verl_loss_model_output(
                 log_probs=log_probs,
             )
+            if tu.get_non_tensor_data(data=data, key="calculate_entropy", default=False):
+                model_output["entropy"] = verl_F.entropy_from_logits(response_logits)
         return model_output
 
     def _checkpoint_file(self, local_path: str) -> Path:

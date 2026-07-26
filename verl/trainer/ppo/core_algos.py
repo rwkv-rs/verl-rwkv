@@ -364,6 +364,7 @@ def compute_maxrl_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
+    binary_success: Optional[torch.Tensor] = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -376,11 +377,20 @@ def compute_maxrl_outcome_advantage(
     This matches the official MaxRL implementation while keeping the current
     verl registry signature.
     """
-    scores = token_level_rewards.sum(dim=-1)
-    # MaxRL's estimator is defined on binary success rewards. Reward managers
-    # such as DAPO may emit -1/0/1, so normalize the estimator input to
-    # success/failure before computing the per-prompt mean probability.
-    scores = (scores > 0).to(dtype=scores.dtype, device=scores.device)
+    if binary_success is None:
+        scores = token_level_rewards.sum(dim=-1)
+        # Backward-compatible fallback for callers outside strict V1 MaxRL.
+        scores = (scores > 0).to(dtype=scores.dtype, device=scores.device)
+    else:
+        if binary_success.ndim != 1 or binary_success.shape[0] != token_level_rewards.shape[0]:
+            raise ValueError(
+                "binary_success must contain one outcome per trajectory; "
+                f"got {tuple(binary_success.shape)} for {token_level_rewards.shape[0]} trajectories"
+            )
+        scores = binary_success.to(
+            dtype=token_level_rewards.dtype,
+            device=token_level_rewards.device,
+        ).clone()
 
     id2score = defaultdict(list)
     id2mean = {}

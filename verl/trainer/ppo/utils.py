@@ -124,9 +124,15 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)
-    dataset_config = data_config
+    prompt_key_config = "train_prompt_key" if is_train else "val_prompt_key"
+    prompt_key = data_config.get(
+        prompt_key_config,
+        data_config.get("prompt_key", "prompt"),
+    )
+    dataset_config = OmegaConf.create(OmegaConf.to_container(data_config, resolve=False))
+    with open_dict(dataset_config):
+        dataset_config.prompt_key = prompt_key
     if not is_train and data_config.get("val_apply_chat_template_kwargs", None):
-        dataset_config = OmegaConf.create(OmegaConf.to_container(data_config, resolve=False))
         train_kwargs = dict(dataset_config.get("apply_chat_template_kwargs", {}) or {})
         train_kwargs.update(dict(dataset_config.get("val_apply_chat_template_kwargs", {}) or {}))
         with open_dict(dataset_config):

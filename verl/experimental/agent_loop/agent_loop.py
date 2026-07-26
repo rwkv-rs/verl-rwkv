@@ -44,6 +44,7 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
+from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
 
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
@@ -94,31 +95,16 @@ def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str
         top_p=sampling_config.top_p,
         top_k=sampling_config.top_k,
         presence_penalty=sampling_value(sampling_config, "presence_penalty", 0.0),
+        frequency_penalty=sampling_value(sampling_config, "frequency_penalty", 0.0),
         repetition_penalty=sampling_value(sampling_config, "repetition_penalty", 1.0),
         penalty_decay=sampling_value(sampling_config, "penalty_decay", RAPID_PENALTY_DECAY_DEFAULT),
         logprobs=logprobs,
     )
     if validate:
-        # Match offline eval: validation should not add rollout-only repetition aborts.
+        # Validation matches the offline evaluator, which does not enable the
+        # rollout-only repetition detector.
         sampling_params["repetition_detection"] = None
     return sampling_params
-
-
-def _prompt_with_single_prefix_token(
-    prompt_ids: list[int],
-    *,
-    prefix_token_id: int,
-    max_length: int | None = None,
-) -> list[int]:
-    """Return prompt ids with exactly one leading context prefix token."""
-    prompt_ids = list(prompt_ids)
-    if not prompt_ids or prompt_ids[0] != prefix_token_id:
-        prompt_ids = [prefix_token_id, *prompt_ids]
-    if max_length is not None and len(prompt_ids) > max_length:
-        if max_length < 1:
-            raise ValueError("Prompt prefix requires max_length >= 1")
-        prompt_ids = [prompt_ids[0], *prompt_ids[-(max_length - 1) :]]
-    return prompt_ids
 
 
 def _right_pad_prompt_batch(
@@ -434,12 +420,10 @@ class AgentLoopBase(ABC):
     def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
-            logger.warning(
-                "Prompt of %d tokens exceeds rollout.prompt_length=%d; left-truncating.",
-                len(prompt_ids),
-                prompt_length,
+            raise ValueError(
+                f"Templated prompt produced {len(prompt_ids)} tokens, exceeding the "
+                f"model context limit={prompt_length}; prompts are never silently truncated."
             )
-            return prompt_ids[-prompt_length:]
         return prompt_ids
 
     async def apply_chat_template(
@@ -508,11 +492,10 @@ class AgentLoopBase(ABC):
             system_prompt = self.val_system_prompt if validate else self.system_prompt
             prompt_ids = prompt_ids[len(system_prompt) :]
 
-        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
-        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
-        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
-        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
-        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
+        # ``rollout.prompt_length`` is the model context envelope. Each request
+        # independently receives the remaining context as its response budget.
+        # Multimodal prompts cannot be sliced because placeholder tokens must
+        # remain aligned 1:1 with ``multi_modal_inputs`` features.
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
             if images or videos or audios:
@@ -816,11 +799,12 @@ class AgentLoopWorker:
         # - position_ids: sequential positions for tokens, starting at 0
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
-        prompt_token_ids = _prompt_with_single_prefix_token(
-            output.prompt_ids,
-            prefix_token_id=0,
-            max_length=self.rollout_config.prompt_length,
-        )
+        prompt_token_ids = list(output.prompt_ids)
+        if self.rollout_config.get("rwkv_prompt_template") is not None:
+            prompt_token_ids = ensure_rwkv_prompt_bos_token(
+                prompt_token_ids,
+                max_length=self.rollout_config.prompt_length,
+            )
         prompt_output = {
             "input_ids": torch.tensor([prompt_token_ids], dtype=torch.long),
             "attention_mask": torch.ones((1, len(prompt_token_ids)), dtype=torch.long),

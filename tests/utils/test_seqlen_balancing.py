@@ -47,6 +47,24 @@ def test_seqlen_balancing():
     torch.testing.assert_close(new_batch, dataproto.batch)
 
 
+def test_rearrange_micro_batches_isolates_oversized_sequences():
+    input_ids = torch.arange(30).reshape(3, 10)
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+        ]
+    )
+    batch = DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask}).batch
+
+    micro_batches, partitions = rearrange_micro_batches(batch, max_token_len=8, allow_oversized_singleton=True)
+
+    oversized_partition = next(partition for partition in partitions if 0 in partition)
+    assert oversized_partition == [0]
+    assert sum(len(micro_batch) for micro_batch in micro_batches) == 3
+
+
 def test_dynamic_batch():
     input_ids = torch.randint(low=0, high=10, size=(20, 100))
 

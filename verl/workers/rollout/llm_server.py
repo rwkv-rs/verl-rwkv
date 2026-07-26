@@ -19,8 +19,10 @@ Utility classes for manage and request LLM servers:
 """
 
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -36,6 +38,30 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.utils import update_prometheus_config
+
+
+def resolve_rollout_topology(
+    *, world_size: int, tensor_parallel_size: int, data_parallel_size: int, pipeline_parallel_size: int
+) -> tuple[int, int]:
+    """Return ``(gpus_per_replica, replicas)`` without silently dropping GPUs."""
+
+    dimensions = {
+        "world_size": world_size,
+        "tensor_parallel_size": tensor_parallel_size,
+        "data_parallel_size": data_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+    }
+    invalid = {name: value for name, value in dimensions.items() if not isinstance(value, int) or value <= 0}
+    if invalid:
+        raise ValueError(f"rollout topology dimensions must be positive integers: {invalid}")
+    gpus_per_replica = tensor_parallel_size * data_parallel_size * pipeline_parallel_size
+    if world_size % gpus_per_replica != 0:
+        raise ValueError(
+            f"rollout topology uses {gpus_per_replica} GPUs per replica but global pool has {world_size}; "
+            "all GPUs must belong to exactly one replica"
+        )
+    return gpus_per_replica, world_size // gpus_per_replica
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -441,7 +467,12 @@ class LLMServerManager:
             if self.worker_group
             else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         )
-        num_replicas = world_size // rollout_world_size
+        rollout_world_size, num_replicas = resolve_rollout_topology(
+            world_size=world_size,
+            tensor_parallel_size=rollout_world_size,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+        )
 
         self.rollout_replicas = [
             self.rollout_replica_class(
@@ -468,6 +499,37 @@ class LLMServerManager:
 
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        if len(set(self.server_addresses)) != len(self.server_addresses):
+            raise RuntimeError(f"rollout replicas returned duplicate endpoints: {self.server_addresses}")
+        deployments = [metadata for replica in self.rollout_replicas for metadata in replica.runtime_metadata]
+        gpu_bindings = [
+            (deployment["node_id"], gpu) for deployment in deployments for gpu in deployment["cuda_visible_devices"]
+        ]
+        if len(gpu_bindings) != world_size or len(gpu_bindings) != len(set(gpu_bindings)):
+            raise RuntimeError(
+                "rollout deployment must cover each global-pool GPU exactly once: "
+                f"world_size={world_size} bindings={gpu_bindings}"
+            )
+        run_log_dir = os.getenv("REMOTE_RUN_LOG_DIR")
+        if run_log_dir:
+            topology_path = Path(run_log_dir) / "rollout_topology.json"
+            topology_path.parent.mkdir(parents=True, exist_ok=True)
+            topology_path.write_text(
+                json.dumps(
+                    {
+                        "replicas": len(self.rollout_replicas),
+                        "gpus_per_replica": rollout_world_size,
+                        "tensor_parallel_size": self.rollout_config.tensor_model_parallel_size,
+                        "data_parallel_size": self.rollout_config.data_parallel_size,
+                        "pipeline_parallel_size": self.rollout_config.pipeline_model_parallel_size,
+                        "endpoints": self.server_addresses,
+                        "deployments": deployments,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         print(f"LLMServerManager: {self.server_addresses}")
 
         # Update Prometheus / rl-insight metrics with server addresses

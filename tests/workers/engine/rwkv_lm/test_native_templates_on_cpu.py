@@ -56,6 +56,13 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
         "ref@actor_rollout_ref.ref=rwkv_lm",
         "model@actor_rollout_ref.model=rwkv_native",
         "data.train_batch_size=2",
+        "data.max_prompt_length=null",
+        "data.max_response_length=null",
+        "+data.train_prompt_key=source_prompt",
+        "+data.val_prompt_key=prompt",
+        "+data.model_context_length=8192",
+        "actor_rollout_ref.rollout.prompt_length=8192",
+        "actor_rollout_ref.rollout.response_length=8192",
         "actor_rollout_ref.model.path=/models/rwkv.pth",
         "actor_rollout_ref.model.rwkv_lm_path=/src/rwkv-lm",
         "actor_rollout_ref.actor.engine.rwkv_lm_path=/src/rwkv-lm",
@@ -72,6 +79,7 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
         "actor_rollout_ref.rollout.load_format=auto",
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.tokenizer_mode=rwkv",
         "actor_rollout_ref.rollout.val_kwargs.presence_penalty=0.65",
+        "actor_rollout_ref.rollout.val_kwargs.frequency_penalty=0.1",
         "actor_rollout_ref.rollout.val_kwargs.repetition_penalty=0.25",
         "actor_rollout_ref.rollout.val_kwargs.penalty_decay=0.99",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",
@@ -95,8 +103,11 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
     assert cfg.actor_rollout_ref.rollout.name == "vllm"
     assert cfg.actor_rollout_ref.rollout.engine_kwargs.vllm.tokenizer_mode == "rwkv"
     assert cfg.actor_rollout_ref.rollout.val_kwargs.presence_penalty == 0.65
+    assert cfg.actor_rollout_ref.rollout.val_kwargs.frequency_penalty == 0.1
     assert cfg.actor_rollout_ref.rollout.val_kwargs.repetition_penalty == 0.25
     assert cfg.actor_rollout_ref.rollout.val_kwargs.penalty_decay == 0.99
+    assert cfg.actor_rollout_ref.rollout.prompt_length == 8192
+    assert cfg.actor_rollout_ref.rollout.response_length == 8192
     assert "nano_vllm_rwkv" not in cfg.actor_rollout_ref.rollout.engine_kwargs
     assert cfg.actor_rollout_ref.rollout.val_kwargs.do_sample is False
     assert cfg.actor_rollout_ref.rollout.multi_turn.enable is False

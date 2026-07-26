@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -332,13 +333,15 @@ class CheckpointEngineWorker(Worker):
         initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, policy_identity: dict[str, Any] | None = None):
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
-        await self.server_adapter.update_weights(
-            weights,
-            global_steps=global_steps,
-            wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
-        )
+        kwargs = {
+            "global_steps": global_steps,
+            "wire_format": getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
+        }
+        if policy_identity is not None:
+            kwargs["policy_identity"] = policy_identity
+        return await self.server_adapter.update_weights(weights, **kwargs)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
@@ -483,7 +486,7 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, policy_identity: dict[str, Any] | None = None):
         """Update weights from actor worker group to rollout replicas.
 
         Args:
@@ -492,8 +495,16 @@ class CheckpointEngineManager:
 
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
-            ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
-            return {}
+            update_refs = self.actor_wg.update_weights(
+                global_steps=global_steps,
+                mode=self.backend,
+                policy_identity=policy_identity,
+            )
+            timeout = None
+            if policy_identity is not None:
+                timeout = float(os.getenv("VERL_STRICT_WEIGHT_UPDATE_TIMEOUT_SECONDS", "600"))
+            acknowledgements = ray.get(update_refs, timeout=timeout)
+            return acknowledgements
 
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()
@@ -513,8 +524,8 @@ class CheckpointEngineManager:
 
         # 5. update weights of all workers
         results = ray.get(
-            actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-            + rollout.update_weights(global_steps=global_steps)
+            actor_wg.update_weights(global_steps=global_steps, mode=self.backend, policy_identity=policy_identity)
+            + rollout.update_weights(global_steps=global_steps, policy_identity=policy_identity)
         )
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.

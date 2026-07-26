@@ -54,6 +54,8 @@ def test_create_rl_dataset_uses_validation_chat_template_kwargs_for_eval(monkeyp
 
     config = OmegaConf.create(
         {
+            "train_prompt_key": "source_prompt",
+            "val_prompt_key": "prompt",
             "apply_chat_template_kwargs": {
                 "rwkv_generation_prompt": "open_think",
                 "shared_key": "shared_value",
@@ -68,9 +70,12 @@ def test_create_rl_dataset_uses_validation_chat_template_kwargs_for_eval(monkeyp
     create_rl_dataset(["validation.parquet"], config, tokenizer=None, processor=None, is_train=False)
 
     assert captured_configs[0].apply_chat_template_kwargs.rwkv_generation_prompt == "open_think"
+    assert captured_configs[0].prompt_key == "source_prompt"
     assert captured_configs[1].apply_chat_template_kwargs.rwkv_generation_prompt == "fake_think"
     assert captured_configs[1].apply_chat_template_kwargs.shared_key == "shared_value"
+    assert captured_configs[1].prompt_key == "prompt"
     assert config.apply_chat_template_kwargs.rwkv_generation_prompt == "open_think"
+    assert "prompt_key" not in config
 
 
 def get_gsm8k_data():

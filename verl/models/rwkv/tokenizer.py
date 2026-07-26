@@ -14,7 +14,10 @@
 
 from typing import Any
 
-from vllm.tokenizers.rwkv_defaults import render_rwkv_chat_template
+from vllm.tokenizers.rwkv_defaults import (
+    ensure_rwkv_prompt_bos_token,
+    render_rwkv_chat_template,
+)
 
 
 def _resolve_rwkv_tokenizer_cls(tokenizer_cls: type | None = None) -> type:
@@ -98,6 +101,8 @@ class PickleableRWKVTokenizer:
                 template_kwargs["tools"] = tools
             if "rwkv_generation_prompt" in kwargs:
                 template_kwargs["rwkv_generation_prompt"] = kwargs["rwkv_generation_prompt"]
+            if "rwkv_prompt_template" in kwargs:
+                template_kwargs["rwkv_prompt_template"] = kwargs["rwkv_prompt_template"]
             if "add_special_tokens" in kwargs:
                 template_kwargs["add_special_tokens"] = kwargs["add_special_tokens"]
             output = self._tokenizer.apply_chat_template(
@@ -113,9 +118,12 @@ class PickleableRWKVTokenizer:
                     "rwkv_generation_prompt",
                     "open_think",
                 ),
+                rwkv_prompt_template=kwargs.get("rwkv_prompt_template"),
             )
             if tokenize:
-                output = self.encode(output)
+                output = self.encode(output, add_special_tokens=False)
+        if tokenize:
+            output = ensure_rwkv_prompt_bos_token(output)
         if not return_dict:
             return output
         if not tokenize:

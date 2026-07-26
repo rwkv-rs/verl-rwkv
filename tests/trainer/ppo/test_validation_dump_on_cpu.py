@@ -60,6 +60,7 @@ def test_validation_sampling_params_for_dump_keeps_eval_overrides_on_cpu():
                         "top_p": 0.35,
                         "top_k": 40,
                         "presence_penalty": 0.65,
+                        "frequency_penalty": 0.1,
                         "repetition_penalty": 0.25,
                         "penalty_decay": 0.99,
                         "logprobs": None,
@@ -76,6 +77,7 @@ def test_validation_sampling_params_for_dump_keeps_eval_overrides_on_cpu():
     assert params["top_p"] == 0.35
     assert params["temperature"] == 0.25
     assert params["presence_penalty"] == 0.65
+    assert params["frequency_penalty"] == 0.1
     assert params["repetition_penalty"] == 0.25
     assert params["penalty_decay"] == 0.99
     assert params["logprobs"] is None

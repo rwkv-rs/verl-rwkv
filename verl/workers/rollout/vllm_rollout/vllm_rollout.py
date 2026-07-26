@@ -273,36 +273,58 @@ class ServerAdapter(BaseRollout):
             f"vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
         )
         start_time = time.time()
+        policy_identity = kwargs.pop("policy_identity", None)
+        publication_guard = self._ensure_server_handle()
+        try:
+            if publication_guard:
+                await self.server_handle.begin_weight_update.remote()
+            future = await self._execute_method(
+                "update_weights_from_ipc",
+                non_block=True,
+                kwargs={**kwargs, "use_shm": self.use_shm},
+            )
 
-        future = await self._execute_method(
-            "update_weights_from_ipc",
-            non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
-        )
+            bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+            sender = BucketedWeightSender(
+                zmq_handle=self.zmq_handle,
+                bucket_size_mb=bucket_size_mb,
+                use_shm=self.use_shm,
+            )
+            if _should_expand_vllm_moe_params() and not (
+                kwargs.get("peft_config") is not None and kwargs.get("base_sync_done", False)
+            ):
+                weights = _iter_vllm_compatible_moe_params(weights)
+            await sender.async_send_weights(weights)
 
-        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
-        sender = BucketedWeightSender(
-            zmq_handle=self.zmq_handle,
-            bucket_size_mb=bucket_size_mb,
-            use_shm=self.use_shm,
-        )
-        if _should_expand_vllm_moe_params() and not (
-            kwargs.get("peft_config") is not None and kwargs.get("base_sync_done", False)
-        ):
-            weights = _iter_vllm_compatible_moe_params(weights)
-        await sender.async_send_weights(weights)
+            if future is not None:
+                await future
 
-        if future is not None:
-            await future
-
-        # reset caches after updating weights
-        if self._has_server:
-            await self.server_handle.clear_kv_cache.remote()
-            if global_steps is not None:
-                await self.server_handle.set_global_steps.remote(global_steps)
+            # Reset caches and expose the new identity only after the local
+            # update, manifest validation, CUDA sync, and state reset complete.
+            if publication_guard:
+                await self.server_handle.clear_kv_cache.remote()
+                if global_steps is not None:
+                    await self.server_handle.set_global_steps.remote(global_steps)
+                if policy_identity is not None:
+                    await self.server_handle.stage_behavior_policy_identity.remote(policy_identity)
+                else:
+                    await self.server_handle.finish_weight_update_without_identity.remote()
+        except BaseException as exc:
+            if publication_guard:
+                try:
+                    await self.server_handle.poison_weight_update.remote(repr(exc))
+                except BaseException:
+                    logger.exception("failed to mark rollout server poisoned after weight update error")
+            raise
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+        return policy_identity
+
+    async def activate_weight_update(self):
+        """Expose staged weights after the request cache has resumed successfully."""
+        if self._ensure_server_handle():
+            await self.server_handle.activate_weight_update.remote()
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""
