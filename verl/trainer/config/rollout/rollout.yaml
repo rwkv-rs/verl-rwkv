@@ -60,6 +60,10 @@ gpu_memory_utilization: 0.5
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False
 
+# RWKV native prompt-template identifier. The vLLM-RWKV template registry
+# derives the matching text stop and always enforces token 0 as BOS/EOS.
+rwkv_prompt_template: null
+
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
 

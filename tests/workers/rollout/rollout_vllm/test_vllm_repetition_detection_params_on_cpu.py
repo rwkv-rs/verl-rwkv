@@ -22,8 +22,8 @@ pytest.importorskip("vllm")
 
 from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
 from vllm.tokenizers.rwkv_defaults import (
-    RWKV_DEFAULT_STOP_TOKEN_IDS,
-    RWKV_DEFAULT_STOPS,
+    RWKV_BOS_EOS_TOKEN_ID,
+    RWKV_PROMPT_TEMPLATE_ASSISTANT,
 )
 from vllm.v1.core.sched.utils import check_sequence_repetition
 
@@ -35,7 +35,7 @@ from verl.utils.ngram_repetition import (
     vllm_repetition_detection_config,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
-    _apply_rwkv_default_stop_params,
+    _apply_rwkv_prompt_template_stops,
     _rollout_output_kind,
 )
 
@@ -109,35 +109,30 @@ def test_rollout_output_kind_uses_delta_only_when_logprobs_are_not_required(
     )
 
 
-def test_rollout_server_applies_rwkv_default_stop_params():
-    sampling_params: dict[str, Any] = {}
+def test_rollout_server_merges_rwkv_template_and_user_stops():
+    sampling_params: dict[str, Any] = {
+        "stop": ["END"],
+        "stop_token_ids": [123],
+        "ignore_eos": True,
+    }
 
-    _apply_rwkv_default_stop_params(sampling_params, _ModelConfig())
+    _apply_rwkv_prompt_template_stops(
+        sampling_params,
+        _ModelConfig(),
+        prompt_template=RWKV_PROMPT_TEMPLATE_ASSISTANT,
+    )
 
-    assert sampling_params["stop"] == list(RWKV_DEFAULT_STOPS)
-    assert sampling_params["stop_token_ids"] == list(RWKV_DEFAULT_STOP_TOKEN_IDS)
-
-
-def test_rollout_server_keeps_explicit_rwkv_stop_params():
-    sampling_params: dict[str, Any] = {"stop": [], "stop_token_ids": [123]}
-
-    _apply_rwkv_default_stop_params(sampling_params, _ModelConfig())
-
-    assert sampling_params == {"stop": [], "stop_token_ids": [123]}
-
-
-def test_rollout_server_skips_rwkv_default_stops_when_ignoring_eos():
-    sampling_params: dict[str, Any] = {"ignore_eos": True}
-
-    _apply_rwkv_default_stop_params(sampling_params, _ModelConfig())
-
-    assert sampling_params == {"ignore_eos": True}
+    assert sampling_params == {
+        "stop": ["\nUser:", "END"],
+        "stop_token_ids": [RWKV_BOS_EOS_TOKEN_ID, 123],
+        "ignore_eos": False,
+    }
 
 
 def test_rollout_server_does_not_apply_rwkv_stop_params_to_other_models():
     sampling_params: dict[str, Any] = {}
 
-    _apply_rwkv_default_stop_params(
+    _apply_rwkv_prompt_template_stops(
         sampling_params,
         _ModelConfig(tokenizer_mode="auto", hf_config=_HFConfig(model_type="llama")),
     )

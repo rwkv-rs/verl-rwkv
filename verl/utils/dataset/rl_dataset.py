@@ -234,11 +234,7 @@ class RLHFDataset(Dataset):
                 **apply_kwargs,
             )
 
-        normalized = normalize_token_ids(token_ids)
-        prefix_token_id = self.config.get("prompt_prefix_token_id", None)
-        if prefix_token_id is not None and (not normalized or normalized[0] != int(prefix_token_id)):
-            return len(normalized) + 1
-        return len(normalized)
+        return len(normalize_token_ids(token_ids))
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts

@@ -44,6 +44,7 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
+from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
 
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
@@ -104,24 +105,6 @@ def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str
         # rollout-only repetition detector.
         sampling_params["repetition_detection"] = None
     return sampling_params
-
-
-def _prompt_with_single_prefix_token(
-    prompt_ids: list[int],
-    *,
-    prefix_token_id: int,
-    max_length: int | None = None,
-) -> list[int]:
-    """Return prompt ids with exactly one leading context prefix token."""
-    prompt_ids = list(prompt_ids)
-    if not prompt_ids or prompt_ids[0] != prefix_token_id:
-        prompt_ids = [prefix_token_id, *prompt_ids]
-    if max_length is not None and len(prompt_ids) > max_length:
-        raise ValueError(
-            f"Prompt with required prefix has {len(prompt_ids)} tokens, exceeding "
-            f"dataset-derived max_length={max_length}; prefix insertion never truncates"
-        )
-    return prompt_ids
 
 
 def _right_pad_prompt_batch(
@@ -816,11 +799,12 @@ class AgentLoopWorker:
         # - position_ids: sequential positions for tokens, starting at 0
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
-        prompt_token_ids = _prompt_with_single_prefix_token(
-            output.prompt_ids,
-            prefix_token_id=0,
-            max_length=self.rollout_config.prompt_length,
-        )
+        prompt_token_ids = list(output.prompt_ids)
+        if self.rollout_config.get("rwkv_prompt_template") is not None:
+            prompt_token_ids = ensure_rwkv_prompt_bos_token(
+                prompt_token_ids,
+                max_length=self.rollout_config.prompt_length,
+            )
         prompt_output = {
             "input_ids": torch.tensor([prompt_token_ids], dtype=torch.long),
             "attention_mask": torch.ones((1, len(prompt_token_ids)), dtype=torch.long),

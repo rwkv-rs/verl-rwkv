@@ -35,9 +35,10 @@ from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
 from vllm.tokenizers.rwkv_defaults import (
-    RWKV_DEFAULT_STOP_TOKEN_IDS,
-    RWKV_DEFAULT_STOPS,
+    apply_rwkv_sampling_stops,
+    ensure_rwkv_prompt_bos_token,
     is_rwkv_model_config,
+    resolve_rwkv_prompt_template,
 )
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -130,13 +131,20 @@ def _rollout_output_kind(*, needs_generation_logprobs: bool, needs_prompt_logpro
     return RequestOutputKind.DELTA
 
 
-def _apply_rwkv_default_stop_params(sampling_params: dict[str, Any], model_config: Any) -> None:
+def _apply_rwkv_prompt_template_stops(
+    sampling_params: dict[str, Any],
+    model_config: Any,
+    *,
+    prompt_template: str | None = None,
+) -> None:
     if not is_rwkv_model_config(model_config):
         return
-    if sampling_params.get("ignore_eos", False):
-        return
-    sampling_params.setdefault("stop", list(RWKV_DEFAULT_STOPS))
-    sampling_params.setdefault("stop_token_ids", list(RWKV_DEFAULT_STOP_TOKEN_IDS))
+    template_spec = resolve_rwkv_prompt_template(prompt_template=prompt_template)
+    apply_rwkv_sampling_stops(
+        sampling_params,
+        model_config,
+        prompt_template=template_spec,
+    )
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -695,6 +703,8 @@ class vLLMHttpServer:
                 expected_sampling_digest=expected_sampling_digest,
             )
         prompt_ids = normalize_token_ids(prompt_ids)
+        if is_rwkv_model_config(self.model_config):
+            prompt_ids = ensure_rwkv_prompt_bos_token(prompt_ids)
         requested_sampling_digest = canonical_digest(sampling_params)
         if expected_sampling_digest is not None and requested_sampling_digest != expected_sampling_digest:
             raise RuntimeError(
@@ -731,7 +741,15 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if generation_logprobs_requested else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
-        _apply_rwkv_default_stop_params(sampling_params, self.model_config)
+        request_prompt_template = sampling_params.pop(
+            "rwkv_prompt_template",
+            self.config.get("rwkv_prompt_template"),
+        )
+        _apply_rwkv_prompt_template_stops(
+            sampling_params,
+            self.model_config,
+            prompt_template=request_prompt_template,
+        )
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
