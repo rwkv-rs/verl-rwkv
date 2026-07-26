@@ -1,0 +1,170 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+from hydra import compose, initialize_config_dir
+
+from verl.trainer.maxrl import (
+    MaxRLConfigError,
+    build_overrides,
+    context_tokens_from_checkpoint,
+    read_config,
+)
+
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = ROOT / "examples/rwkv_trainer/config/maxrl_dapo_math_17k.toml"
+ENV = {
+    "WEIGHT_PATH": "/weights",
+    "DATASETS_PATH": "/datasets",
+    "RWKV_LM_PATH": "/src/rwkv-lm",
+}
+
+
+def config() -> dict:
+    return read_config(CONFIG_PATH, ENV)
+
+
+def resolved(overrides: list[str]) -> dict[str, str]:
+    result = {}
+    for override in overrides:
+        if "=" in override:
+            key, value = override.split("=", 1)
+            result[key.lstrip("+")] = value
+    return result
+
+
+def test_compiles_strict_maxrl_contract() -> None:
+    overrides, child_env = build_overrides(config(), env=ENV)
+    values = resolved(overrides)
+
+    assert values["algorithm.adv_estimator"] == "maxrl"
+    assert values["trainer.v1.trainer_mode"] == "sync"
+    assert values["actor_rollout_ref.actor.ppo_mini_batch_size"] == "32"
+    assert values["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"] == "1"
+    assert values["actor_rollout_ref.rollout.n"] == "16"
+    assert values["actor_rollout_ref.rollout.max_model_len"] == "10240"
+    assert values["actor_rollout_ref.rollout.ignore_eos"] == "False"
+    assert values["actor_rollout_ref.rollout.top_p"] == "0.95"
+    assert values["actor_rollout_ref.rollout.val_kwargs.temperature"] == "0.96"
+    assert values["actor_rollout_ref.rollout.val_kwargs.top_p"] == "0.76"
+    assert values["actor_rollout_ref.rollout.val_kwargs.top_k"] == "32"
+    assert values["actor_rollout_ref.rollout.val_kwargs.presence_penalty"] == "1.0"
+    assert values["actor_rollout_ref.rollout.val_kwargs.frequency_penalty"] == "0.1"
+    assert values["actor_rollout_ref.rollout.val_kwargs.penalty_decay"] == "0.988"
+    assert values["actor_rollout_ref.rollout.val_kwargs.do_sample"] == "True"
+    assert values["data.max_prompt_length"] == "null"
+    assert values["data.max_response_length"] == "null"
+    assert values["data.train_files"] == "['/datasets/DAPO/dapo-math-17k-processed.parquet']"
+    assert values["data.train_prompt_key"] == "source_prompt"
+    assert "data.model_context_length" not in values
+    assert child_env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
+
+
+def test_user_override_cannot_disable_strict_eos_or_sync_mode() -> None:
+    with pytest.raises(MaxRLConfigError, match="MaxRL override"):
+        build_overrides(
+            config(),
+            env=ENV,
+            extra_overrides=["actor_rollout_ref.rollout.ignore_eos=True"],
+        )
+    with pytest.raises(MaxRLConfigError, match="MaxRL override"):
+        build_overrides(
+            config(),
+            env=ENV,
+            extra_overrides=["trainer.v1.trainer_mode=async"],
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "data.max_prompt_length=512",
+        "data.max_response_length=4096",
+        "actor_rollout_ref.rollout.max_model_len=8192",
+        "actor_rollout_ref.rollout.n=8",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
+        "actor_rollout_ref.model.path=/weights/other-ctx10240.pth",
+        "data.train_files=[/datasets/raw.parquet]",
+        "data={train_batch_size:1}",
+        "~actor_rollout_ref.rollout",
+        "trainer.total_epochs=1",
+    ],
+)
+def test_user_override_cannot_replace_derived_training_contract(override: str) -> None:
+    with pytest.raises(MaxRLConfigError, match="MaxRL override"):
+        build_overrides(config(), env=ENV, extra_overrides=[override])
+
+
+def test_user_override_accepts_documented_operational_fields() -> None:
+    overrides, _ = build_overrides(
+        config(),
+        env=ENV,
+        extra_overrides=[
+            "trainer.resume_mode=auto",
+            "trainer.save_freq=10",
+            "actor_rollout_ref.rollout.max_num_seqs=128",
+        ],
+    )
+
+    values = resolved(overrides)
+    assert values["trainer.resume_mode"] == "auto"
+    assert values["trainer.save_freq"] == "10"
+    assert values["actor_rollout_ref.rollout.max_num_seqs"] == "128"
+
+
+def test_compiler_output_composes_with_real_hydra_schema() -> None:
+    overrides, _ = build_overrides(config(), env=ENV)
+    config_dir = str((ROOT / "verl/trainer/config").resolve())
+
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        composed = compose(config_name="ppo_trainer", overrides=overrides)
+
+    assert composed.data.train_files == ["/datasets/DAPO/dapo-math-17k-processed.parquet"]
+    assert composed.data.train_prompt_key == "source_prompt"
+    assert composed.actor_rollout_ref.rollout.n == 16
+    assert composed.actor_rollout_ref.rollout.max_model_len == 10240
+    assert composed.actor_rollout_ref.rollout.response_length == 10240
+
+
+def test_removed_user_knobs_are_rejected() -> None:
+    modified = deepcopy(config())
+    modified["generation"]["train"]["stop_on_eos"] = False
+    with pytest.raises(MaxRLConfigError, match="removed field"):
+        build_overrides(modified, env=ENV)
+
+    modified = deepcopy(config())
+    modified["generation"]["validation"]["strategy"] = "greedy"
+    with pytest.raises(MaxRLConfigError, match="removed field"):
+        build_overrides(modified, env=ENV)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected"),
+    [
+        ("rwkv7-g1h-ctx10240.pth", 10240),
+        ("/weights/rwkv7-g1g-ctx8192-test.pth", 8192),
+    ],
+)
+def test_context_is_derived_from_checkpoint(checkpoint: str, expected: int) -> None:
+    assert context_tokens_from_checkpoint(checkpoint) == expected
+
+
+def test_context_requires_exactly_one_suffix() -> None:
+    with pytest.raises(MaxRLConfigError, match="exactly one"):
+        context_tokens_from_checkpoint("rwkv7-g1h.pth")
