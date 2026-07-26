@@ -17,12 +17,14 @@ import logging
 import math
 import os
 import signal
+import subprocess
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from pprint import pprint
 from typing import Any, Optional
 
@@ -843,14 +845,23 @@ class PPOTrainer(ABC):
             is_train=True,
             max_samples=self.config.data.get("train_max_samples", -1),
         )
-        self.val_dataset = create_rl_dataset(
-            self.config.data.val_files,
-            self.config.data,
-            self.tokenizer,
-            self.processor,
-            is_train=False,
-            max_samples=self.config.data.get("val_max_samples", -1),
+        external_evaluation = self.config.trainer.get("external_evaluation", None)
+        validation_enabled = not external_evaluation and bool(
+            self.config.trainer.get("val_before_train", True)
+            or self.config.trainer.get("val_only", False)
+            or self.config.trainer.test_freq > 0
         )
+        if validation_enabled:
+            self.val_dataset = create_rl_dataset(
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                is_train=False,
+                max_samples=self.config.data.get("val_max_samples", -1),
+            )
+        else:
+            self.val_dataset = None
         # Async drop refills an arbitrary number of dropped prompts, which must divide gen_batch_size,
         # so force gen_batch_size=1.
         if self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop":
@@ -889,18 +900,24 @@ class PPOTrainer(ABC):
         self.train_dataloader_it = None
         self._candidate_dataset_passes_completed = 0
         self._candidate_prompts_in_current_pass = 0
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=self.config.data.val_batch_size or len(self.val_dataset),
-            num_workers=self.config.data["dataloader_num_workers"],
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-        logger.info(
-            f"train and validate dataloader initialized, train dataset size: "
-            f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
-        )
+        if self.val_dataset is not None:
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=self.config.data.val_batch_size or len(self.val_dataset),
+                num_workers=self.config.data["dataloader_num_workers"],
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+            logger.info(
+                f"train and validate dataloader initialized, train dataset size: "
+                f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
+            )
+        else:
+            self.val_dataloader = None
+            logger.info(
+                f"train dataloader initialized without validation, train dataset size: {len(self.train_dataset)}"
+            )
 
         self.steps_per_epoch = len(self.train_dataset) // self.config.data.train_batch_size
 
@@ -1186,6 +1203,10 @@ class PPOTrainer(ABC):
             f.write(str(self.global_steps))
 
     def _validate(self) -> dict[str, float]:
+        external_evaluation = self.config.trainer.get("external_evaluation", None)
+        if external_evaluation:
+            return self._validate_external(external_evaluation)
+
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -1339,6 +1360,67 @@ class PPOTrainer(ABC):
             )
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+    def _validate_external(self, external_evaluation: DictConfig) -> dict[str, float]:
+        """Checkpoint the current actor and obtain metrics from an external command."""
+
+        command = list(external_evaluation.command)
+        if not command or any(not isinstance(argument, str) or not argument for argument in command):
+            raise RuntimeError("trainer.external_evaluation.command must contain command arguments")
+
+        checkpoint_root = Path(self.config.trainer.default_local_dir).resolve()
+        checkpoint_file = checkpoint_root / f"global_step_{self.global_steps}" / "actor" / "rwkv_lm.pth"
+        if not checkpoint_file.is_file():
+            self._save_checkpoint()
+        if not checkpoint_file.is_file():
+            raise RuntimeError(f"external evaluation checkpoint is missing: {checkpoint_file}")
+
+        weight_root_raw = os.environ.get("WEIGHT_PATH")
+        if not weight_root_raw:
+            raise RuntimeError("external evaluation requires WEIGHT_PATH")
+        weight_root = Path(weight_root_raw).resolve()
+        try:
+            relative_weight = checkpoint_file.relative_to(weight_root)
+        except ValueError as error:
+            raise RuntimeError("external evaluation checkpoint must be below WEIGHT_PATH") from error
+
+        result_path = checkpoint_file.parent / "lighteval_metrics.json"
+        result_path.unlink(missing_ok=True)
+        child_env = os.environ.copy()
+        child_env.update(
+            {
+                "MAXRL_EVAL_WEIGHT": relative_weight.as_posix(),
+                "MAXRL_EVAL_RESULT_PATH": str(result_path),
+                "MAXRL_EVAL_STEP": str(self.global_steps),
+            }
+        )
+
+        self.checkpoint_manager.sleep_replicas()
+        try:
+            subprocess.run(command, env=child_env, check=True)
+        finally:
+            self.checkpoint_manager.wake_up_replicas()
+
+        if not result_path.is_file():
+            raise RuntimeError(f"external evaluation did not write metrics: {result_path}")
+        with result_path.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        if not isinstance(metrics, dict) or not metrics:
+            raise RuntimeError("external evaluation result requires a non-empty metrics object")
+
+        validated: dict[str, float] = {}
+        for name, value in metrics.items():
+            if not isinstance(name, str) or not name or isinstance(value, bool):
+                raise RuntimeError("external evaluation returned an invalid metric")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"external evaluation metric is not numeric: {name}") from error
+            if not math.isfinite(numeric):
+                raise RuntimeError(f"external evaluation metric is not finite: {name}")
+            validated[f"val-core/{name}"] = numeric
+        return validated
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""

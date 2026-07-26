@@ -7,14 +7,25 @@ python -m verl.trainer.maxrl \
   --config examples/rwkv_trainer/config/maxrl_dapo_math_17k.toml
 ```
 
-The canonical validation paths are materialized by
-`examples/data_preprocess/rwkv_maxrl_math_eval.py`. This data conversion belongs
-to the MaxRL recipe; it is not a benchmark evaluator. Full benchmark scoring
-remains delegated to Helicopter's public LightEval command.
-
 `verl.trainer.maxrl` owns the complete MaxRL contract. Launchers may forward the
 TOML and explicit `--override` values, but they must not compile a second Hydra
 configuration.
+
+MaxRL does not implement a second benchmark evaluator or install LightEval.
+Its `math_verify` scorer is only the training reward used to filter effective
+groups. The `[evaluation]` lifecycle calls Helicopter's public LightEval command
+before training and at the configured optimizer-step interval:
+
+```bash
+helicopter eval --config configs/eval/maxrl_math.toml --env-file .env.remote
+```
+
+The trainer first writes the current actor to
+`global_step_<N>/actor/rwkv_lm.pth`, sleeps its rollout replicas, and supplies
+the relative checkpoint and result paths to the command through
+`MAXRL_EVAL_WEIGHT` and `MAXRL_EVAL_RESULT_PATH`. The command must write a JSON
+object with a non-empty numeric `metrics` map. Rollout replicas wake after the
+command exits, including on failure.
 
 ## User-facing sections
 
@@ -27,23 +38,22 @@ configuration.
   conversation column. The DAPO recipe uses every unique row from
   `open-r1/DAPO-Math-17k-Processed`; it does not repeat or randomly subsample
   the parquet.
-- `[[data.validation.suites]]` lists the validation parquets. Their native
-  dataset fields remain untouched.
 - `[algorithm]` exposes the global optimizer-step shape and objective
   coefficients. `prompts_per_step = 32` and `responses_per_prompt = 16` mean
   that one accepted global step contains 32 mixed-outcome groups and 512
   responses.
 - `[reward]` selects the existing Verl reward manager and scorer.
 - `[optimizer]` contains only optimizer semantics.
-- `[generation.train]` and `[generation.validation]` contain the two fixed
-  sampling contracts. Validation always samples; an unsupported `greedy`
-  switch is not exposed.
+- `[generation.train]` contains the fixed training sampling contract.
 - `[execution]` selects topology, precision, and RWKV state-passing.
   `[execution.rollout]` contains serving capacity and weight-transfer
   parameters, not optimizer batch semantics.
-- `[evaluation]`, `[checkpoint]`, and `[logging]` contain lifecycle settings.
-  Training-time validation uses Verl's validation loop. Full benchmark
-  evaluation is a separate public LightEval command owned by Helicopter.
+- `[evaluation]` contains only the original lifecycle trigger and the external
+  command. The benchmark list and publication policy belong to the referenced
+  Helicopter eval config.
+- `[checkpoint]` sets the cadence and a directory below `WEIGHT_PATH`, so the
+  LightEval command can load the native actor checkpoint directly.
+- `[logging]` contains training logger settings.
 
 ## Derived invariants
 
@@ -62,11 +72,10 @@ switches:
 - MaxRL effective-group filtering and refill until 32 mixed-outcome groups are
   available;
 - training `top_p = 0.95`;
-- validation `temperature = 0.96`, `top_p = 0.76`, `top_k = 32`,
-  `presence_penalty = 1.0`, `frequency_penalty = 0.1`, and
-  `penalty_decay = 0.988`.
+- no Verl validation scorer or LightEval Python dependency; validation metrics
+  come back from the configured command.
 
 Final Hydra overrides are limited to an explicit operational allowlist (for
-example checkpoint paths, resume mode, logging, validation cadence, and rollout
-capacity). Dataset, model, decoding, objective, and batch-shape fields cannot be
+example checkpoint paths, resume mode, logging, and rollout capacity). Dataset,
+model, decoding, objective, batch-shape, and evaluation fields cannot be
 replaced from the command line.

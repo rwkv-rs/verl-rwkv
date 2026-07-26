@@ -61,13 +61,14 @@ def test_compiles_strict_maxrl_contract() -> None:
     assert values["actor_rollout_ref.rollout.max_model_len"] == "10240"
     assert values["actor_rollout_ref.rollout.ignore_eos"] == "False"
     assert values["actor_rollout_ref.rollout.top_p"] == "0.95"
-    assert values["actor_rollout_ref.rollout.val_kwargs.temperature"] == "0.96"
-    assert values["actor_rollout_ref.rollout.val_kwargs.top_p"] == "0.76"
-    assert values["actor_rollout_ref.rollout.val_kwargs.top_k"] == "32"
-    assert values["actor_rollout_ref.rollout.val_kwargs.presence_penalty"] == "1.0"
-    assert values["actor_rollout_ref.rollout.val_kwargs.frequency_penalty"] == "0.1"
-    assert values["actor_rollout_ref.rollout.val_kwargs.penalty_decay"] == "0.988"
-    assert values["actor_rollout_ref.rollout.val_kwargs.do_sample"] == "True"
+    assert values["data.val_files"] == "null"
+    assert values["trainer.val_before_train"] == "True"
+    assert values["trainer.test_freq"] == "50"
+    assert values["trainer.default_local_dir"] == "/weights/maxrl/maxrl-dapo-math-17k"
+    assert values["trainer.external_evaluation.command"] == (
+        '["helicopter","eval","--config","configs/eval/maxrl_math.toml","--env-file",".env.remote"]'
+    )
+    assert not any(key.startswith("actor_rollout_ref.rollout.val_kwargs.") for key in values)
     assert values["data.max_prompt_length"] == "null"
     assert values["data.max_response_length"] == "null"
     assert values["data.train_files"] == "['/datasets/DAPO/dapo-math-17k-processed.parquet']"
@@ -140,6 +141,17 @@ def test_compiler_output_composes_with_real_hydra_schema() -> None:
     assert composed.actor_rollout_ref.rollout.n == 16
     assert composed.actor_rollout_ref.rollout.max_model_len == 10240
     assert composed.actor_rollout_ref.rollout.response_length == 10240
+    assert composed.data.val_files is None
+    assert composed.trainer.val_before_train is True
+    assert composed.trainer.test_freq == 50
+    assert list(composed.trainer.external_evaluation.command) == [
+        "helicopter",
+        "eval",
+        "--config",
+        "configs/eval/maxrl_math.toml",
+        "--env-file",
+        ".env.remote",
+    ]
 
 
 def test_removed_user_knobs_are_rejected() -> None:
@@ -148,10 +160,18 @@ def test_removed_user_knobs_are_rejected() -> None:
     with pytest.raises(MaxRLConfigError, match="removed field"):
         build_overrides(modified, env=ENV)
 
-    modified = deepcopy(config())
-    modified["generation"]["validation"]["strategy"] = "greedy"
-    with pytest.raises(MaxRLConfigError, match="removed field"):
-        build_overrides(modified, env=ENV)
+    for section, value in (
+        ("data.validation", {"suites": []}),
+        ("generation.validation", {"temperature": 0.96}),
+    ):
+        modified = deepcopy(config())
+        target = modified
+        parts = section.split(".")
+        for part in parts[:-1]:
+            target = target[part]
+        target[parts[-1]] = value
+        with pytest.raises(MaxRLConfigError, match="removed table"):
+            build_overrides(modified, env=ENV)
 
 
 @pytest.mark.parametrize(

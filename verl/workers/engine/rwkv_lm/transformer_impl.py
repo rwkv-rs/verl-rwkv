@@ -355,7 +355,15 @@ class RWKVLMEngine(BaseEngine):
             raise RuntimeError("RWKVLMEngine.initialize() must be called before save_checkpoint().")
         path = self._checkpoint_file(local_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.model.state_dict(), path)
+        data_parallel_group = self.get_data_parallel_group()
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if not distributed or torch.distributed.get_rank(group=data_parallel_group) == 0:
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.unlink(missing_ok=True)
+            torch.save(self.model.state_dict(), temporary_path)
+            temporary_path.replace(path)
+        if distributed:
+            torch.distributed.barrier(group=data_parallel_group)
 
     def load_checkpoint(
         self,
