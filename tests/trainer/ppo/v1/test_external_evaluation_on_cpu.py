@@ -38,8 +38,9 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
         def wake_up_replicas(self):
             events.append("wake")
 
-    def run(command, *, env, check):
+    def run(command, *, cwd, env, check):
         assert command == ["helicopter", "eval", "--config", "maxrl.toml"]
+        assert cwd == "/product/helicopter"
         assert check is True
         assert env["MAXRL_EVAL_WEIGHT"] == "maxrl/run/global_step_7/actor/rwkv_lm.pth"
         assert env["MAXRL_EVAL_STEP"] == "7"
@@ -52,6 +53,7 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
         events.append("command")
 
     monkeypatch.setenv("WEIGHT_PATH", str(weight_root))
+    monkeypatch.setenv("HELICOPTER_PRODUCT_ROOT", "/product/helicopter")
     monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.subprocess.run", run)
     trainer = SimpleNamespace(
         config=OmegaConf.create({"trainer": {"default_local_dir": str(checkpoint_root)}}),

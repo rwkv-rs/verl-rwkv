@@ -1397,7 +1397,12 @@ class PPOTrainer(ABC):
 
         self.checkpoint_manager.sleep_replicas()
         try:
-            subprocess.run(command, env=child_env, check=True)
+            subprocess.run(
+                command,
+                cwd=child_env.get("HELICOPTER_PRODUCT_ROOT"),
+                env=child_env,
+                check=True,
+            )
         finally:
             self.checkpoint_manager.wake_up_replicas()
 
