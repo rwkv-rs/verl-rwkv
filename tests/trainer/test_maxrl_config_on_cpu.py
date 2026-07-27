@@ -18,26 +18,100 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+import tomllib
 from hydra import compose, initialize_config_dir
 
 from verl.trainer.maxrl import (
     MaxRLConfigError,
     build_overrides,
     context_tokens_from_checkpoint,
-    read_config,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = ROOT / "examples/rwkv_trainer/config/maxrl_dapo_math_17k.toml"
 ENV = {
     "WEIGHT_PATH": "/weights",
     "DATASETS_PATH": "/datasets",
     "RWKV_LM_PATH": "/src/rwkv-lm",
 }
+CONFIG_TOML = """
+[experiment]
+name = "maxrl-dapo-math-17k"
+project = "helicopter-math"
+seed = 42
+candidate_dataset_passes = 10
+
+[model]
+name = "g1h-7.2b"
+checkpoint = "/weights/rwkv7/pth/rwkv7-g1h-7.2b-20260710-ctx10240.pth"
+prompt_mode = "open_think"
+prompt_template = "\\nBot✿"
+
+[data.train]
+files = ["/datasets/DAPO/dapo-math-17k-processed.parquet"]
+prompt_field = "source_prompt"
+
+[algorithm]
+name = "maxrl"
+prompts_per_step = 32
+responses_per_prompt = 16
+ppo_clip = 0.2
+dual_clip = 3.0
+entropy_coefficient = 0.0
+kl_coefficient = 0.0
+
+[reward]
+manager = "dapo"
+scorer = "math_verify"
+
+[optimizer]
+learning_rate = 1e-6
+warmup_steps = 0
+weight_decay = 0.01
+gradient_norm_limit = 0.3
+
+[generation.train]
+temperature = 1.0
+top_k = -1
+top_p = 0.95
+
+[execution]
+nodes = 1
+gpus_per_node = 8
+wkv_mode = "fp32io16"
+context_mode = "state_passing"
+state_chunk_tokens = 2048
+
+[execution.rollout]
+replicas = 8
+tensor_parallel_size_per_replica = 1
+pipeline_parallel_size_per_replica = 1
+max_concurrent_sequences_per_replica = 64
+generation_token_budget_per_replica = 8192
+weight_update_bucket_mib = 64
+
+[evaluation]
+before_training = true
+every_optimizer_steps = 50
+command = [
+  "helicopter",
+  "eval",
+  "--config",
+  "configs/eval/maxrl_math.toml",
+  "--env-file",
+  ".env.remote",
+]
+
+[checkpoint]
+every_optimizer_steps = 50
+directory = "/weights/maxrl/maxrl-dapo-math-17k"
+
+[logging]
+backends = ["console", "file", "wandb"]
+"""
 
 
 def config() -> dict:
-    return read_config(CONFIG_PATH, ENV)
+    return tomllib.loads(CONFIG_TOML)
 
 
 def resolved(overrides: list[str]) -> dict[str, str]:
