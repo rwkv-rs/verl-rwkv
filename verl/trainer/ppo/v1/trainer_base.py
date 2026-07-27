@@ -1370,10 +1370,15 @@ class PPOTrainer(ABC):
 
         checkpoint_root = Path(self.config.trainer.default_local_dir).resolve()
         checkpoint_file = checkpoint_root / f"global_step_{self.global_steps}" / "actor" / "rwkv_lm.pth"
-        if not checkpoint_file.is_file():
+        checkpoint_config = checkpoint_file.parent / "config.json"
+        if not checkpoint_file.is_file() or not checkpoint_config.is_file():
             self._save_checkpoint()
-        if not checkpoint_file.is_file():
-            raise RuntimeError(f"external evaluation checkpoint is missing: {checkpoint_file}")
+        missing_checkpoint_files = [
+            path for path in (checkpoint_file, checkpoint_config) if not path.is_file()
+        ]
+        if missing_checkpoint_files:
+            missing_paths = ", ".join(str(path) for path in missing_checkpoint_files)
+            raise RuntimeError(f"external evaluation checkpoint is incomplete: {missing_paths}")
 
         weight_root_raw = os.environ.get("WEIGHT_PATH")
         if not weight_root_raw:

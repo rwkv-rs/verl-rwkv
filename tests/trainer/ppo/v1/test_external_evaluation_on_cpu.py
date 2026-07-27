@@ -29,6 +29,7 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
     def save_checkpoint():
         checkpoint_file.parent.mkdir(parents=True)
         checkpoint_file.write_bytes(b"weights")
+        (checkpoint_file.parent / "config.json").write_text("{}", encoding="utf-8")
         events.append("save")
 
     class CheckpointManager:
