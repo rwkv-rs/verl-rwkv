@@ -42,12 +42,15 @@ REQUIRED_SECTIONS = {
     "checkpoint",
     "logging",
 }
+REMOVED_TABLES = (
+    "data.validation",
+    "generation.validation",
+)
 REMOVED_FIELDS = (
     ("model", "context_tokens"),
     ("data.train", "max_prompt_tokens"),
     ("generation.train", "max_response_tokens"),
     ("generation.train", "stop_on_eos"),
-    ("generation.validation", "strategy"),
     ("execution", "dynamic_microbatching"),
     ("execution", "train_token_budget_per_gpu"),
 )
@@ -63,8 +66,6 @@ OPERATIONAL_OVERRIDE_KEYS = frozenset(
         "trainer.resume_from_path",
         "trainer.resume_mode",
         "trainer.save_freq",
-        "trainer.test_freq",
-        "trainer.validation_data_dir",
     }
 )
 
@@ -129,6 +130,14 @@ def read_config(path: Path, env: Mapping[str, str] | None = None) -> dict[str, A
 
 
 def _validate_removed_fields(config: Mapping[str, Any]) -> None:
+    for section_path in REMOVED_TABLES:
+        value: Any = config
+        for component in section_path.split("."):
+            if not isinstance(value, Mapping) or component not in value:
+                break
+            value = value[component]
+        else:
+            raise MaxRLConfigError(f"MaxRL config contains removed table: {section_path}")
     for section_path, key in REMOVED_FIELDS:
         if key in _table(config, section_path):
             raise MaxRLConfigError(f"MaxRL config contains removed field: {section_path}.{key}")
@@ -200,18 +209,6 @@ def _reward_path(scorer: str, verl_root: Path) -> Path:
     raise MaxRLConfigError(f"unsupported reward.scorer: {scorer!r}")
 
 
-def _validation_files(validation: Mapping[str, Any]) -> str:
-    suites = _required(validation, "suites", section_name="data.validation")
-    if not isinstance(suites, list) or not suites:
-        raise MaxRLConfigError("data.validation.suites must be a non-empty array")
-    files: list[str] = []
-    for index, suite in enumerate(suites):
-        if not isinstance(suite, Mapping) or not suite.get("file"):
-            raise MaxRLConfigError(f"data.validation.suites[{index}] requires file")
-        files.append(str(suite["file"]))
-    return _files(files, name="data.validation.suites")
-
-
 def _resolved_map(overrides: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for override in overrides:
@@ -242,12 +239,15 @@ def _validate_resolved(
     prompts_per_step: int,
     responses_per_prompt: int,
     candidate_dataset_passes: int,
+    validation_before_training: bool,
+    validation_interval: int,
 ) -> None:
     resolved = _resolved_map(overrides)
     required = {
         "algorithm.adv_estimator": "maxrl",
         "data.max_prompt_length": "null",
         "data.max_response_length": "null",
+        "data.val_files": "null",
         "data.filter_overlong_prompts": "False",
         "data.truncation": "error",
         "data.train_batch_size": str(prompts_per_step),
@@ -274,6 +274,8 @@ def _validate_resolved(
         "actor_rollout_ref.rollout.ignore_eos": "False",
         "actor_rollout_ref.rollout.top_p": "0.95",
         "actor_rollout_ref.rollout.checkpoint_engine.backend": "naive",
+        "trainer.val_before_train": _hydra(validation_before_training),
+        "trainer.test_freq": str(validation_interval),
         "algorithm.rollout_correction.rollout_is": "token",
         "algorithm.rollout_correction.rollout_is_threshold": "2.0",
         "algorithm.rollout_correction.rollout_is_batch_normalize": "False",
@@ -300,12 +302,10 @@ def build_overrides(
     experiment = _table(config, "experiment")
     model = _table(config, "model")
     train = _table(config, "data.train")
-    validation = _table(config, "data.validation")
     algorithm = _table(config, "algorithm")
     reward = _table(config, "reward")
     optimizer = _table(config, "optimizer")
     train_generation = _table(config, "generation.train")
-    validation_generation = _table(config, "generation.validation")
     execution = _table(config, "execution")
     rollout = _table(config, "execution.rollout")
     evaluation = _table(config, "evaluation")
@@ -357,30 +357,33 @@ def build_overrides(
         raise MaxRLConfigError("RWKV_LM_PATH is required")
     verl_root = Path(__file__).resolve().parents[2]
     train_prompt_key = str(train.get("prompt_field", "prompt")).strip()
-    validation_prompt_key = str(validation.get("prompt_field", "prompt")).strip()
     scorer = str(_required(reward, "scorer", section_name="reward"))
     kl_coefficient = algorithm.get("kl_coefficient", 0.0)
     train_temperature = _required(train_generation, "temperature", section_name="generation.train")
-    validation_temperature = _required(validation_generation, "temperature", section_name="generation.validation")
-    validation_top_k = _required(validation_generation, "top_k", section_name="generation.validation")
-    validation_top_p = _required(validation_generation, "top_p", section_name="generation.validation")
-    validation_responses = _required(
-        validation_generation,
-        "responses_per_prompt",
-        section_name="generation.validation",
-    )
     gradient_norm_limit = _required(optimizer, "gradient_norm_limit", section_name="optimizer")
     wkv_mode = str(_required(execution, "wkv_mode", section_name="execution"))
     if wkv_mode not in {"fp16", "fp32io16"}:
         raise MaxRLConfigError("execution.wkv_mode must be fp16 or fp32io16")
+    validation_before_training = bool(_required(evaluation, "before_training", section_name="evaluation"))
+    validation_interval = _positive_int(
+        _required(evaluation, "every_optimizer_steps", section_name="evaluation"),
+        name="evaluation.every_optimizer_steps",
+    )
+    validation_command = _required(evaluation, "command", section_name="evaluation")
+    if (
+        not isinstance(validation_command, list)
+        or not validation_command
+        or any(not isinstance(item, str) or not item.strip() for item in validation_command)
+    ):
+        raise MaxRLConfigError("evaluation.command must be a non-empty array of command arguments")
+    checkpoint_directory = str(_required(checkpoint, "directory", section_name="checkpoint"))
 
     overrides = [
         "algorithm.adv_estimator=maxrl",
         "algorithm.use_kl_in_reward=False",
         f"data.train_files={_files(_required(train, 'files', section_name='data.train'), name='data.train.files')}",
-        f"data.val_files={_validation_files(validation)}",
+        "data.val_files=null",
         f"+data.train_prompt_key={train_prompt_key}",
-        f"+data.val_prompt_key={validation_prompt_key}",
         f"data.train_batch_size={prompts_per_step}",
         f"data.seed={_required(experiment, 'seed', section_name='experiment')}",
         "data.max_prompt_length=null",
@@ -446,17 +449,6 @@ def build_overrides(
         "algorithm.rollout_correction.rollout_rs=null",
         "algorithm.rollout_correction.bypass_mode=False",
         "data.dataloader_num_workers=0",
-        "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
-        f"actor_rollout_ref.rollout.val_kwargs.temperature={validation_temperature}",
-        f"actor_rollout_ref.rollout.val_kwargs.top_k={validation_top_k}",
-        f"actor_rollout_ref.rollout.val_kwargs.top_p={validation_top_p}",
-        "actor_rollout_ref.rollout.val_kwargs.presence_penalty="
-        f"{_required(validation_generation, 'presence_penalty', section_name='generation.validation')}",
-        "actor_rollout_ref.rollout.val_kwargs.frequency_penalty="
-        f"{_required(validation_generation, 'frequency_penalty', section_name='generation.validation')}",
-        "actor_rollout_ref.rollout.val_kwargs.penalty_decay="
-        f"{_required(validation_generation, 'penalty_decay', section_name='generation.validation')}",
-        f"actor_rollout_ref.rollout.val_kwargs.n={validation_responses}",
         "actor_rollout_ref.rollout.dtype=float16",
     ]
     prompt_mode = model.get("prompt_mode")
@@ -465,7 +457,6 @@ def build_overrides(
         overrides.extend(
             [
                 f"+data.apply_chat_template_kwargs.rwkv_generation_prompt={prompt_mode}",
-                f"+data.val_apply_chat_template_kwargs.rwkv_generation_prompt={prompt_mode}",
             ]
         )
     if prompt_template:
@@ -473,7 +464,6 @@ def build_overrides(
         overrides.extend(
             [
                 f"+data.apply_chat_template_kwargs.rwkv_prompt_template={quoted_template}",
-                f"+data.val_apply_chat_template_kwargs.rwkv_prompt_template={quoted_template}",
                 f"actor_rollout_ref.rollout.rwkv_prompt_template={quoted_template}",
             ]
         )
@@ -504,14 +494,14 @@ def build_overrides(
             f"trainer.experiment_name={_required(experiment, 'name', section_name='experiment')}",
             f"trainer.nnodes={nodes}",
             f"trainer.n_gpus_per_node={gpus}",
+            f"trainer.default_local_dir={checkpoint_directory}",
             f"trainer.save_freq={_required(checkpoint, 'every_optimizer_steps', section_name='checkpoint')}",
-            f"trainer.test_freq={_required(evaluation, 'every_optimizer_steps', section_name='evaluation')}",
-            f"trainer.val_before_train={_hydra(_required(evaluation, 'before_training', section_name='evaluation'))}",
+            f"trainer.test_freq={validation_interval}",
+            f"trainer.val_before_train={_hydra(validation_before_training)}",
+            f"+trainer.external_evaluation.command={_hydra(validation_command)}",
             f"trainer.total_epochs={passes}",
         ]
     )
-    if evaluation.get("output_directory"):
-        overrides.append(f"trainer.validation_data_dir={evaluation['output_directory']}")
     if extra_overrides:
         _validate_extra_overrides(extra_overrides)
         overrides.extend(extra_overrides)
@@ -522,6 +512,8 @@ def build_overrides(
         prompts_per_step=prompts_per_step,
         responses_per_prompt=responses_per_prompt,
         candidate_dataset_passes=passes,
+        validation_before_training=validation_before_training,
+        validation_interval=validation_interval,
     )
 
     child_env = environment.copy()
