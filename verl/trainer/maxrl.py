@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import tomllib
+from hydra.core.override_parser.types import Quote, QuotedString
 
 CONTEXT_SUFFIX_RE = re.compile(r"(?:^|[-_.])ctx(?P<tokens>[1-9]\d*)(?=[-_.]|$)")
 ENV_REFERENCE_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
@@ -166,7 +167,7 @@ def _hydra(value: Any) -> str:
 
 
 def _quoted(value: Any) -> str:
-    return json.dumps(str(value))
+    return QuotedString(text=str(value), quote=Quote.double).with_quotes()
 
 
 def _files(value: Any, *, name: str) -> str:
