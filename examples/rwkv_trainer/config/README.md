@@ -1,14 +1,15 @@
 # RWKV MaxRL configuration
 
-Run the canonical experiment directly from this checkout:
+Run a MaxRL experiment supplied by the product checkout:
 
 ```bash
 python -m verl.trainer.maxrl \
-  --config examples/rwkv_trainer/config/maxrl_dapo_math_17k.toml
+  --config /path/to/maxrl-experiment.toml
 ```
 
-`verl.trainer.maxrl` owns the complete MaxRL contract. Launchers may forward the
-TOML and explicit `--override` values, but they must not compile a second Hydra
+`verl.trainer.maxrl` owns the MaxRL schema, validation, and compilation contract.
+The product launcher owns concrete experiment TOML files and may forward them
+with explicit `--override` values, but it must not compile a second Hydra
 configuration.
 
 MaxRL does not implement a second benchmark evaluator or install LightEval.
