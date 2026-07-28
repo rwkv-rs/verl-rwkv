@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import json
 import logging
 import math
@@ -1362,7 +1363,7 @@ class PPOTrainer(ABC):
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _validate_external(self, external_evaluation: DictConfig) -> dict[str, float]:
-        """Checkpoint the current actor and obtain metrics from an external command."""
+        """Evaluate the current actor through the existing rollout HTTP replicas."""
 
         command = list(external_evaluation.command)
         if not command or any(not isinstance(argument, str) or not argument for argument in command):
@@ -1370,10 +1371,13 @@ class PPOTrainer(ABC):
 
         checkpoint_root = Path(self.config.trainer.default_local_dir).resolve()
         checkpoint_file = checkpoint_root / f"global_step_{self.global_steps}" / "actor" / "rwkv_lm.pth"
-        if not checkpoint_file.is_file():
+        checkpoint_config = checkpoint_file.parent / "config.json"
+        if not checkpoint_file.is_file() or not checkpoint_config.is_file():
             self._save_checkpoint()
-        if not checkpoint_file.is_file():
-            raise RuntimeError(f"external evaluation checkpoint is missing: {checkpoint_file}")
+        missing_checkpoint_files = [path for path in (checkpoint_file, checkpoint_config) if not path.is_file()]
+        if missing_checkpoint_files:
+            missing_paths = ", ".join(str(path) for path in missing_checkpoint_files)
+            raise RuntimeError(f"external evaluation checkpoint is incomplete: {missing_paths}")
 
         weight_root_raw = os.environ.get("WEIGHT_PATH")
         if not weight_root_raw:
@@ -1386,17 +1390,59 @@ class PPOTrainer(ABC):
 
         result_path = checkpoint_file.parent / "lighteval_metrics.json"
         result_path.unlink(missing_ok=True)
-        child_env = os.environ.copy()
-        child_env.update(
-            {
-                "MAXRL_EVAL_WEIGHT": relative_weight.as_posix(),
-                "MAXRL_EVAL_RESULT_PATH": str(result_path),
-                "MAXRL_EVAL_STEP": str(self.global_steps),
-            }
-        )
-
-        self.checkpoint_manager.sleep_replicas()
+        rollout_config = self.config.actor_rollout_ref.rollout
+        max_model_len = rollout_config.get("max_model_len")
+        if not isinstance(max_model_len, int) or isinstance(max_model_len, bool) or max_model_len <= 0:
+            max_model_len = int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length)
+        max_concurrency = rollout_config.get("max_num_seqs")
+        if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool) or max_concurrency <= 0:
+            raise RuntimeError("external evaluation requires rollout.max_num_seqs")
+        wkv_mode = os.environ.get("VLLM_RWKV7_WKV_MODE")
+        if wkv_mode not in {"fp16", "fp32io16"}:
+            raise RuntimeError("external evaluation requires VLLM_RWKV7_WKV_MODE")
+        addresses = list(self.llm_server_manager.get_addresses())
+        if (
+            not addresses
+            or any(
+                not isinstance(address, str) or not address or address != address.strip() or "://" in address
+                for address in addresses
+            )
+            or len(set(addresses)) != len(addresses)
+        ):
+            raise RuntimeError("external evaluation requires unique rollout server addresses")
+        pool_manifest_path = checkpoint_file.parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
+        pool_payload = {
+            "schema_version": 1,
+            "global_step": self.global_steps,
+            "wkv_mode": wkv_mode,
+            "vllm_version": importlib.metadata.version("vllm"),
+            "max_model_len": max_model_len,
+            "replicas": [
+                {
+                    "base_url": f"http://{address}",
+                    "max_concurrency": max_concurrency,
+                }
+                for address in addresses
+            ],
+        }
         try:
+            descriptor = os.open(
+                pool_manifest_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(pool_payload, stream, sort_keys=True)
+                stream.write("\n")
+            child_env = os.environ.copy()
+            child_env.update(
+                {
+                    "MAXRL_EVAL_WEIGHT": relative_weight.as_posix(),
+                    "MAXRL_EVAL_RESULT_PATH": str(result_path),
+                    "MAXRL_EVAL_STEP": str(self.global_steps),
+                    "HELICOPTER_VLLM_POOL_MANIFEST": str(pool_manifest_path),
+                }
+            )
             subprocess.run(
                 command,
                 cwd=child_env.get("HELICOPTER_PRODUCT_ROOT"),
@@ -1404,7 +1450,7 @@ class PPOTrainer(ABC):
                 check=True,
             )
         finally:
-            self.checkpoint_manager.wake_up_replicas()
+            pool_manifest_path.unlink(missing_ok=True)
 
         if not result_path.is_file():
             raise RuntimeError(f"external evaluation did not write metrics: {result_path}")

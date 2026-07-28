@@ -15,6 +15,7 @@
 
 import ctypes
 import gc
+import json
 from collections.abc import Callable, Generator
 from contextlib import ContextDecorator, contextmanager, nullcontext
 from pathlib import Path
@@ -362,6 +363,29 @@ class RWKVLMEngine(BaseEngine):
             temporary_path.unlink(missing_ok=True)
             torch.save(self.model.state_dict(), temporary_path)
             temporary_path.replace(path)
+            if self.runner is None:
+                raise RuntimeError("RWKVLMEngine.initialize() must be called before save_checkpoint().")
+            args = self.runner.args
+            config_path = path.parent / "config.json"
+            temporary_config_path = config_path.with_suffix(config_path.suffix + ".tmp")
+            temporary_config_path.unlink(missing_ok=True)
+            temporary_config_path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["RWKV7ForCausalLM"],
+                        "model_type": "rwkv7",
+                        "vocab_size": int(args.vocab_size),
+                        "hidden_size": int(args.n_embd),
+                        "head_size": int(args.head_size),
+                        "num_hidden_layers": int(args.n_layer),
+                        "max_position_embeddings": int(args.ctx_len),
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary_config_path.replace(config_path)
         if distributed:
             torch.distributed.barrier(group=data_parallel_group)
 

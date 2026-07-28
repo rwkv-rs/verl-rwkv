@@ -218,6 +218,8 @@ def test_compiler_output_composes_with_real_hydra_schema() -> None:
     assert composed.data.val_files is None
     assert composed.trainer.val_before_train is True
     assert composed.trainer.test_freq == 50
+    assert composed.data.apply_chat_template_kwargs.rwkv_prompt_template == "\nBot✿"
+    assert composed.actor_rollout_ref.rollout.rwkv_prompt_template == "\nBot✿"
     assert list(composed.trainer.external_evaluation.command) == [
         "helicopter",
         "eval",
