@@ -1374,9 +1374,7 @@ class PPOTrainer(ABC):
         checkpoint_config = checkpoint_file.parent / "config.json"
         if not checkpoint_file.is_file() or not checkpoint_config.is_file():
             self._save_checkpoint()
-        missing_checkpoint_files = [
-            path for path in (checkpoint_file, checkpoint_config) if not path.is_file()
-        ]
+        missing_checkpoint_files = [path for path in (checkpoint_file, checkpoint_config) if not path.is_file()]
         if missing_checkpoint_files:
             missing_paths = ", ".join(str(path) for path in missing_checkpoint_files)
             raise RuntimeError(f"external evaluation checkpoint is incomplete: {missing_paths}")
