@@ -284,6 +284,7 @@ class vLLMHttpServer:
         self.weight_update_state = "uninitialized"
         self.weight_update_failure = None
         self._warned_missing_spec_decode_stats = False
+        self._runtime_capacity: dict[str, Any] | None = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -334,7 +335,6 @@ class vLLMHttpServer:
 
     def get_runtime_metadata(self) -> dict[str, Any]:
         context = ray.get_runtime_context()
-        tokenizer_mode = self.config.engine_kwargs.get("vllm", {}).get("tokenizer_mode")
         return {
             "replica_rank": self.replica_rank,
             "node_rank": self.node_rank,
@@ -348,13 +348,7 @@ class vLLMHttpServer:
             "master_port": self._master_port,
             "dp_rpc_port": self._dp_rpc_port,
             "dp_master_port": self._dp_master_port,
-            "capacity": {
-                "capacity_mode": "recurrent-state-no-kv-cache" if tokenizer_mode == "rwkv" else "kv-cache",
-                "kv_cache_applicable": tokenizer_mode != "rwkv",
-                "max_num_seqs": int(self.config.max_num_seqs),
-                "max_num_batched_tokens": int(self.config.max_num_batched_tokens),
-                "gpu_memory_utilization": float(self.config.gpu_memory_utilization),
-            },
+            "capacity": self._runtime_capacity,
         }
 
     @property
@@ -594,6 +588,15 @@ class vLLMHttpServer:
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        tokenizer_mode = self.config.engine_kwargs.get("vllm", {}).get("tokenizer_mode")
+        self._runtime_capacity = {
+            "capacity_source": "vllm.scheduler_config",
+            "capacity_mode": "recurrent-state-no-kv-cache" if tokenizer_mode == "rwkv" else "kv-cache",
+            "kv_cache_applicable": tokenizer_mode != "rwkv",
+            "max_num_seqs": int(vllm_config.scheduler_config.max_num_seqs),
+            "max_num_batched_tokens": int(vllm_config.scheduler_config.max_num_batched_tokens),
+            "gpu_memory_utilization": float(vllm_config.cache_config.gpu_memory_utilization),
+        }
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
