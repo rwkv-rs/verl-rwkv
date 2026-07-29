@@ -58,8 +58,6 @@ REMOVED_FIELDS = (
 OPERATIONAL_OVERRIDE_KEYS = frozenset(
     {
         "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
-        "actor_rollout_ref.rollout.max_num_batched_tokens",
-        "actor_rollout_ref.rollout.max_num_seqs",
         "trainer.default_local_dir",
         "trainer.experiment_name",
         "trainer.logger",
@@ -451,6 +449,7 @@ def build_overrides(
         "algorithm.rollout_correction.bypass_mode=False",
         "data.dataloader_num_workers=0",
         "actor_rollout_ref.rollout.dtype=float16",
+        "actor_rollout_ref.rollout.disable_log_stats=False",
     ]
     prompt_mode = model.get("prompt_mode")
     prompt_template = model.get("prompt_template")

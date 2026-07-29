@@ -32,6 +32,7 @@ from verl.trainer.ppo.v1.effective_groups import (
     binary_success_from_rewards,
     classify_complete_groups,
     effective_training_should_stop,
+    strict_rollout_group_capacity,
 )
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
 
@@ -114,10 +115,45 @@ def test_candidate_wave_planner_uses_rate_quantum_and_limit():
         group_quantum=32,
         max_candidate_groups=1024,
         max_wave_groups=256,
+        acceptance_rate=0.5,
     )
     assert planner.plan(accepted_groups=0) == 96
     planner.observe(candidate_groups=96, effective_groups=48)
     assert planner.plan(accepted_groups=24) == 32
+
+
+def test_candidate_wave_planner_cold_start_targets_one_wave_fill_probability():
+    planner = CandidateWavePlanner(
+        target_groups=32,
+        group_quantum=1,
+        max_candidate_groups=1024,
+        max_wave_groups=256,
+    )
+
+    assert planner.plan(accepted_groups=0) == 193
+    assert planner._fill_probability(192, 32, 0.20) < 0.90
+    assert planner._fill_probability(193, 32, 0.20) >= 0.90
+
+
+def test_strict_rollout_group_capacity_uses_sequence_and_decode_limits():
+    assert (
+        strict_rollout_group_capacity(
+            replica_count=8,
+            max_num_seqs_per_replica=960,
+            max_num_batched_tokens_per_replica=8192,
+            responses_per_prompt=16,
+        )
+        == 480
+    )
+    assert (
+        strict_rollout_group_capacity(
+            replica_count=8,
+            max_num_seqs_per_replica=960,
+            max_num_batched_tokens_per_replica=512,
+            responses_per_prompt=16,
+        )
+        == 256
+    )
 
 
 def test_candidate_wave_planner_stops_at_safety_limit():
@@ -315,7 +351,6 @@ def _collector_fixture(monkeypatch, waves, *, graceful=False):
         max_candidate_groups=8,
         max_wave_groups=2,
         acceptance_rate=1.0,
-        headroom=1.0,
     )
     trainer._effective_group_acceptance_rate = 1.0
     trainer._effective_sampling_totals = defaultdict(float)
@@ -355,6 +390,11 @@ def test_collector_refills_to_exact_effective_batch_and_clears_rejections(
     assert metrics["training/effective_sampling/candidate_groups"] == 3
     assert metrics["training/effective_sampling/accepted_groups"] == 2
     assert metrics["training/effective_sampling/refill_waves"] == 2
+    assert metrics["training/effective_sampling/planned_initial_wave_groups"] == 2
+    assert metrics["training/effective_sampling/initial_wave_groups"] == 2
+    assert metrics["training/effective_sampling/refill_candidate_groups"] == 1
+    assert metrics["training/effective_sampling/max_wave_groups"] == 2
+    assert metrics["training/effective_sampling/runtime_wave_capacity_groups"] == 2
     assert metrics["training/effective_sampling/effective_batch_trajectories"] == 4
     assert metrics["training/effective_sampling/candidate_data_id_unique"] == 3
     assert metrics["training/effective_sampling/accepted_data_id_unique"] == 2

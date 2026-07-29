@@ -21,7 +21,7 @@ binary-success contract and candidate-wave policy can be tested on CPU.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Sequence
 
@@ -79,6 +79,8 @@ class EffectiveRoundState:
     candidate_order: list[str]
     in_flight_groups: int = 0
     refill_waves: int = 0
+    wave_groups: list[int] = field(default_factory=list)
+    completed_wave_groups: list[int] = field(default_factory=list)
 
     @classmethod
     def create(cls, target_groups: int, responses_per_prompt: int) -> EffectiveRoundState:
@@ -89,12 +91,14 @@ class EffectiveRoundState:
             raise ValueError("candidate wave must contain at least one group")
         self.in_flight_groups += group_count
         self.refill_waves += 1
+        self.wave_groups.append(group_count)
 
     def complete_wave(self, selection: GroupSelection) -> None:
         completed = selection.completed
         if len(completed) > self.in_flight_groups:
             raise ValueError("completed groups exceed the round's in-flight candidates")
         self.in_flight_groups -= len(completed)
+        self.completed_wave_groups.append(len(completed))
         self.candidate_order.extend(group.uid for group in completed)
         self.accepted.extend(selection.accepted)
         self.rejected.extend(selection.rejected)
@@ -195,6 +199,33 @@ def effective_training_should_stop(
     return target_candidate_dataset_passes > 0 and candidate_dataset_passes_completed >= target_candidate_dataset_passes
 
 
+def strict_rollout_group_capacity(
+    *,
+    replica_count: int,
+    max_num_seqs_per_replica: int,
+    max_num_batched_tokens_per_replica: int,
+    responses_per_prompt: int,
+) -> int:
+    """Return the largest complete-group wave supported by decode capacity."""
+
+    values = (
+        replica_count,
+        max_num_seqs_per_replica,
+        max_num_batched_tokens_per_replica,
+        responses_per_prompt,
+    )
+    if any(value <= 0 for value in values):
+        raise ValueError("strict rollout capacity inputs must be positive")
+    per_replica_decode_sequences = min(
+        max_num_seqs_per_replica,
+        max_num_batched_tokens_per_replica,
+    )
+    group_capacity = replica_count * per_replica_decode_sequences // responses_per_prompt
+    if group_capacity <= 0:
+        raise ValueError("strict rollout capacity cannot fit one complete response group")
+    return group_capacity
+
+
 def classify_complete_groups(
     uids: Sequence[str],
     binary_success: torch.Tensor,
@@ -252,10 +283,10 @@ class CandidateWavePlanner:
     group_quantum: int
     max_candidate_groups: int
     max_wave_groups: int
-    acceptance_rate: float = 0.5
+    acceptance_rate: float = 0.20
     smoothing: float = 0.25
     acceptance_floor: float = 0.05
-    headroom: float = 1.10
+    target_fill_probability: float = 0.90
     observed_candidates: int = 0
 
     def __post_init__(self) -> None:
@@ -265,6 +296,25 @@ class CandidateWavePlanner:
             raise ValueError("max_candidate_groups must cover the target")
         if self.max_wave_groups < self.group_quantum:
             raise ValueError("max_wave_groups must cover one group quantum")
+        if not 0.0 < self.acceptance_rate <= 1.0:
+            raise ValueError("acceptance_rate must be in (0, 1]")
+        if not 0.0 <= self.smoothing <= 1.0:
+            raise ValueError("smoothing must be in [0, 1]")
+        if not 0.0 < self.acceptance_floor <= 1.0:
+            raise ValueError("acceptance_floor must be in (0, 1]")
+        if not 0.0 < self.target_fill_probability < 1.0:
+            raise ValueError("target_fill_probability must be in (0, 1)")
+
+    @staticmethod
+    def _fill_probability(candidate_groups: int, deficit: int, acceptance_rate: float) -> float:
+        if candidate_groups < deficit:
+            return 0.0
+        return sum(
+            math.comb(candidate_groups, effective_groups)
+            * acceptance_rate**effective_groups
+            * (1.0 - acceptance_rate) ** (candidate_groups - effective_groups)
+            for effective_groups in range(deficit, candidate_groups + 1)
+        )
 
     def plan(self, accepted_groups: int) -> int:
         deficit = self.target_groups - accepted_groups
@@ -275,9 +325,16 @@ class CandidateWavePlanner:
             return 0
 
         rate = max(self.acceptance_rate, self.acceptance_floor)
-        estimated = math.ceil(deficit / rate * self.headroom)
-        rounded = math.ceil(estimated / self.group_quantum) * self.group_quantum
-        return min(max(rounded, self.group_quantum), self.max_wave_groups, remaining)
+        max_wave = min(self.max_wave_groups, remaining)
+        candidate_groups = max(
+            self.group_quantum,
+            math.ceil(deficit / self.group_quantum) * self.group_quantum,
+        )
+        while candidate_groups < max_wave:
+            if self._fill_probability(candidate_groups, deficit, rate) >= self.target_fill_probability:
+                return candidate_groups
+            candidate_groups = min(candidate_groups + self.group_quantum, max_wave)
+        return max_wave
 
     def observe(self, candidate_groups: int, effective_groups: int) -> None:
         if candidate_groups <= 0 or not 0 <= effective_groups <= candidate_groups:

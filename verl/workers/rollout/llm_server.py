@@ -37,6 +37,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
+from verl.workers.rollout.runtime_metrics import RolloutRuntimeMetricsSampler
 from verl.workers.rollout.utils import update_prometheus_config
 
 
@@ -61,6 +62,56 @@ def resolve_rollout_topology(
             "all GPUs must belong to exactly one replica"
         )
     return gpus_per_replica, world_size // gpus_per_replica
+
+
+def validate_strict_rollout_capacity(
+    deployments: list[dict[str, Any]],
+    *,
+    expected_replicas: int,
+    expected_max_num_seqs: int,
+    expected_max_num_batched_tokens: int,
+) -> None:
+    """Fail closed unless every replica head reports the final vLLM scheduler capacity."""
+
+    replica_heads = sorted(
+        (deployment for deployment in deployments if deployment.get("node_rank") == 0),
+        key=lambda deployment: deployment.get("replica_rank", -1),
+    )
+    replica_ranks = [deployment.get("replica_rank") for deployment in replica_heads]
+    if len(replica_heads) != expected_replicas or len(set(replica_ranks)) != expected_replicas:
+        raise RuntimeError(
+            "strict MaxRL rollout capacity requires one runtime head per replica: "
+            f"expected_replicas={expected_replicas} replica_ranks={replica_ranks}"
+        )
+
+    expected = {
+        "max_num_seqs": expected_max_num_seqs,
+        "max_num_batched_tokens": expected_max_num_batched_tokens,
+    }
+    mismatches = []
+    for deployment in replica_heads:
+        capacity = deployment.get("capacity")
+        actual = (
+            {
+                "max_num_seqs": capacity.get("max_num_seqs"),
+                "max_num_batched_tokens": capacity.get("max_num_batched_tokens"),
+            }
+            if isinstance(capacity, dict) and capacity.get("capacity_source") == "vllm.scheduler_config"
+            else None
+        )
+        if actual != expected:
+            mismatches.append(
+                {
+                    "replica_rank": deployment.get("replica_rank"),
+                    "capacity_source": capacity.get("capacity_source") if isinstance(capacity, dict) else None,
+                    "actual": actual,
+                }
+            )
+    if mismatches:
+        raise RuntimeError(
+            "strict MaxRL rollout runtime capacity does not match the compiled contract: "
+            f"expected={expected} mismatches={mismatches}"
+        )
 
 
 logger = logging.getLogger(__file__)
@@ -100,8 +151,15 @@ class GlobalRequestLoadBalancer:
 
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
+        self._peak_inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
+
+    def _record_peak(self, server_id: str) -> None:
+        self._peak_inflight_requests[server_id] = max(
+            self._peak_inflight_requests[server_id],
+            self._inflight_requests[server_id],
+        )
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -115,6 +173,7 @@ class GlobalRequestLoadBalancer:
             # Check if server is still in the active pool
             if server_id in self._inflight_requests:
                 self._inflight_requests[server_id] += 1
+                self._record_peak(server_id)
                 return server_id, self._servers[server_id]
             # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
@@ -134,6 +193,7 @@ class GlobalRequestLoadBalancer:
             server_id = candidates[0]
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
+        self._record_peak(server_id)
         return server_id, self._servers[server_id]
 
     def release_server(self, server_id: str) -> None:
@@ -155,6 +215,7 @@ class GlobalRequestLoadBalancer:
         """
         for sid, handle in servers.items():
             self._inflight_requests[sid] = 0
+            self._peak_inflight_requests[sid] = 0
             self._servers[sid] = handle
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
@@ -168,6 +229,7 @@ class GlobalRequestLoadBalancer:
         """
         for sid in server_ids:
             self._inflight_requests.pop(sid, None)
+            self._peak_inflight_requests.pop(sid, None)
             self._servers.pop(sid, None)
         logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
 
@@ -187,6 +249,12 @@ class GlobalRequestLoadBalancer:
             "active_servers": len(self._inflight_requests),
             "registered_handles": list(self._servers.keys()),
         }
+
+    def reset_peak_status(self) -> None:
+        self._peak_inflight_requests = dict(self._inflight_requests)
+
+    def get_peak_status(self) -> dict[str, int]:
+        return dict(self._peak_inflight_requests)
 
 
 class LLMServerClient:
@@ -412,6 +480,7 @@ class LLMServerManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
+        self._runtime_metrics_sampler: RolloutRuntimeMetricsSampler | None = None
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -502,6 +571,24 @@ class LLMServerManager:
         if len(set(self.server_addresses)) != len(self.server_addresses):
             raise RuntimeError(f"rollout replicas returned duplicate endpoints: {self.server_addresses}")
         deployments = [metadata for replica in self.rollout_replicas for metadata in replica.runtime_metadata]
+        trainer_config = self.config.get("trainer", {})
+        trainer_v1_config = trainer_config.get("v1", {})
+        algorithm_config = self.config.get("algorithm", {})
+        strict_maxrl = (
+            str(trainer_v1_config.get("trainer_mode", "")).lower() == "sync"
+            and str(algorithm_config.get("adv_estimator", "")).lower() == "maxrl"
+        )
+        expected_capacity = {
+            "max_num_seqs": int(self.rollout_config.max_num_seqs),
+            "max_num_batched_tokens": int(self.rollout_config.max_num_batched_tokens),
+        }
+        if strict_maxrl:
+            validate_strict_rollout_capacity(
+                deployments,
+                expected_replicas=num_replicas,
+                expected_max_num_seqs=expected_capacity["max_num_seqs"],
+                expected_max_num_batched_tokens=expected_capacity["max_num_batched_tokens"],
+            )
         gpu_bindings = [
             (deployment["node_id"], gpu) for deployment in deployments for gpu in deployment["cuda_visible_devices"]
         ]
@@ -524,6 +611,11 @@ class LLMServerManager:
                         "pipeline_parallel_size": self.rollout_config.pipeline_model_parallel_size,
                         "endpoints": self.server_addresses,
                         "deployments": deployments,
+                        "capacity_contract": {
+                            "strict_maxrl": strict_maxrl,
+                            "expected": expected_capacity,
+                            "verified": strict_maxrl,
+                        },
                     },
                     indent=2,
                 )
@@ -573,6 +665,37 @@ class LLMServerManager:
     def get_addresses(self) -> list[str]:
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""
         return self.server_addresses
+
+    def start_runtime_metrics(self) -> None:
+        if self._runtime_metrics_sampler is not None:
+            raise RuntimeError("rollout runtime metrics are already active")
+        ray.get(self.global_load_balancer.reset_peak_status.remote())
+        self._runtime_metrics_sampler = RolloutRuntimeMetricsSampler(self.server_addresses)
+        self._runtime_metrics_sampler.start()
+
+    def stop_runtime_metrics(self) -> dict[str, float]:
+        sampler = self._runtime_metrics_sampler
+        if sampler is None:
+            return {}
+        self._runtime_metrics_sampler = None
+        snapshot = sampler.stop()
+        lb_peaks = ray.get(self.global_load_balancer.get_peak_status.remote())
+
+        prefix = "training/rollout_runtime"
+        metrics: dict[str, float] = {
+            f"{prefix}/samples": float(snapshot["samples"]),
+            f"{prefix}/sampling_errors": float(snapshot["errors"]),
+        }
+        for replica_rank, address in enumerate(self.server_addresses):
+            replica = snapshot["replicas"][address]
+            metrics[f"{prefix}/replica_{replica_rank}_peak_active_sequences"] = float(replica["running_sequences"])
+            metrics[f"{prefix}/replica_{replica_rank}_peak_waiting_sequences"] = float(replica["waiting_sequences"])
+            metrics[f"{prefix}/replica_{replica_rank}_peak_lb_inflight"] = float(lb_peaks.get(address, 0))
+        for gpu_index, gpu in snapshot["gpus"].items():
+            metrics[f"{prefix}/gpu_{gpu_index}_peak_utilization_percent"] = float(gpu["utilization_percent"])
+            metrics[f"{prefix}/gpu_{gpu_index}_peak_memory_used_bytes"] = float(gpu["memory_used_bytes"])
+            metrics[f"{prefix}/gpu_{gpu_index}_memory_total_bytes"] = float(gpu["memory_total_bytes"])
+        return metrics
 
     def get_replicas(self) -> list[RolloutReplica]:
         """Get the LLM server replicas."""

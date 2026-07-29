@@ -85,7 +85,7 @@ state_chunk_tokens = 2048
 replicas = 8
 tensor_parallel_size_per_replica = 1
 pipeline_parallel_size_per_replica = 1
-max_concurrent_sequences_per_replica = 64
+max_concurrent_sequences_per_replica = 960
 generation_token_budget_per_replica = 8192
 weight_update_bucket_mib = 64
 
@@ -193,14 +193,24 @@ def test_user_override_accepts_documented_operational_fields() -> None:
         extra_overrides=[
             "trainer.resume_mode=auto",
             "trainer.save_freq=10",
-            "actor_rollout_ref.rollout.max_num_seqs=128",
         ],
     )
 
     values = resolved(overrides)
     assert values["trainer.resume_mode"] == "auto"
     assert values["trainer.save_freq"] == "10"
-    assert values["actor_rollout_ref.rollout.max_num_seqs"] == "128"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "actor_rollout_ref.rollout.max_num_seqs=64",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=4096",
+    ],
+)
+def test_user_override_cannot_replace_rollout_capacity_contract(override: str) -> None:
+    with pytest.raises(MaxRLConfigError, match="MaxRL override"):
+        build_overrides(config(), env=ENV, extra_overrides=[override])
 
 
 def test_compiler_output_composes_with_real_hydra_schema() -> None:
@@ -213,6 +223,9 @@ def test_compiler_output_composes_with_real_hydra_schema() -> None:
     assert composed.data.train_files == ["/datasets/DAPO/dapo-math-17k-processed.parquet"]
     assert composed.data.train_prompt_key == "source_prompt"
     assert composed.actor_rollout_ref.rollout.n == 16
+    assert composed.actor_rollout_ref.rollout.max_num_seqs == 960
+    assert composed.actor_rollout_ref.rollout.max_num_batched_tokens == 8192
+    assert composed.actor_rollout_ref.rollout.disable_log_stats is False
     assert composed.actor_rollout_ref.rollout.max_model_len == 10240
     assert composed.actor_rollout_ref.rollout.response_length == 10240
     assert composed.data.val_files is None

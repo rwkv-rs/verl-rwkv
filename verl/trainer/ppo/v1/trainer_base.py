@@ -86,6 +86,7 @@ from verl.trainer.ppo.v1.effective_groups import (
     binary_success_from_rewards,
     classify_complete_groups,
     effective_training_should_stop,
+    strict_rollout_group_capacity,
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
@@ -150,7 +151,7 @@ class PPOTrainer(ABC):
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
-        self._effective_group_acceptance_rate = 0.5
+        self._effective_group_acceptance_rate = 0.20
         self._effective_sampling_totals: dict[str, float] = defaultdict(float)
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
@@ -535,16 +536,31 @@ class PPOTrainer(ABC):
         with marked_timer("feed", timing_raw):
             if effective_group_sampling:
                 train_batch_size = self.config.data.train_batch_size
-                gen_batch_size = self.config.data.get("gen_batch_size", None) or train_batch_size
+                rollout_config = self.config.actor_rollout_ref.rollout
+                runtime_group_capacity = strict_rollout_group_capacity(
+                    replica_count=len(self.llm_server_manager.server_addresses),
+                    max_num_seqs_per_replica=int(rollout_config.max_num_seqs),
+                    max_num_batched_tokens_per_replica=int(rollout_config.max_num_batched_tokens),
+                    responses_per_prompt=int(rollout_config.n),
+                )
                 self._effective_group_planner = CandidateWavePlanner(
                     target_groups=train_batch_size,
-                    group_quantum=gen_batch_size,
+                    # TransferQueue accepts an exact prompt count, so strict
+                    # effective-group waves do not need the ordinary training
+                    # batch quantum. A one-group quantum avoids surplus while
+                    # preserving complete n-response groups.
+                    group_quantum=1,
                     max_candidate_groups=train_batch_size * 32,
-                    max_wave_groups=train_batch_size * 8,
+                    max_wave_groups=min(train_batch_size * 32, runtime_group_capacity),
                     acceptance_rate=self._effective_group_acceptance_rate,
                 )
                 initial_wave = self._effective_group_planner.plan(accepted_groups=0)
-                self._add_prompts_to_generate(initial_wave)
+                self.llm_server_manager.start_runtime_metrics()
+                try:
+                    self._add_prompts_to_generate(initial_wave)
+                except BaseException:
+                    self.llm_server_manager.stop_runtime_metrics()
+                    raise
             else:
                 self._add_batch_to_generate()
 
@@ -571,10 +587,13 @@ class PPOTrainer(ABC):
             self.on_sample_begin()
             reward_already_computed = self._effective_group_sampling_enabled()
             if reward_already_computed:
-                batch, off_policy_metrics = self._sample_effective_maxrl_batch(
-                    sample_batch_size,
-                    metrics,
-                )
+                try:
+                    batch, off_policy_metrics = self._sample_effective_maxrl_batch(
+                        sample_batch_size,
+                        metrics,
+                    )
+                finally:
+                    metrics.update(self.llm_server_manager.stop_runtime_metrics())
             else:
                 batch, off_policy_metrics = self.replay_buffer.sample(
                     global_steps=self.global_steps,
@@ -751,6 +770,11 @@ class PPOTrainer(ABC):
             "all_correct_groups": all_correct_groups,
             "surplus_groups": surplus_groups,
             "refill_waves": round_state.refill_waves,
+            "planned_initial_wave_groups": round_state.wave_groups[0],
+            "initial_wave_groups": round_state.completed_wave_groups[0],
+            "refill_candidate_groups": sum(round_state.completed_wave_groups[1:]),
+            "max_wave_groups": max(round_state.completed_wave_groups),
+            "runtime_wave_capacity_groups": planner.max_wave_groups,
             "generated_trajectories": round_state.candidate_groups * responses_per_prompt,
         }
         for key, value in round_metrics.items():

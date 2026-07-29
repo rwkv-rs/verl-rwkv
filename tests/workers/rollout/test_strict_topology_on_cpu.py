@@ -17,7 +17,7 @@ import asyncio
 import pytest
 from fastapi import FastAPI
 
-from verl.workers.rollout.llm_server import resolve_rollout_topology
+from verl.workers.rollout.llm_server import resolve_rollout_topology, validate_strict_rollout_capacity
 from verl.workers.rollout.utils import run_uvicorn
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
@@ -44,6 +44,53 @@ def test_topology_rejects_unused_gpu_remainder():
 def test_duplicate_endpoint_gate_is_represented_by_unique_addresses():
     endpoints = [f"127.0.0.1:{port}" for port in range(30000, 30008)]
     assert len(set(endpoints)) == 8
+
+
+def _runtime_deployments(max_num_seqs: int = 960) -> list[dict]:
+    return [
+        {
+            "replica_rank": replica_rank,
+            "node_rank": 0,
+            "capacity": {
+                "capacity_source": "vllm.scheduler_config",
+                "max_num_seqs": max_num_seqs,
+                "max_num_batched_tokens": 8192,
+            },
+        }
+        for replica_rank in range(8)
+    ]
+
+
+def test_strict_capacity_gate_accepts_eight_verified_960_sequence_replicas():
+    validate_strict_rollout_capacity(
+        _runtime_deployments(),
+        expected_replicas=8,
+        expected_max_num_seqs=960,
+        expected_max_num_batched_tokens=8192,
+    )
+
+
+def test_strict_capacity_gate_rejects_stale_64_sequence_runtime():
+    with pytest.raises(RuntimeError, match="runtime capacity"):
+        validate_strict_rollout_capacity(
+            _runtime_deployments(max_num_seqs=64),
+            expected_replicas=8,
+            expected_max_num_seqs=960,
+            expected_max_num_batched_tokens=8192,
+        )
+
+
+def test_strict_capacity_gate_rejects_unverified_config_input_metadata():
+    deployments = _runtime_deployments()
+    deployments[0]["capacity"]["capacity_source"] = "rollout_config"
+
+    with pytest.raises(RuntimeError, match="runtime capacity"):
+        validate_strict_rollout_capacity(
+            deployments,
+            expected_replicas=8,
+            expected_max_num_seqs=960,
+            expected_max_num_batched_tokens=8192,
+        )
 
 
 @pytest.mark.asyncio
