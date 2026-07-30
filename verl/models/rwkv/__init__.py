@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .config import RWKVNativeModelConfig
-from .native_imports import import_rwkv_lm
+from .native_imports import import_rwkv_lm_modules
 from .paths import (
     RWKVLMPaths,
     resolve_rwkv_lm_paths,
@@ -25,7 +25,7 @@ __all__ = [
     "RWKVLMPaths",
     "RWKVNativeModelConfig",
     "build_rwkv_tokenizer",
-    "import_rwkv_lm",
+    "import_rwkv_lm_modules",
     "map_verl_to_rwkv_lm",
     "resolve_rwkv_lm_paths",
 ]

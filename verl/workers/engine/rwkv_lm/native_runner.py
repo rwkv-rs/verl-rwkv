@@ -34,7 +34,7 @@ from .args import build_rwkv_lm_args
 from .checkpoint import load_rwkv_lm_checkpoint
 from .env import build_rwkv_lm_env, rwkv_lm_env
 
-NativeImporter = Callable[..., ModuleType]
+NativeImporter = Callable[..., tuple[ModuleType, ModuleType]]
 CheckpointLoader = Callable[..., dict[str, Any]]
 
 
@@ -64,15 +64,17 @@ def _validate_rwkv_lm_runtime() -> None:
 
 
 def _default_import_rwkv_lm(
-    module_name: str,
     *,
     rwkv_lm_path: str | None = None,
     native_env: Mapping[str, str] | None = None,
-) -> ModuleType:
+) -> tuple[ModuleType, ModuleType]:
     _validate_rwkv_lm_runtime()
-    from verl.models.rwkv.native_imports import import_rwkv_lm
+    from verl.models.rwkv.native_imports import import_rwkv_lm_modules
 
-    return import_rwkv_lm(module_name, rwkv_lm_path=rwkv_lm_path, native_env=native_env)
+    return import_rwkv_lm_modules(
+        rwkv_lm_path=rwkv_lm_path,
+        native_env=native_env,
+    )
 
 
 class NativeRWKVLMRunner:
@@ -118,8 +120,10 @@ class NativeRWKVLMRunner:
         """Import upstream ``src.model`` and ``src.trainer`` under native env."""
 
         rwkv_lm_path = self._rwkv_lm_path()
-        self.model_module = self.importer("src.model", rwkv_lm_path=rwkv_lm_path, native_env=self.native_env)
-        self.trainer_module = self.importer("src.trainer", rwkv_lm_path=rwkv_lm_path, native_env=self.native_env)
+        self.model_module, self.trainer_module = self.importer(
+            rwkv_lm_path=rwkv_lm_path,
+            native_env=self.native_env,
+        )
         return self.model_module, self.trainer_module
 
     def build_model(self) -> Any:

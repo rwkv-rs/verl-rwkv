@@ -54,21 +54,19 @@ def test_native_runner_imports_native_modules_with_native_env_and_path():
     runner_module = _load_runner_module()
     calls = []
 
-    def importer(module_name, *, rwkv_lm_path=None, native_env=None):
-        calls.append((module_name, rwkv_lm_path, native_env))
-        if module_name == "src.model":
-            return ModuleType("src.model")
-        return ModuleType("src.trainer")
+    def importer(*, rwkv_lm_path=None, native_env=None):
+        calls.append((rwkv_lm_path, native_env))
+        return ModuleType("src.model"), ModuleType("src.trainer")
 
     engine_config = SimpleNamespace(rwkv_lm_path="/src/rwkv-lm", precision="bf16", native_env={"RWKV_KERNEL": ""})
     runner = runner_module.NativeRWKVLMRunner(engine_config=engine_config, importer=importer)
 
     runner.import_native_modules()
 
-    assert [call[0] for call in calls] == ["src.model", "src.trainer"]
-    assert calls[0][1] == "/src/rwkv-lm"
-    assert calls[0][2]["RWKV_FLOAT_MODE"] == "bf16"
-    assert calls[0][2]["RWKV_HEAD_SIZE"] == "64"
+    assert len(calls) == 1
+    assert calls[0][0] == "/src/rwkv-lm"
+    assert calls[0][1]["RWKV_FLOAT_MODE"] == "bf16"
+    assert calls[0][1]["RWKV_HEAD_SIZE"] == "64"
 
 
 def test_native_runner_builds_upstream_model_and_loads_native_checkpoint():
@@ -78,8 +76,8 @@ def test_native_runner_builds_upstream_model_and_loads_native_checkpoint():
     trainer_module = ModuleType("src.trainer")
     trainer_module.train_callback = FakeCallback
 
-    def importer(module_name, **kwargs):
-        return model_module if module_name == "src.model" else trainer_module
+    def importer(**kwargs):
+        return model_module, trainer_module
 
     runner = runner_module.NativeRWKVLMRunner(
         model_config=SimpleNamespace(path="/models/rwkv.pth"),
@@ -114,8 +112,8 @@ def test_native_runner_constructs_non_offloaded_model_directly_on_cuda(monkeypat
         def __exit__(self, exc_type, exc, traceback):
             return False
 
-    def importer(module_name, **kwargs):
-        return model_module if module_name == "src.model" else trainer_module
+    def importer(**kwargs):
+        return model_module, trainer_module
 
     monkeypatch.setattr(runner_module, "is_device_available", lambda: True)
     monkeypatch.setattr(runner_module, "get_device_name", lambda: "cuda")
@@ -140,7 +138,7 @@ def test_default_import_rejects_wrong_pytorch_lightning_version(monkeypatch):
     )
 
     with pytest.raises(RuntimeError) as raised:
-        runner_module._default_import_rwkv_lm("src.model", rwkv_lm_path="/src/rwkv-lm")
+        runner_module._default_import_rwkv_lm(rwkv_lm_path="/src/rwkv-lm")
 
     assert str(raised.value) == (
         "native rwkv-lm requires pytorch-lightning==1.9.5; found 2.6.4. "
