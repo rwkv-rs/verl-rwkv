@@ -21,6 +21,7 @@ from uuid import uuid4
 
 import torch
 from PIL import Image
+
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopOutput,

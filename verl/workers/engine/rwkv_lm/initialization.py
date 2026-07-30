@@ -17,14 +17,9 @@ def init_delay_seconds(rank: int, value: str | None) -> int:
     try:
         stagger = int(value)
     except ValueError as exc:
-        raise RuntimeError(
-            "HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be an integer, "
-            f"got {value!r}"
-        ) from exc
+        raise RuntimeError(f"HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be an integer, got {value!r}") from exc
     if stagger < 0 or stagger > 300:
-        raise RuntimeError(
-            "HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be between 0 and 300"
-        )
+        raise RuntimeError("HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be between 0 and 300")
     return rank * stagger
 
 
@@ -35,19 +30,11 @@ def acquire_init_slot(value: str | None, run_log_dir: str | None) -> IO[str] | N
     try:
         concurrency = int(value)
     except ValueError as exc:
-        raise RuntimeError(
-            "HELICOPTER_RWKV_INIT_CONCURRENCY must be an integer, "
-            f"got {value!r}"
-        ) from exc
+        raise RuntimeError(f"HELICOPTER_RWKV_INIT_CONCURRENCY must be an integer, got {value!r}") from exc
     if concurrency < 1 or concurrency > 8:
-        raise RuntimeError(
-            "HELICOPTER_RWKV_INIT_CONCURRENCY must be between 1 and 8"
-        )
+        raise RuntimeError("HELICOPTER_RWKV_INIT_CONCURRENCY must be between 1 and 8")
     if not run_log_dir:
-        raise RuntimeError(
-            "REMOTE_RUN_LOG_DIR is required when "
-            "HELICOPTER_RWKV_INIT_CONCURRENCY is set"
-        )
+        raise RuntimeError("REMOTE_RUN_LOG_DIR is required when HELICOPTER_RWKV_INIT_CONCURRENCY is set")
 
     lock_dir = Path(run_log_dir) / "rwkv-init-slots"
     lock_dir.mkdir(parents=True, exist_ok=True)
