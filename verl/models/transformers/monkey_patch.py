@@ -327,24 +327,30 @@ def apply_monkey_patch(
     """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
     module = sys.modules[model.__module__]
 
-    try:
-        num_attention_heads, num_key_value_heads = model.config.num_attention_heads, model.config.num_key_value_heads
-    except AttributeError:
-        # Some multimodal configs nest text_config differently; fall back to get_text_config().
-        text_config = getattr(model.config, "text_config", None) or model.config.get_text_config()
-        num_attention_heads, num_key_value_heads = (
-            text_config.num_attention_heads,
-            text_config.num_key_value_heads,
-        )
+    if use_remove_padding or ulysses_sp_size > 1:
+        try:
+            num_attention_heads, num_key_value_heads = (
+                model.config.num_attention_heads,
+                model.config.num_key_value_heads,
+            )
+        except AttributeError:
+            # Some multimodal configs nest text_config differently; fall back
+            # to get_text_config().
+            text_config = getattr(model.config, "text_config", None) or model.config.get_text_config()
+            num_attention_heads, num_key_value_heads = (
+                text_config.num_attention_heads,
+                text_config.num_key_value_heads,
+            )
 
-    assert num_attention_heads % ulysses_sp_size == 0, (
-        f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
-    )
-    assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (
-        f"num_key_value_heads {num_key_value_heads} must be divisible by ulysses_sp_size "
-        f"{ulysses_sp_size}or vise versa. Upon ulysses_sp_size % num_key_value_heads == 0,"
-        f"kv heads are repeated to ensure correctness."
-    )
+        assert num_attention_heads % ulysses_sp_size == 0, (
+            f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
+        )
+        assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (
+            f"num_key_value_heads {num_key_value_heads} must be divisible by "
+            f"ulysses_sp_size {ulysses_sp_size}or vise versa. Upon "
+            "ulysses_sp_size % num_key_value_heads == 0,kv heads are repeated "
+            "to ensure correctness."
+        )
 
     if is_trl_available():
         try:
