@@ -138,21 +138,21 @@ def test_candidate_wave_planner_cold_start_targets_one_wave_fill_probability():
 def test_strict_rollout_group_capacity_uses_sequence_and_decode_limits():
     assert (
         strict_rollout_group_capacity(
-            replica_count=8,
-            max_num_seqs_per_replica=960,
-            max_num_batched_tokens_per_replica=8192,
-            responses_per_prompt=16,
+            replica_count=3,
+            max_num_seqs_per_replica=24,
+            max_num_batched_tokens_per_replica=64,
+            responses_per_prompt=8,
         )
-        == 480
+        == 9
     )
     assert (
         strict_rollout_group_capacity(
-            replica_count=8,
-            max_num_seqs_per_replica=960,
-            max_num_batched_tokens_per_replica=512,
-            responses_per_prompt=16,
+            replica_count=3,
+            max_num_seqs_per_replica=24,
+            max_num_batched_tokens_per_replica=16,
+            responses_per_prompt=8,
         )
-        == 256
+        == 6
     )
 
 
