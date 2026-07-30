@@ -378,8 +378,8 @@ def rearrange_micro_batches(
         seq_len_effective: torch.Tensor = input_ids.offsets().diff()
         max_seq_len = max(seq_len_effective)
     else:
-        max_seq_len = batch["attention_mask"].shape[-1]
         seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+        max_seq_len = max(seq_len_effective)
 
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
