@@ -10,9 +10,6 @@ tokenizer_path: null
 # Native rwkv-lm repository path
 rwkv_lm_path: ???
 
-# RWKV architecture version
-rwkv_version: v7
-
 # Context length
 ctx_len: null
 

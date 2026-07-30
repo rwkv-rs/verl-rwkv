@@ -618,24 +618,17 @@ class RWKVLMEngineConfig(EngineConfig):
 
     strategy: str = "rwkv_lm"
     rwkv_lm_path: Optional[str] = None
-    train_entrypoint: str = "train.py"
-    model_entrypoint: str = "src/model.py"
-    rwkv_version: str = "v7"
     precision: str = "bf16"
     ctx_len: Optional[int] = None
     head_size: Optional[int] = None
     grad_cp: Optional[int] = None
     infctx: bool = False
     chunk_ctx: Optional[int] = None
-    compile_cuda: bool = True
     native_env: dict[str, str] = field(default_factory=dict)
-    checkpoint_format: str = "pth"
-    export_weight_format: str = "state_dict"
 
     def __post_init__(self):
         assert self.strategy == "rwkv_lm", f"strategy must be 'rwkv_lm', got {self.strategy}"
         assert self.precision in ["bf16", "fp16", "fp32"], f"precision {self.precision} not supported"
-        assert self.checkpoint_format in ["pth"], f"checkpoint_format {self.checkpoint_format} not supported"
         if self.infctx:
             assert self.chunk_ctx is not None and self.chunk_ctx > 0, "infctx requires chunk_ctx > 0"
             if self.ctx_len is not None:
