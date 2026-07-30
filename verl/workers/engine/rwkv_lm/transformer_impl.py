@@ -36,6 +36,7 @@ from verl.workers.engine.utils import prepare_micro_batches
 
 from .batch_bridge import build_verl_loss_model_output, extract_rwkv_lm_forward_batch
 from .checkpoint import load_rwkv_lm_checkpoint
+from .initialization import coordinated_initialization
 from .native_runner import NativeRWKVLMRunner
 from .weight_bridge import iter_rwkv_lm_state_dict_weights
 
@@ -87,12 +88,14 @@ class RWKVLMEngine(BaseEngine):
         return bool(getattr(self.engine_config, "optimizer_offload", False))
 
     def initialize(self):
-        self.runner = self.runner_cls(
-            model_config=self.model_config,
-            engine_config=self.engine_config,
-            optimizer_config=self.optimizer_config,
-        )
-        self.model = self.runner.build_model()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        with coordinated_initialization(rank):
+            self.runner = self.runner_cls(
+                model_config=self.model_config,
+                engine_config=self.engine_config,
+                optimizer_config=self.optimizer_config,
+            )
+            self.model = self.runner.build_model()
         self.to(
             device="cpu" if self.is_param_offload_enabled else get_device_name(),
             model=True,

@@ -11,17 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import fcntl
 import functools
 import logging
 import os
-import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
 from itertools import chain
-from pathlib import Path
-from typing import IO, Optional
+from typing import Optional
 
 import psutil
 import torch
@@ -59,62 +56,6 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def strict_rwkv_init_delay_seconds(rank: int, value: str | None) -> int:
-    if value is None or value == "":
-        return 0
-    try:
-        stagger = int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be an integer, got {value!r}") from exc
-    if stagger < 0 or stagger > 300:
-        raise RuntimeError("HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be between 0 and 300")
-    return rank * stagger
-
-
-def acquire_strict_rwkv_init_slot(value: str | None, run_log_dir: str | None) -> IO[str] | None:
-    """Bound concurrent CPU checkpoint/model materialization across colocated ranks."""
-
-    if value is None or value == "":
-        return None
-    try:
-        concurrency = int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"HELICOPTER_RWKV_INIT_CONCURRENCY must be an integer, got {value!r}") from exc
-    if concurrency < 1 or concurrency > 8:
-        raise RuntimeError("HELICOPTER_RWKV_INIT_CONCURRENCY must be between 1 and 8")
-    if not run_log_dir:
-        raise RuntimeError("REMOTE_RUN_LOG_DIR is required when HELICOPTER_RWKV_INIT_CONCURRENCY is set")
-
-    lock_dir = Path(run_log_dir) / "rwkv-init-slots"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    while True:
-        for slot in range(concurrency):
-            handle = (lock_dir / f"slot-{slot}.lock").open("a+", encoding="utf-8")
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                handle.close()
-                continue
-            return handle
-        time.sleep(0.25)
-
-
-def release_strict_rwkv_init_slot(handle: IO[str] | None) -> None:
-    if handle is None:
-        return
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    handle.close()
-
-
-@contextmanager
-def strict_rwkv_init_slot(value: str | None, run_log_dir: str | None):
-    handle = acquire_strict_rwkv_init_slot(value, run_log_dir)
-    try:
-        yield
-    finally:
-        release_strict_rwkv_init_slot(handle)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -587,13 +528,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        delay = strict_rwkv_init_delay_seconds(
-            self.rank,
-            os.getenv("HELICOPTER_RWKV_INIT_STAGGER_SECONDS"),
-        )
-        if delay:
-            logger.info("staggering strict RWKV model initialization by %s seconds on rank %s", delay, self.rank)
-            time.sleep(delay)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -631,11 +565,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
             self.ref = self.ref_worker_cls(config=ref_training_config)
-            with strict_rwkv_init_slot(
-                os.getenv("HELICOPTER_RWKV_INIT_CONCURRENCY"),
-                os.getenv("REMOTE_RUN_LOG_DIR"),
-            ):
-                self.ref.reset()
+            self.ref.reset()
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model
@@ -683,11 +613,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
-            with strict_rwkv_init_slot(
-                os.getenv("HELICOPTER_RWKV_INIT_CONCURRENCY"),
-                os.getenv("REMOTE_RUN_LOG_DIR"),
-            ):
-                self.actor.reset()
+            self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
