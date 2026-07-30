@@ -40,7 +40,6 @@ class RWKVNativeModelConfig(BaseConfig):
     processor: Any = None
     custom_chat_template: Optional[str] = None
     rwkv_lm_path: Optional[str] = None
-    rwkv_version: str = "v7"
     ctx_len: Optional[int] = None
     n_layer: Optional[int] = None
     n_embd: Optional[int] = None
@@ -54,7 +53,6 @@ class RWKVNativeModelConfig(BaseConfig):
     weight_mapping: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
-        assert self.rwkv_version in ["v7"], f"rwkv_version {self.rwkv_version} not supported"
         assert self.precision in ["bf16", "fp16", "fp32"], f"precision {self.precision} not supported"
         if self.load_tokenizer and self.tokenizer is None:
             self.tokenizer = build_rwkv_tokenizer(
