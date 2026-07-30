@@ -112,13 +112,14 @@ def patch_vllm_moe_model_weight_loader(model):
 
     DEFAULT_MLP_ATTR = "mlp"
 
+    supported_model_types = tuple(SUPPORTED_MOE_MODELS)
+
     # Get inner model (either model.model or model.language_model)
     inner_model = getattr(model, "model", None) or getattr(model, "language_model", None)
-    if inner_model is None:
-        raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
-
-    if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS)):
+    if not isinstance(model, supported_model_types) and not isinstance(inner_model, supported_model_types):
         return
+    if inner_model is None:
+        raise ValueError("A supported MoE model must expose 'model' or 'language_model'.")
 
     # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
     # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
