@@ -128,8 +128,6 @@ def get_ppo_ray_runtime_env(config=None):
         "HELICOPTER_RUN_ID",
         "HELICOPTER_CHECKPOINT_SHA256",
         "VLLM_RWKV7_WKV_MODE",
-        "HELICOPTER_RWKV_INIT_STAGGER_SECONDS",
-        "HELICOPTER_RWKV_INIT_CONCURRENCY",
     ):
         value = os.environ.get(key)
         if value is not None:
