@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from importlib import import_module
 
 from .npu_vllm_patch import apply_npu_vllm_patches
-
-# The contents of vllm/patch.py should not be imported here, because the contents of
-# patch.py should be imported after the vllm LLM instance is created. Therefore,
-# wait until you actually start using it before importing the contents of
-# patch.py separately.
+from .utils import TensorLoRARequest, VLLMHijack, is_version_ge
 
 # Apply NPU-specific vLLM patches when this module is imported.
 # Remove this when https://github.com/vllm-project/vllm-ascend/issues/5915 is fixed.
@@ -30,13 +25,3 @@ __all__ = [
     "VLLMHijack",
     "is_version_ge",
 ]
-
-
-def __getattr__(name: str):
-    if name not in __all__:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-    utils = import_module(f"{__name__}.utils")
-    value = getattr(utils, name)
-    globals()[name] = value
-    return value

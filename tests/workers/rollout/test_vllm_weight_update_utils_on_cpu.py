@@ -72,9 +72,6 @@ def _load_vllm_rollout_utils():
     fake_vllm_utils.TensorLoRARequest = _FakeTensorLoRARequest
     fake_vllm_utils.VLLMHijack = _FakeVLLMHijack
 
-    fake_vllm_patch = types.ModuleType("verl.utils.vllm.patch")
-    fake_vllm_patch.patch_vllm_moe_model_weight_loader = lambda model: None
-
     fake_vllm_fp8 = types.ModuleType("verl.utils.vllm.vllm_fp8_utils")
     fake_vllm_fp8.apply_vllm_fp8_patches = lambda: None
     fake_vllm_fp8.is_fp8_model = lambda config: False
@@ -88,7 +85,6 @@ def _load_vllm_rollout_utils():
         "vllm.outputs": fake_outputs,
         "verl.third_party.vllm": fake_vllm_third_party,
         "verl.utils.vllm": fake_vllm_utils,
-        "verl.utils.vllm.patch": fake_vllm_patch,
         "verl.utils.vllm.vllm_fp8_utils": fake_vllm_fp8,
         "verl.plugin.platform": fake_platform,
         "verl.workers.rollout.vllm_rollout.weight_update_utils": _weight_update_utils,

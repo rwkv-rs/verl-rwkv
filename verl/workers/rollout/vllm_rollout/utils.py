@@ -27,7 +27,6 @@ from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
-from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
@@ -226,8 +225,6 @@ class vLLMColocateWorkerExtension:
         for model in self._iter_all_models():
             # patch compute_logits to avoid sampling OOV and other illegal tokens
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
-            # patch weight loader to support MoE model
-            patch_vllm_moe_model_weight_loader(model)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
@@ -264,11 +261,6 @@ class vLLMColocateWorkerExtension:
             quant_reload_states = [
                 (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
             ]
-        else:
-            # TODO(wuxibin): not need anymore for newer vllm version.
-            for model in self._iter_all_models():
-                patch_vllm_moe_model_weight_loader(model)
-
         # =========================== step 2: receive weights and update ===========================
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
