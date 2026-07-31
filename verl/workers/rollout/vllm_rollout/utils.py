@@ -23,16 +23,14 @@ from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
 import torch
+from packaging import version
 from vllm.outputs import RequestOutput
 
 from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
+from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
-from verl.workers.rollout.vllm_rollout.weight_update_utils import (
-    _LayerwiseReloadSession,
-    apply_buffer_updates,
-    split_buffer_updates,
-)
+from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -43,6 +41,30 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def build_vllm_prefix_cache_reset_kwargs(vllm_version: Any, *, reset_running_requests: bool = False) -> dict[str, bool]:
+    parsed_version = version.parse(str(vllm_version))
+    kwargs = {}
+    if parsed_version >= version.parse("0.13.0"):
+        kwargs["reset_connector"] = True
+    if reset_running_requests and parsed_version >= version.parse("0.12.0"):
+        kwargs["reset_running_requests"] = True
+    return kwargs
+
+
+async def reset_vllm_weight_update_caches(engine: Any, vllm_version: Any) -> None:
+    parsed_version = version.parse(str(vllm_version))
+    reset_successful = await engine.reset_prefix_cache(
+        **build_vllm_prefix_cache_reset_kwargs(parsed_version, reset_running_requests=True)
+    )
+    if reset_successful is False:
+        raise RuntimeError("Failed to reset vLLM prefix cache after weight update")
+
+    if parsed_version >= version.parse("0.9.0"):
+        await engine.reset_mm_cache()
+    if parsed_version >= version.parse("0.16.0"):
+        await engine.reset_encoder_cache()
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
@@ -229,6 +251,8 @@ class vLLMColocateWorkerExtension:
         for model in self._iter_all_models():
             # patch compute_logits to avoid sampling OOV and other illegal tokens
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
+            # patch weight loader to support MoE model
+            patch_vllm_moe_model_weight_loader(model)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
@@ -241,7 +265,6 @@ class vLLMColocateWorkerExtension:
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
-        fp8_model = is_fp8_model(self.model_runner.vllm_config)
 
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
@@ -260,24 +283,16 @@ class vLLMColocateWorkerExtension:
             # TODO: this is buggy if lora span multiple buckets.
             self.remove_lora(VLLM_LORA_INT_ID)
             logger.info("LoRA adapter sync: remove old lora and prepare new lora")
-        elif fp8_model:
+        elif is_fp8_model(self.model_runner.vllm_config):
             from verl.utils.vllm.vllm_fp8_utils import prepare_quanted_weights_for_loading
 
             quant_reload_states = [
                 (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
             ]
-        reload_session = None
-        if not (self._is_qat_model or self._is_modelopt_qat or (peft_config and base_sync_done) or fp8_model):
-            from vllm.model_executor.model_loader.reload import (
-                finalize_layerwise_reload,
-                initialize_layerwise_reload,
-            )
-
-            reload_session = _LayerwiseReloadSession(
-                self._iter_all_models_with_config(),
-                initialize=initialize_layerwise_reload,
-                finalize=finalize_layerwise_reload,
-            )
+        else:
+            # TODO(wuxibin): not need anymore for newer vllm version.
+            for model in self._iter_all_models():
+                patch_vllm_moe_model_weight_loader(model)
 
         # =========================== step 2: receive weights and update ===========================
         receiver = BucketedWeightReceiver(
@@ -285,21 +300,40 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
+        model = self.model_runner.model
+        use_standard_weight_load = (
+            not self._is_qat_model
+            and not self._is_modelopt_qat
+            and not (peft_config and base_sync_done)
+            and not is_fp8_model(self.model_runner.vllm_config)
+        )
+        transactional_weight_update = (
+            use_standard_weight_load
+            and callable(getattr(model, "start_weight_update", None))
+            and callable(getattr(model, "finish_weight_update", None))
+        )
+        if transactional_weight_update:
+            model.start_weight_update()
+
         try:
-            if reload_session is not None:
-                receiver.receive_weights(on_bucket_received=reload_session.load_bucket)
-                reload_session.finish()
-            else:
-                receiver.receive_weights(
-                    on_bucket_received=lambda weights: self._update_weights(
-                        weights,
-                        peft_config=peft_config,
-                        base_sync_done=base_sync_done,
-                    )
+            receiver.receive_weights(
+                on_bucket_received=lambda weights: self._update_weights(
+                    weights,
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
                 )
+            )
+            if transactional_weight_update:
+                model.finish_weight_update()
+                model_state = getattr(self.model_runner, "model_state", None)
+                reset_state = getattr(model_state, "reset_after_weight_update", None)
+                if callable(reset_state):
+                    reset_state()
         except Exception:
-            if reload_session is not None:
-                reload_session.abort()
+            if transactional_weight_update:
+                abort_weight_update = getattr(model, "abort_weight_update", None)
+                if callable(abort_weight_update):
+                    abort_weight_update()
             raise
 
         # =========================== step 3: process weights after loading ===========================
@@ -317,13 +351,17 @@ class vLLMColocateWorkerExtension:
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif peft_config and base_sync_done:
             logger.info("LoRA adapter sync, no post-process needed")
-        elif fp8_model:
+        elif is_fp8_model(self.model_runner.vllm_config):
             from verl.utils.vllm.vllm_fp8_utils import process_quanted_weights_after_loading
 
             for model, reload_state in quant_reload_states:
                 process_quanted_weights_after_loading(model, reload_state)
-        elif reload_session is not None:
-            logger.info("vLLM layerwise weight reload completed")
+        else:
+            # Some post-load transforms are non-idempotent; run once after all buckets.
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+            for model, model_config in self._iter_all_models_with_config():
+                process_weights_after_loading(model, model_config, self.device)
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.

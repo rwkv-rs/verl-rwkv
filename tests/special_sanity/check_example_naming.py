@@ -19,7 +19,7 @@ The current convention (see ``examples/README.md``) is::
     run_<model>_<train-backend>.sh
 
 Where ``<train-backend>`` is one of ``fsdp``, ``fsdp2``, ``megatron``,
-``megatron_lite``, ``mindspeed``, ``automodel`` or ``veomni``, and **must be
+``megatron_lite``, ``mindspeed``, ``automodel``, ``veomni`` or ``rwkv_lm``, and **must be
 the final suffix before** ``.sh`` — nothing follows it. The legacy
 convention used to embed the inference backend (``vllm``/``sglang``/``trtllm``),
 platform tokens (``_npu``/``_amd``), machine-type tokens (``_gb200``,
@@ -78,6 +78,7 @@ ALLOWED_BACKENDS = (
     "mindspeed",
     "automodel",
     "veomni",
+    "rwkv_lm",
 )
 
 # Directories whose scripts have their own conventions and are exempt from

@@ -65,6 +65,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.ngram_repetition import REPETITION_EXTRA_FIELD_KEYS
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip.skip_manager import SkipManager
@@ -257,6 +258,8 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if "binary_success" in data.batch:
+            adv_kwargs["binary_success"] = data.batch["binary_success"]
         # GDPO: pass raw data for per-dimension reward extraction
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
@@ -476,6 +479,45 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    @staticmethod
+    def _listify_dump_values(values):
+        if isinstance(values, np.ndarray):
+            return values.tolist()
+        if torch.is_tensor(values):
+            return values.detach().cpu().tolist()
+        if isinstance(values, list):
+            return values
+        return list(values)
+
+    @staticmethod
+    def _validation_sampling_params_for_dump(config):
+        val_kwargs = OmegaConf.select(config, "actor_rollout_ref.rollout.val_kwargs")
+        if val_kwargs is None:
+            return {}
+        val_kwargs = OmegaConf.to_container(val_kwargs, resolve=True)
+        if not isinstance(val_kwargs, dict):
+            return {}
+
+        dump_keys = (
+            "n",
+            "do_sample",
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "repetition_penalty",
+            "penalty_decay",
+            "logprobs",
+            "prompt_logprobs",
+            "repetition_detection",
+        )
+        sampling_params = {key: val_kwargs[key] for key in dump_keys if key in val_kwargs}
+        response_length = OmegaConf.select(config, "actor_rollout_ref.rollout.response_length")
+        if response_length is not None:
+            sampling_params.setdefault("max_tokens", response_length)
+        return sampling_params
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL asynchronously."""
         global_steps = self.global_steps
@@ -535,6 +577,10 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            for key in REPETITION_EXTRA_FIELD_KEYS:
+                if key in batch.non_tensor_batch:
+                    value = batch.non_tensor_batch[key]
+                    reward_extra_infos_to_dump.setdefault(key, value.tolist() if hasattr(value, "tolist") else value)
 
             self._dump_generations(
                 inputs=inputs,
@@ -596,6 +642,7 @@ class RayPPOTrainer:
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        dump_extra_infos_dict: dict[str, list] = defaultdict(list)
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -667,7 +714,20 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            batch_uids = test_batch.non_tensor_batch["uid"]
+            sample_uids.extend(batch_uids)
+            dump_extra_infos_dict["uid"].extend(self._listify_dump_values(batch_uids))
+            if "response_mask" in test_output_gen_batch.batch:
+                response_token_count = test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
+                dump_extra_infos_dict["response_token_count"].extend(int(count) for count in response_token_count)
+            for key in (
+                "stop_reason",
+                "finish_reason",
+                "backend_stop_reason",
+                *REPETITION_EXTRA_FIELD_KEYS,
+            ):
+                if key in test_batch.non_tensor_batch:
+                    dump_extra_infos_dict[key].extend(self._listify_dump_values(test_batch.non_tensor_batch[key]))
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = extract_reward(test_batch)
@@ -695,12 +755,18 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            dump_infos_dict = {key: list(values) for key, values in reward_extra_infos_dict.items()}
+            for key, values in dump_extra_infos_dict.items():
+                dump_infos_dict.setdefault(key, values)
+            sampling_params = self._validation_sampling_params_for_dump(self.config)
+            if sampling_params:
+                dump_infos_dict["sampling_params"] = [sampling_params] * len(sample_scores)
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_infos_dict=dump_infos_dict,
                 dump_path=val_data_dir,
             )
 
@@ -1116,6 +1182,15 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _shutdown_dataloader_workers(self) -> None:
+        for dataloader_name in ("train_dataloader", "val_dataloader"):
+            dataloader = getattr(self, dataloader_name, None)
+            iterator = getattr(dataloader, "_iterator", None)
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+        self.train_dataloader_it = None
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -1416,6 +1491,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dataloader_workers()
                 self._shutdown_dump_executor()
                 return
 
@@ -1772,6 +1848,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dataloader_workers()
                     self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
@@ -1784,4 +1861,5 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dataloader_workers()
         self._shutdown_dump_executor()

@@ -23,10 +23,16 @@ import torch
 from packaging import version
 
 try:
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
     from vllm.model_executor.layers.linear import LinearBase
 except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
+
+try:
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    # Newer vLLM releases expose ``FusedMoEFactory`` instead. The concrete
+    # ``MoERunner`` and ``RoutedExperts`` classes are resolved below.
+    FusedMoE = None
 
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 from verl.utils.vllm.vllm_dsv4_fp8_utils import (

@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import fcntl
 import functools
 import logging
 import os
-from contextlib import nullcontext
+import time
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import partial
 from itertools import chain
-from typing import Optional
+from pathlib import Path
+from typing import IO, Optional
 
 import psutil
 import torch
@@ -39,7 +42,7 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
+from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, marked_timer
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
@@ -58,6 +61,62 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def strict_rwkv_init_delay_seconds(rank: int, value: str | None) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        stagger = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be an integer, got {value!r}") from exc
+    if stagger < 0 or stagger > 300:
+        raise RuntimeError("HELICOPTER_RWKV_INIT_STAGGER_SECONDS must be between 0 and 300")
+    return rank * stagger
+
+
+def acquire_strict_rwkv_init_slot(value: str | None, run_log_dir: str | None) -> IO[str] | None:
+    """Bound concurrent CPU checkpoint/model materialization across colocated ranks."""
+
+    if value is None or value == "":
+        return None
+    try:
+        concurrency = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"HELICOPTER_RWKV_INIT_CONCURRENCY must be an integer, got {value!r}") from exc
+    if concurrency < 1 or concurrency > 8:
+        raise RuntimeError("HELICOPTER_RWKV_INIT_CONCURRENCY must be between 1 and 8")
+    if not run_log_dir:
+        raise RuntimeError("REMOTE_RUN_LOG_DIR is required when HELICOPTER_RWKV_INIT_CONCURRENCY is set")
+
+    lock_dir = Path(run_log_dir) / "rwkv-init-slots"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        for slot in range(concurrency):
+            handle = (lock_dir / f"slot-{slot}.lock").open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                continue
+            return handle
+        time.sleep(0.25)
+
+
+def release_strict_rwkv_init_slot(handle: IO[str] | None) -> None:
+    if handle is None:
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+@contextmanager
+def strict_rwkv_init_slot(value: str | None, run_log_dir: str | None):
+    handle = acquire_strict_rwkv_init_slot(value, run_log_dir)
+    try:
+        yield
+    finally:
+        release_strict_rwkv_init_slot(handle)
+
+
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
@@ -71,6 +130,26 @@ def _with_routing_replay_flag(enabled: bool):
         return wrapper
 
     return decorator
+
+
+def _normalize_gathered_metric_values(values):
+    if not isinstance(values, list) or not values:
+        return values
+    if isinstance(values[0], Metric):
+        return Metric.aggregate_dp(values)
+    if isinstance(values[0], list | tuple):
+        return list(chain.from_iterable(values))
+    return values
+
+
+def validate_strict_on_policy_optimizer_iterations(*, enabled: bool, epochs: int, iterations: int) -> None:
+    """Fail before actor work if a strict round would step the optimizer more than once."""
+
+    if enabled and (epochs != 1 or iterations != 1):
+        raise RuntimeError(
+            "strict on-policy actor update requires exactly one optimizer step per round: "
+            f"epochs={epochs}, iterations={iterations}"
+        )
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
@@ -232,6 +311,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
             if forward_only:
                 final_metrics["mfu"] /= 3.0
+        else:
+            final_metrics.setdefault("mfu", 0.0)
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics
@@ -254,6 +335,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
         num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
         epochs = tu.pop(data, key="epochs", default=1)
+        strict_on_policy = tu.pop(data, key="strict_on_policy", default=False)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
 
@@ -284,6 +366,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            validate_strict_on_policy_optimizer_iterations(
+                enabled=strict_on_policy,
+                epochs=epochs,
+                iterations=total_num_iterations,
+            )
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
@@ -320,12 +407,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            output[key] = _normalize_gathered_metric_values(val)
                     append_to_dict(metrics, output)
+
+                metrics["optimizer_steps"] = [total_num_iterations]
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
@@ -531,6 +616,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        delay = strict_rwkv_init_delay_seconds(
+            self.rank,
+            os.getenv("HELICOPTER_RWKV_INIT_STAGGER_SECONDS"),
+        )
+        if delay:
+            logger.info("staggering strict RWKV model initialization by %s seconds on rank %s", delay, self.rank)
+            time.sleep(delay)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -579,7 +671,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
             self.ref = self.ref_worker_cls(config=ref_training_config)
-            self.ref.reset()
+            with strict_rwkv_init_slot(
+                os.getenv("HELICOPTER_RWKV_INIT_CONCURRENCY"),
+                os.getenv("REMOTE_RUN_LOG_DIR"),
+            ):
+                self.ref.reset()
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model
@@ -636,7 +732,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
-            self.actor.reset()
+            with strict_rwkv_init_slot(
+                os.getenv("HELICOPTER_RWKV_INIT_CONCURRENCY"),
+                os.getenv("REMOTE_RUN_LOG_DIR"),
+            ):
+                self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
@@ -717,7 +817,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+    async def update_weights(
+        self,
+        global_steps: int = None,
+        mode: str = "auto",
+        policy_identity: dict | None = None,
+    ):
         """Update weights from trainer to rollout.
 
         1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
@@ -755,14 +860,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 return metrics or {}
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
-            return metrics or {}
+            acknowledgement = dict(policy_identity or {})
+            acknowledgement.update(metrics or {})
+            return acknowledgement
 
         set_expandable_segments(False)
         log_gpu_memory_usage("Before resume weights", logger=logger)
+        publication_timing = {}
 
         # 1. resume rollout memory (weights were released during sleep)
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
+            with marked_timer("rollout_weights_resume", publication_timing, color="orange"):
+                await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
@@ -776,17 +885,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             do_lora_base_sync = not self.base_sync_done
 
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
-        if do_lora_base_sync:
-            per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
-            )
-            await self.rollout.update_weights(
-                per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
-            )
+        with marked_timer("weight_transfer", publication_timing, color="red"):
+            if do_lora_base_sync:
+                per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
+                    layered_summon=self.layered_summon, base_sync_done=False
+                )
+                await self.rollout.update_weights(
+                    per_tensor_param_base,
+                    peft_config=peft_config,
+                    base_sync_done=False,
+                    global_steps=global_steps,
+                    policy_identity=policy_identity,
+                )
 
-        await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
-        )
+            await self.rollout.update_weights(
+                per_tensor_param,
+                peft_config=peft_config,
+                base_sync_done=True,
+                global_steps=global_steps,
+                policy_identity=policy_identity,
+            )
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
@@ -797,11 +915,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
+            with marked_timer("rollout_kv_wake", publication_timing, color="green"):
+                await self.rollout.resume(tags=["kv_cache"])
+        activate_weight_update = getattr(self.rollout, "activate_weight_update", None)
+        if activate_weight_update is not None:
+            await activate_weight_update()
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
         set_expandable_segments(True)
+        acknowledgement = dict(policy_identity or {})
+        acknowledgement["replica_id"] = self.rank
+        acknowledgement["publication_timing"] = publication_timing
+        return acknowledgement
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

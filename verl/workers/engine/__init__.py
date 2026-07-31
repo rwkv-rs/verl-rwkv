@@ -45,6 +45,14 @@ except ImportError:
     AutomodelEngine = None
     AutomodelEngineWithLMHead = None
 
+try:
+    from .rwkv_lm import RWKVLMEngine, RWKVLMEngineWithLMHead
+
+    __all__ += ["RWKVLMEngine", "RWKVLMEngineWithLMHead"]
+except ImportError:
+    RWKVLMEngine = None
+    RWKVLMEngineWithLMHead = None
+
 # Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
 try:
     from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead, MindSpeedMegatronEngineWithLMHead

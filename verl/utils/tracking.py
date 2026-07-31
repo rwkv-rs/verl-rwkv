@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from contextlib import contextmanager
 from enum import Enum
 from functools import partial
@@ -59,6 +60,7 @@ class Tracking:
     ]
 
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
+        self._finished = False
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -349,6 +351,12 @@ class RLInsightLogger:
         except Exception:
             logger.exception("[rl-insight] Failed to register metrics endpoint")
 
+    def __del__(self):
+        try:
+            self.finish()
+        except Exception:
+            logger.exception("Failed to finish tracking backends during object cleanup")
+
 
 class ClearMLLogger:
     def __init__(self, project_name: str, experiment_name: str, config):
@@ -429,9 +437,14 @@ class FileLogger:
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
         print(f"Creating file logger at {os.path.abspath(self.filepath)}")
         self.fp = open(self.filepath, "wb", buffering=0)
+        self.started_monotonic = time.monotonic()
 
     def log(self, data, step):
-        data = {"step": step, "data": data}
+        data = {
+            "step": step,
+            "elapsed_seconds": time.monotonic() - self.started_monotonic,
+            "data": data,
+        }
         self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
 
     def finish(self):

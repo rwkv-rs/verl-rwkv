@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from omegaconf import MISSING
@@ -27,6 +27,7 @@ __all__ = [
     "VeOmniOptimizerConfig",
     "TorchtitanOptimizerConfig",
     "AutomodelOptimizerConfig",
+    "RWKVLMOptimizerConfig",
 ]
 
 
@@ -292,6 +293,26 @@ class AutomodelOptimizerConfig(OptimizerConfig):
 
     def __post_init__(self):
         assert self.lr_scheduler_type in ["constant", "cosine", "linear", "inverse-square-root"]
+        return super().__post_init__()
+
+
+@dataclass
+class RWKVLMOptimizerConfig(OptimizerConfig):
+    """Optimizer configuration for native rwkv-lm training."""
+
+    optimizer: str = "adamw"
+    layerwise_lr: bool = False
+    lr_scheduler_type: str = "cosine"
+    beta1: Optional[float] = None
+    beta2: Optional[float] = None
+    adam_eps: float = 1e-8
+    native_optimizer_kwargs: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        assert self.optimizer in ["adam", "adamw"], f"optimizer {self.optimizer} not supported"
+        assert self.lr_scheduler_type in ["constant", "cosine"], (
+            f"lr_scheduler_type {self.lr_scheduler_type} not supported"
+        )
         return super().__post_init__()
 
 

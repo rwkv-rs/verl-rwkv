@@ -112,10 +112,26 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+    selected_actor_log_probs = torch.masked_select(actor_old_log_probs, response_mask_bool)
+    selected_rollout_log_probs = torch.masked_select(rollout_old_log_probs, response_mask_bool)
+    selected_actor_probs = torch.exp(selected_actor_log_probs)
+    selected_rollout_probs = torch.exp(selected_rollout_log_probs)
+    max_diff_index = int(torch.argmax(rollout_probs_diff).item())
+    actor_leads_mask = response_mask_bool[:, :-1] & response_mask_bool[:, 1:]
+    actor_leads_corr = pearson_correlation_coefficient(actor_probs[:, :-1], rollout_probs[:, 1:], actor_leads_mask)
+    rollout_leads_corr = pearson_correlation_coefficient(actor_probs[:, 1:], rollout_probs[:, :-1], actor_leads_mask)
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
+        "training/rollout_probs_diff_p95": torch.quantile(rollout_probs_diff.float(), 0.95).detach().item(),
+        "training/rollout_probs_diff_p99": torch.quantile(rollout_probs_diff.float(), 0.99).detach().item(),
+        "training/rollout_probs_diff_max_actor_logprob": selected_actor_log_probs[max_diff_index].detach().item(),
+        "training/rollout_probs_diff_max_rollout_logprob": selected_rollout_log_probs[max_diff_index].detach().item(),
+        "training/rollout_probs_diff_max_actor_prob": selected_actor_probs[max_diff_index].detach().item(),
+        "training/rollout_probs_diff_max_rollout_prob": selected_rollout_probs[max_diff_index].detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
+        "training/rollout_actor_probs_pearson_corr_actor_leads_one": actor_leads_corr,
+        "training/rollout_actor_probs_pearson_corr_rollout_leads_one": rollout_leads_corr,
     }

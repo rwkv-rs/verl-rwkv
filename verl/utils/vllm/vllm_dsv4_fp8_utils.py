@@ -16,8 +16,14 @@
 from types import MethodType
 
 import torch
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
+
+try:
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    # vLLM's modular MoE refactor replaced the FusedMoE module with the
+    # RoutedExperts weight holder returned by FusedMoEFactory.
+    from vllm.model_executor.layers.fused_moe import RoutedExperts as FusedMoE
 
 
 def is_deepseek_v4_model(model):

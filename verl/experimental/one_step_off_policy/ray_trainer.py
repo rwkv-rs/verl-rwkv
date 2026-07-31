@@ -137,6 +137,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.future_reward = None
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
+        self._init_dump_executor()
 
     def _create_actor_rollout_classes(self):
         for role in [Role.Actor]:
@@ -293,6 +294,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
 
         # add tqdm
@@ -318,7 +320,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         while batch_data_future is not None:
             batch_data_future = await self.fit_step(batch_data_future, continuous_iterator)
             if self.is_last_step:
+                self._shutdown_dump_executor()
                 return
+        self._shutdown_dump_executor()
 
     async def fit_step(self, batch_data_future, continuous_iterator):
         """

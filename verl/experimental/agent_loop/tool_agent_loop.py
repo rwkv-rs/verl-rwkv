@@ -21,6 +21,7 @@ from uuid import uuid4
 
 import torch
 from PIL import Image
+from vllm.tokenizers.rwkv_defaults import resolve_rwkv_prompt_template
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
@@ -67,6 +68,7 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        validate: bool = False,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -76,9 +78,11 @@ class AgentData:
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
+        self.validate = validate
 
         # State variables
         self.prompt_ids: list[int] = []
+        self.rwkv_prompt_template: str | None = None
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
@@ -123,6 +127,7 @@ class ToolAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        validate = bool(kwargs.pop("__validate__", False))
         messages = list(kwargs["raw_prompt"])
 
         # extract multimodal inputs from messages
@@ -145,6 +150,7 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            validate=validate,
         )
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
@@ -208,6 +214,13 @@ class ToolAgentLoop(AgentLoopBase):
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        configured_prompt_template = self.rollout_config.get("rwkv_prompt_template")
+        if configured_prompt_template is not None:
+            agent_data.rwkv_prompt_template = resolve_rwkv_prompt_template(
+                prompt_template=configured_prompt_template,
+                messages=agent_data.messages,
+                tools=schemas,
+            ).name
         if self.enable_continuous_token:
             prompt_ids = await self.ct_build_initial_tokens(agent_data.messages, tools=schemas)
         else:
@@ -218,6 +231,7 @@ class ToolAgentLoop(AgentLoopBase):
                 videos=agent_data.video_data,
                 audios=agent_data.audio_data,
                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
+                validate=agent_data.validate,
             )
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
@@ -230,6 +244,11 @@ class ToolAgentLoop(AgentLoopBase):
         if self.tool_parser.stop_token_ids:
             stop_token_ids = list(set((sampling_params.get("stop_token_ids") or []) + self.tool_parser.stop_token_ids))
             sampling_params = {**sampling_params, "stop_token_ids": stop_token_ids}
+        if agent_data.rwkv_prompt_template is not None:
+            sampling_params = {
+                **sampling_params,
+                "rwkv_prompt_template": agent_data.rwkv_prompt_template,
+            }
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(

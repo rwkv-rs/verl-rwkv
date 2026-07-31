@@ -33,21 +33,29 @@ def _constant_compute_score(data_source, solution_str, ground_truth, extra_info=
     return 0.5
 
 
+def _unexpected_compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    raise AssertionError("compute_score should not run for repetition-truncated responses")
+
+
 def _overlong_buffer_cfg(enable: bool, length: int = 128):
     return OmegaConf.create({"enable": enable, "len": length, "penalty_factor": 1.0, "log": False})
 
 
-def _make_data(batch_size: int = 2, seq_len: int = 4) -> DataProto:
+def _make_data(batch_size: int = 2, seq_len: int = 4, non_tensors: dict | None = None) -> DataProto:
+    base_non_tensors = {
+        "reward_model": np.array([{"ground_truth": "1"}] * batch_size, dtype=object),
+        "data_source": np.array(["unit_test"] * batch_size, dtype=object),
+    }
+    if non_tensors:
+        base_non_tensors.update(non_tensors)
+
     return DataProto.from_dict(
         tensors={
             "prompts": torch.ones(batch_size, seq_len, dtype=torch.long),
             "responses": torch.ones(batch_size, seq_len, dtype=torch.long),
             "attention_mask": torch.ones(batch_size, 2 * seq_len, dtype=torch.long),
         },
-        non_tensors={
-            "reward_model": np.array([{"ground_truth": "1"}] * batch_size, dtype=object),
-            "data_source": np.array(["unit_test"] * batch_size, dtype=object),
-        },
+        non_tensors=base_non_tensors,
     )
 
 
@@ -109,6 +117,39 @@ def test_call_with_overlong_buffer_enabled_applies_penalty():
     assert torch.all(reward_tensor[:, -1] == 0.5 - 1.0)
 
 
+def test_call_sets_zero_reward_for_repetition_truncated_response():
+    reward_manager = DAPORewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=_unexpected_compute_score,
+    )
+    data = _make_data(
+        batch_size=1,
+        non_tensors={"repetition_truncated": np.array([True], dtype=object)},
+    )
+
+    result = reward_manager(data, return_dict=True)
+
+    assert torch.all(result["reward_tensor"] == 0)
+    assert result["reward_extra_info"]["acc"] == [0.0]
+    assert result["reward_extra_info"]["score"] == [0.0]
+    assert result["reward_extra_info"]["repetition_truncated"] == [True]
+
+
+def test_call_scalar_reward_extra_info_has_stable_base_keys():
+    reward_manager = DAPORewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=_constant_compute_score,
+    )
+
+    result = reward_manager(_make_data(batch_size=1), return_dict=True)
+
+    assert result["reward_extra_info"]["score"] == [0.5]
+    assert result["reward_extra_info"]["acc"] == [0.5]
+    assert result["reward_extra_info"]["repetition_truncated"] == [False]
+
+
 def test_reward_loop_construct_with_overlong_buffer_disabled():
     """The experimental reward loop manager accepts a disabled overlong buffer without max_resp_len."""
     config = OmegaConf.create(
@@ -125,3 +166,43 @@ def test_reward_loop_construct_with_overlong_buffer_disabled():
         config=config, tokenizer=_DummyTokenizer(), compute_score=_constant_compute_score
     )
     assert reward_manager.max_resp_len is None
+
+
+@pytest.mark.asyncio
+async def test_reward_loop_sets_zero_reward_for_repetition_truncated_response():
+    config = OmegaConf.create({"reward": {"reward_kwargs": {}}})
+    reward_manager = RewardLoopDAPORewardManager(
+        config=config,
+        tokenizer=_DummyTokenizer(),
+        compute_score=_unexpected_compute_score,
+    )
+    data = _make_data(
+        batch_size=1,
+        non_tensors={
+            "tool_extra_fields": np.array([{"repetition_truncated": True}], dtype=object),
+        },
+    )
+
+    result = await reward_manager.run_single(data)
+
+    assert result["reward_score"] == 0.0
+    assert result["reward_extra_info"]["acc"] == 0.0
+    assert result["reward_extra_info"]["score"] == 0.0
+    assert result["reward_extra_info"]["repetition_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_reward_loop_scalar_reward_extra_info_has_stable_base_keys():
+    config = OmegaConf.create({"reward": {"reward_kwargs": {}}})
+    reward_manager = RewardLoopDAPORewardManager(
+        config=config,
+        tokenizer=_DummyTokenizer(),
+        compute_score=_constant_compute_score,
+    )
+
+    result = await reward_manager.run_single(_make_data(batch_size=1))
+
+    assert result["reward_score"] == 0.5
+    assert result["reward_extra_info"]["score"] == 0.5
+    assert result["reward_extra_info"]["acc"] == 0.5
+    assert result["reward_extra_info"]["repetition_truncated"] is False

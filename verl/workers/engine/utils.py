@@ -61,6 +61,7 @@ def prepare_micro_batches(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    allow_oversized_singleton=False,
 ):
     """
     Prepare micro batches from data.
@@ -83,6 +84,7 @@ def prepare_micro_batches(
             min_num_micro_batch=min_num_micro_batch,
             use_dynamic_bsz_balance=use_dynamic_bsz_balance,
             force_group_size=force_group_size,
+            allow_oversized_singleton=allow_oversized_singleton,
         )
     else:
         total_data_size = len(data)

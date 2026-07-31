@@ -255,6 +255,10 @@ actor_rollout_ref:
     temperature: 1.0
     top_k: -1
     top_p: 1
+    presence_penalty: 0.0
+    frequency_penalty: 0.0
+    repetition_penalty: 1.0
+    penalty_decay: 0.996
     full_determinism: false
     seed: 42
     prompt_length: ${oc.select:data.max_prompt_length,512}
@@ -262,6 +266,7 @@ actor_rollout_ref:
     dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: false
+    rwkv_prompt_template: null
     enforce_eager: false
     cudagraph_capture_sizes: null
     free_cache_engine: true
@@ -296,6 +301,11 @@ actor_rollout_ref:
       top_k: -1
       top_p: 1.0
       temperature: 0
+      presence_penalty: 0.0
+      frequency_penalty: 0.0
+      repetition_penalty: 1.0
+      penalty_decay: 0.996
+      logprobs: null
       'n': 1
       do_sample: false
     multi_turn:
