@@ -28,7 +28,6 @@ def test_rwkv_native_rollout_model_config_uses_vllm_pth_config(tmp_path):
             "_target_": "verl.models.rwkv.RWKVNativeModelConfig",
             "path": str(checkpoint),
             "load_tokenizer": False,
-            "rwkv_lm_path": "/workspace/Projects/MachineLearning/rwkv-lm",
             "lora": {},
         }
     )

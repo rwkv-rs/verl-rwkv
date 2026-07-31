@@ -620,10 +620,8 @@ class RWKVLMEngineConfig(EngineConfig):
     rwkv_lm_path: Optional[str] = None
     train_entrypoint: str = "train.py"
     model_entrypoint: str = "src/model.py"
-    rwkv_version: str = "v7"
     precision: str = "bf16"
     ctx_len: Optional[int] = None
-    head_size: Optional[int] = None
     grad_cp: Optional[int] = None
     infctx: bool = False
     chunk_ctx: Optional[int] = None

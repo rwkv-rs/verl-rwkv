@@ -396,7 +396,6 @@ def build_overrides(
         f"reward.reward_manager.name={_required(reward, 'manager', section_name='reward')}",
         "model@actor_rollout_ref.model=rwkv_native",
         f"actor_rollout_ref.model.path={checkpoint_path}",
-        f"actor_rollout_ref.model.rwkv_lm_path={rwkv_lm_path}",
         "actor@actor_rollout_ref.actor=rwkv_lm",
         f"actor_rollout_ref.actor.engine.rwkv_lm_path={rwkv_lm_path}",
         f"actor_rollout_ref.actor.optim.lr={_required(optimizer, 'learning_rate', section_name='optimizer')}",

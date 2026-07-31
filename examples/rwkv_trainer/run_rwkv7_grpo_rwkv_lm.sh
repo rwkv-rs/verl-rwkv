@@ -95,7 +95,6 @@ DATA=(
 MODEL=(
     model@actor_rollout_ref.model=rwkv_native
     actor_rollout_ref.model.path="${RWKV_MODEL_PATH}"
-    actor_rollout_ref.model.rwkv_lm_path="${RWKV_LM_PATH}"
 )
 
 ACTOR=(

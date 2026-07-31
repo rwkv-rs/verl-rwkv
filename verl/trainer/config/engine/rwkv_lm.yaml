@@ -10,17 +10,11 @@ train_entrypoint: train.py
 # Native rwkv-lm model implementation relative to rwkv_lm_path
 model_entrypoint: src/model.py
 
-# RWKV architecture version
-rwkv_version: v7
-
 # Native training precision
 precision: bf16
 
 # Context length passed to rwkv-lm
 ctx_len: null
-
-# RWKV head size passed to rwkv-lm
-head_size: null
 
 # Native RWKV gradient checkpointing. Defaults to enabled when infctx is enabled.
 grad_cp: null

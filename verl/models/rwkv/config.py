@@ -23,11 +23,12 @@ from verl.models.rwkv.tokenizer import build_rwkv_tokenizer
 
 @dataclass
 class RWKVNativeModelConfig(BaseConfig):
-    """Shared model configuration template for native RWKV integration.
+    """Checkpoint and architecture identity for native RWKV models.
 
-    This config is intentionally independent from ``HFModelConfig`` because the
-    native rwkv-lm path owns model construction, checkpoint naming, precision
-    flags, and CUDA extension environment variables.
+    Native checkout, runtime, precision, and environment settings belong to
+    ``RWKVLMEngineConfig``. This config remains independent from
+    ``HFModelConfig`` because native RWKV checkpoints do not use the Hugging
+    Face model-loading contract.
     """
 
     _mutable_fields = {"model_type", "tokenizer", "processor"}
@@ -39,23 +40,16 @@ class RWKVNativeModelConfig(BaseConfig):
     tokenizer: Any = None
     processor: Any = None
     custom_chat_template: Optional[str] = None
-    rwkv_lm_path: Optional[str] = None
     rwkv_version: str = "v7"
-    ctx_len: Optional[int] = None
     n_layer: Optional[int] = None
     n_embd: Optional[int] = None
     head_size: Optional[int] = None
-    precision: str = "bf16"
     vocab_size: Optional[int] = None
-    use_remove_padding: bool = False
-    use_fused_kernels: bool = False
     lora: dict[str, object] = field(default_factory=dict)
-    native_env: dict[str, str] = field(default_factory=dict)
     weight_mapping: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         assert self.rwkv_version in ["v7"], f"rwkv_version {self.rwkv_version} not supported"
-        assert self.precision in ["bf16", "fp16", "fp32"], f"precision {self.precision} not supported"
         if self.load_tokenizer and self.tokenizer is None:
             self.tokenizer = build_rwkv_tokenizer(
                 tokenizer_path=self.tokenizer_path,

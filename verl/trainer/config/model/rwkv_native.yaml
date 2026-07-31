@@ -7,14 +7,8 @@ path: ???
 # Tokenizer path
 tokenizer_path: null
 
-# Native rwkv-lm repository path
-rwkv_lm_path: ???
-
 # RWKV architecture version
 rwkv_version: v7
-
-# Context length
-ctx_len: null
 
 # Number of layers
 n_layer: null
@@ -25,14 +19,8 @@ n_embd: null
 # RWKV head size
 head_size: null
 
-# Native precision
-precision: bf16
-
 # Vocabulary size
 vocab_size: null
-
-# Native environment variables
-native_env: {}
 
 # Optional explicit weight-name mapping
 weight_mapping: {}

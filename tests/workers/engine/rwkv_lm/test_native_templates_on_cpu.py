@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -29,8 +30,17 @@ def _load_rwkv_trainer_module(name: str):
     return module
 
 
-def test_rwkv_model_config_exposes_generic_worker_compat_fields():
+def test_rwkv_config_ownership_separates_model_identity_from_engine_runtime():
     from verl.models.rwkv import RWKVNativeModelConfig
+    from verl.workers.config import RWKVLMEngineConfig
+
+    model_fields = {field.name for field in fields(RWKVNativeModelConfig)}
+    engine_fields = {field.name for field in fields(RWKVLMEngineConfig)}
+
+    assert {"rwkv_version", "n_layer", "n_embd", "head_size", "vocab_size"} <= model_fields
+    assert {"rwkv_lm_path", "ctx_len", "precision", "native_env"} <= engine_fields
+    assert {"rwkv_lm_path", "ctx_len", "precision", "native_env"}.isdisjoint(model_fields)
+    assert {"rwkv_version", "head_size"}.isdisjoint(engine_fields)
 
     model = RWKVNativeModelConfig(path="/models/rwkv", load_tokenizer=False)
 
@@ -64,7 +74,6 @@ def test_rwkv_grpo_vllm_hydra_entrypoint_composes():
         "actor_rollout_ref.rollout.prompt_length=8192",
         "actor_rollout_ref.rollout.response_length=8192",
         "actor_rollout_ref.model.path=/models/rwkv.pth",
-        "actor_rollout_ref.model.rwkv_lm_path=/src/rwkv-lm",
         "actor_rollout_ref.actor.engine.rwkv_lm_path=/src/rwkv-lm",
         "actor_rollout_ref.actor.ppo_mini_batch_size=2",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",

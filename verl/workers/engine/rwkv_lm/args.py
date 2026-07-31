@@ -186,13 +186,12 @@ def _apply_model_config(values: dict[str, Any], model_config: Any) -> None:
     if path and path != "???":
         values["load_model"] = path
         _apply_checkpoint_metadata(values, model_config, path)
-    for key in ("ctx_len", "n_layer", "n_embd", "head_size", "vocab_size"):
+    for key in ("n_layer", "n_embd", "head_size", "vocab_size"):
         _set_if_not_none(values, key, _get(model_config, key))
 
 
 def _apply_engine_config(values: dict[str, Any], engine_config: Any) -> None:
     _set_if_not_none(values, "ctx_len", _get(engine_config, "ctx_len"))
-    _set_if_not_none(values, "head_size", _get(engine_config, "head_size"))
     _set_if_not_none(values, "precision", _get(engine_config, "precision"))
     grad_cp = _get(engine_config, "grad_cp")
     _set_if_not_none(values, "grad_cp", grad_cp)

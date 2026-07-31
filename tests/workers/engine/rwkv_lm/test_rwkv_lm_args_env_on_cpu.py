@@ -29,8 +29,8 @@ def _load_engine_module(name: str):
 
 def test_rwkv_lm_args_apply_verl_config_overrides_without_rewriting_native_names():
     args_module = _load_engine_module("args")
-    model_config = SimpleNamespace(path="/models/rwkv.pth", ctx_len=2048, n_layer=12, n_embd=768, head_size=64)
-    engine_config = SimpleNamespace(precision="bf16", ctx_len=4096, head_size=64, grad_cp=1)
+    model_config = SimpleNamespace(path="/models/rwkv.pth", n_layer=12, n_embd=768, head_size=64)
+    engine_config = SimpleNamespace(precision="bf16", ctx_len=4096, grad_cp=1)
     optimizer_config = SimpleNamespace(
         lr=1e-4,
         weight_decay=0.01,
@@ -73,7 +73,6 @@ def test_rwkv_lm_args_enable_infctx_chunk_ctx_and_env():
     engine_config = SimpleNamespace(
         precision="bf16",
         ctx_len=2048,
-        head_size=64,
         grad_cp=0,
         infctx=True,
         chunk_ctx=512,
@@ -96,7 +95,6 @@ def test_rwkv_lm_args_enable_grad_cp_by_default_for_infctx():
     engine_config = SimpleNamespace(
         precision="bf16",
         ctx_len=2048,
-        head_size=64,
         grad_cp=None,
         infctx=True,
         chunk_ctx=512,
@@ -135,7 +133,6 @@ def test_rwkv_lm_args_infer_native_shape_from_checkpoint(tmp_path, monkeypatch):
     )
     model_config = SimpleNamespace(
         path=str(checkpoint),
-        ctx_len=None,
         n_layer=None,
         n_embd=None,
         head_size=None,
