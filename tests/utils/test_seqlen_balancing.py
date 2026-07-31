@@ -56,13 +56,9 @@ def test_seqlen_balancing_uses_effective_lengths_for_padded_batches():
             [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
         ]
     )
-    batch = DataProto.from_single_dict(
-        {"input_ids": input_ids, "attention_mask": attention_mask}
-    ).batch
+    batch = DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask}).batch
 
-    micro_batches, micro_batch_indices = rearrange_micro_batches(
-        batch, max_token_len=4
-    )
+    micro_batches, micro_batch_indices = rearrange_micro_batches(batch, max_token_len=4)
     reordered = torch.cat(micro_batches)
     flat_indices = [index for indices in micro_batch_indices for index in indices]
     restored = reordered[torch.tensor(get_reverse_idx(flat_indices))]
