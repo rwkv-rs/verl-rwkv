@@ -12,9 +12,146 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from collections.abc import Callable, Iterable
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 
 WeightUpdate = tuple[str, torch.Tensor]
+logger = logging.getLogger(__name__)
+
+
+def _disable_mtp_completeness_check():
+    """Use vLLM's scoped MTP control when the installed version provides it."""
+    try:
+        from vllm.model_executor.model_loader.mtp_validation import (
+            disable_mtp_completeness_check,
+        )
+    except ImportError:
+        return nullcontext()
+    return disable_mtp_completeness_check()
+
+
+@dataclass
+class _ReloadTarget:
+    model: torch.nn.Module
+    model_config: Any
+    named_buffers: dict[str, torch.Tensor]
+    expected: set[str] | None
+    loaded: set[str] | None
+    needs_finalize: bool = False
+
+
+class _LayerwiseReloadSession:
+    """Own one complete vLLM layerwise reload across all received buckets."""
+
+    def __init__(
+        self,
+        models_with_config: Iterable[tuple[torch.nn.Module, Any]],
+        *,
+        initialize: Callable[[torch.nn.Module], None],
+        finalize: Callable[[torch.nn.Module, Any], None],
+    ) -> None:
+        self._targets: list[_ReloadTarget] = []
+        self._finalize = finalize
+        self._staged_buffers: list[WeightUpdate] = []
+        self._finished = False
+
+        for model, model_config in models_with_config:
+            strict = getattr(model_config, "quantization", None) is None
+            self._targets.append(
+                _ReloadTarget(
+                    model=model,
+                    model_config=model_config,
+                    named_buffers=dict(model.named_buffers()),
+                    expected={name for name, _ in model.named_parameters()} if strict else None,
+                    loaded=set() if strict else None,
+                )
+            )
+
+        try:
+            for target in self._targets:
+                target.needs_finalize = True
+                initialize(target.model)
+        except Exception:
+            self.abort()
+            raise
+
+    def load_bucket(self, weights: list[WeightUpdate]) -> None:
+        if self._finished:
+            raise RuntimeError("Cannot load weights after the reload session finished")
+        if not self._targets:
+            return
+
+        owned_weights = [(name, tensor.detach().clone()) for name, tensor in weights]
+        main_buffers = self._targets[0].named_buffers
+        param_updates = []
+        for name, tensor in owned_weights:
+            if name in main_buffers:
+                self._staged_buffers.append((name, tensor))
+            else:
+                param_updates.append((name, tensor))
+
+        if not param_updates:
+            return
+        for target in self._targets:
+            with _disable_mtp_completeness_check():
+                loaded = target.model.load_weights(param_updates)
+            if loaded is None:
+                target.loaded = None
+            elif target.loaded is not None:
+                target.loaded.update(loaded)
+
+    def finish(self) -> None:
+        if self._finished:
+            raise RuntimeError("Reload session already finished")
+
+        self._finalize_models()
+        for target in self._targets:
+            apply_buffer_updates(
+                target.model,
+                self._staged_buffers,
+                named_buffers=target.named_buffers,
+            )
+            if (
+                target.expected is not None
+                and target.loaded is not None
+                and (missing := target.expected - target.loaded)
+            ):
+                logger.warning(
+                    "Following weights were not loaded from checkpoint: %s",
+                    missing,
+                )
+        self._finished = True
+
+    def abort(self) -> None:
+        if self._finished:
+            return
+        try:
+            self._finalize_models()
+        except Exception:
+            logger.exception("Failed to finalize an interrupted vLLM weight reload")
+        finally:
+            self._staged_buffers.clear()
+            self._finished = True
+
+    def _finalize_models(self) -> None:
+        first_error = None
+        for target in self._targets:
+            if not target.needs_finalize:
+                continue
+            try:
+                self._finalize(target.model, target.model_config)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                target.needs_finalize = False
+        if first_error is not None:
+            raise first_error
 
 
 def split_buffer_updates(
