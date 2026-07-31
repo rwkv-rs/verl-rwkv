@@ -38,6 +38,8 @@ class OneStepTaskRunner:
 
         from omegaconf import OmegaConf
 
+        from verl.utils.fs import copy_to_local
+
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
 
         pprint(OmegaConf.to_container(config, resolve=True))
@@ -53,10 +55,19 @@ class OneStepTaskRunner:
             use_critic=need_critic(config),
         )
 
-        # Instantiate the tokenizer and processor.
-        from verl.trainer.tokenizer import build_ppo_tokenizer_and_processor
+        # Download the checkpoint from HDFS to the local machine.
+        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
 
-        tokenizer, processor = build_ppo_tokenizer_and_processor(config)
+        # Instantiate the tokenizer and processor.
+        from verl.utils import hf_processor, hf_tokenizer
+
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # Used for multimodal LLM, could be None
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         resource_pool_manager = create_resource_pool_manager(config, role_worker_mapping.keys())
 

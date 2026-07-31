@@ -31,7 +31,6 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
-from verl.experimental.agent_loop.agent_loop import build_agent_loop_sampling_params
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -43,6 +42,11 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
+
+
+async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseException]:
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return [result for result in results if isinstance(result, BaseException)]
 
 
 @ray.remote
@@ -57,7 +61,19 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         validate = batch["validate"] if "validate" in batch else False
         batch.pop("validate", None)
         config = self.config.actor_rollout_ref.rollout
-        sampling_params = build_agent_loop_sampling_params(config, validate=validate)
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+
+        # override sampling params for validation
+        if validate:
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["top_k"] = config.val_kwargs.top_k
+            sampling_params["temperature"] = config.val_kwargs.temperature
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch:
@@ -92,6 +108,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+        tasks = []
         try:
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
             config = self.config.actor_rollout_ref.rollout
@@ -106,19 +123,28 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for i in range(n):
                 task = asyncio.create_task(
                     self._run_agent_loop(
-                        run_sampling_params,
-                        trajectory=trajectory,
-                        trace=trace,
-                        session_id=i,
-                        group_size=n,
-                        **prompt,
+                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+
+            # Publish a terminal status only after every session settles, so no sibling can write after
+            # ReplayBuffer clears a failed group.
+            session_errors = await _settle_session_tasks(tasks)
+            if session_errors:
+                for error in session_errors:
+                    logger.error(
+                        f"Error in _run_prompt for uid={uid}",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                status = "failure"
+            else:
+                status = "finished"
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
+            if tasks:
+                await _settle_session_tasks(tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _agent_loop_postprocess(
@@ -176,7 +202,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["multi_modal_inputs"] = multi_modal_inputs
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
-            rollout_metrics = field.get("metrics", {})
             tags.append(
                 {
                     "status": "success",
@@ -191,16 +216,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
-                    "group_id": uid,
-                    "group_size": kwargs["group_size"],
-                    "response_index": session_id,
-                    "policy_version": field["extra_fields"].get("policy_version"),
-                    "weight_digest": field["extra_fields"].get("weight_digest"),
-                    "sampling_config_digest": field["extra_fields"].get("sampling_config_digest"),
-                    "request_sampling_digest": field["extra_fields"].get("request_sampling_digest"),
-                    "runtime_identity": field["extra_fields"].get("runtime_identity"),
-                    "generation_seconds": float(rollout_metrics.get("generate_sequences", 0.0)),
-                    "num_preempted": int(rollout_metrics.get("num_preempted", -1)),
                 }
             )
 
@@ -225,8 +240,7 @@ class AgentLoopManagerTQ(AgentLoopManager):
         await instance._init_agent_loop_workers()
         return instance
 
-    @auto_await
-    async def generate_sequences(self, prompts: TensorDict) -> None:
+    def generate_sequences(self, prompts: TensorDict) -> None:
         """
         Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
         into TransferQueue once an agent loop finished.
@@ -235,8 +249,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
             prompts (TensorDict): Input batch from train or validation dataset.
         """
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        await asyncio.gather(
-            *[
+        ray.get(
+            [
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]

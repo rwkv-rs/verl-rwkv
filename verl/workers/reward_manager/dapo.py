@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any
 
 import torch
 
@@ -21,7 +20,6 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
-from verl.workers.reward_manager.repetition import is_repetition_truncated
 
 
 @register("dapo")
@@ -66,7 +64,7 @@ class DAPORewardManager(AbstractRewardManager):
             return reward_from_rm_scores
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        reward_extra_info: defaultdict[str, list[Any]] = defaultdict(list)
+        reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
 
@@ -101,40 +99,26 @@ class DAPORewardManager(AbstractRewardManager):
 
             extra_info["rollout_reward_scores"] = rollout_reward_scores
 
-            repetition_truncated = is_repetition_truncated(data_item.non_tensor_batch)
+            result = self.compute_score(
+                data_source=data_source,
+                solution_str=response_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
+
             score: float
-            if repetition_truncated:
-                result = {"score": 0.0, "acc": 0.0}
-                score = 0.0
+            if isinstance(result, dict):
+                score = result["score"]
+                # Store the information including original reward
+                for key, value in result.items():
+                    reward_extra_info[key].append(value)
             else:
-                result = self.compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                )
-
-                if isinstance(result, dict):
-                    score = result["score"]
-                    result = dict(result)
-                    result.setdefault("acc", score)
-                else:
-                    score = result
-                    result = {"score": score, "acc": score}
-
-            current_reward_extra_info = dict(result)
-            current_reward_extra_info["repetition_truncated"] = repetition_truncated
-            for key in list(reward_extra_info.keys()):
-                if key not in current_reward_extra_info:
-                    reward_extra_info[key].append(None)
-            for key, value in current_reward_extra_info.items():
-                if key not in reward_extra_info:
-                    reward_extra_info[key].extend([None] * i)
-                reward_extra_info[key].append(value)
+                score = result
+                reward_extra_info["acc"].append(score)
 
             reward = score
 
-            if (not repetition_truncated) and self.overlong_buffer_cfg is not None and self.overlong_buffer_cfg.enable:
+            if self.overlong_buffer_cfg is not None and self.overlong_buffer_cfg.enable:
                 overlong_buffer_len = self.overlong_buffer_cfg.len
                 expected_len = self.max_resp_len - overlong_buffer_len
                 exceed_len = valid_response_length - expected_len
@@ -155,8 +139,11 @@ class DAPORewardManager(AbstractRewardManager):
                 print("[prompt]", prompt_str)
                 print("[response]", response_str)
                 print("[ground_truth]", ground_truth)
-                for key, value in current_reward_extra_info.items():
-                    print(f"[{key}]", value)
+                if isinstance(result, dict):
+                    for key, value in result.items():
+                        print(f"[{key}]", value)
+                else:
+                    print("[score]", score)
 
         if return_dict:
             return {

@@ -33,71 +33,17 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
-from packaging import version as vs
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
-from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
-from verl.utils.device import get_device_id, is_support_ipc
+from verl.third_party.vllm import VLLM_SLEEP_LEVEL
+from verl.utils.device import is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
-from verl.workers.rollout.vllm_rollout.utils import get_device_uuid
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
-
-
-def _check_vllm_version_for_sleep_level():
-    # https://github.com/vllm-project/vllm/issues/25171
-    minver = "0.11.0"
-    current_version = get_version("vllm")
-    if not current_version:
-        logger.warning("Could not determine vLLM version, assuming an older version for sleep_level configuration.")
-        return False
-    return vs.parse(current_version) >= vs.parse(minver)
-
-
-def _should_expand_vllm_moe_params() -> bool:
-    current_version = get_version("vllm")
-    if not current_version:
-        return False
-
-    try:
-        return vs.parse(current_version) <= vs.parse("0.24.0")
-    except vs.InvalidVersion:
-        return False
-
-
-async def _iter_vllm_compatible_moe_params(weights):
-    """Expand Transformers 5 packed MoE expert tensors to vLLM checkpoint keys.
-
-    Transformers 5 stores Qwen-style MoE experts as packed 3D parameters:
-    ``mlp.experts.gate_up_proj`` with shape
-    ``[num_experts, 2 * intermediate_size, hidden_size]`` and
-    ``mlp.experts.down_proj`` with shape
-    ``[num_experts, hidden_size, intermediate_size]``. vLLM's Qwen MoE reload
-    path still accepts the original per-expert checkpoint keys during live
-    weight sync, so stream those keys without materializing a full dict.
-    """
-    from verl.workers.rollout.utils import ensure_async_iterator
-
-    async for name, tensor in ensure_async_iterator(weights):
-        if name.endswith(".mlp.experts.gate_up_proj") and tensor.dim() == 3:
-            gate, up = tensor.chunk(2, dim=1)
-            base = name.removesuffix(".gate_up_proj")
-            for expert_id in range(tensor.size(0)):
-                yield f"{base}.{expert_id}.gate_proj.weight", gate[expert_id].contiguous()
-                yield f"{base}.{expert_id}.up_proj.weight", up[expert_id].contiguous()
-            continue
-
-        if name.endswith(".mlp.experts.down_proj") and tensor.dim() == 3:
-            base = name.removesuffix(".down_proj")
-            for expert_id in range(tensor.size(0)):
-                yield f"{base}.{expert_id}.down_proj.weight", tensor[expert_id].contiguous()
-            continue
-
-        yield name, tensor
 
 
 class ServerAdapter(BaseRollout):
@@ -176,13 +122,12 @@ class ServerAdapter(BaseRollout):
         else:
             self._has_server = self.rollout_rank == 0
 
-        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+        if config.layered_summon:
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
 
-        self.device_uuid = get_device_uuid(get_device_id())
         # Use replica_rank + node-local rank to form ZMQ handle instead of GPU UUID,
         # because CheckpointEngineWorker and vLLM worker may see different GPU UUIDs
         # when CUDA_VISIBLE_DEVICES differs between processes (common on ROCm/AMD).
@@ -273,58 +218,32 @@ class ServerAdapter(BaseRollout):
             f"vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
         )
         start_time = time.time()
-        policy_identity = kwargs.pop("policy_identity", None)
-        publication_guard = self._ensure_server_handle()
-        try:
-            if publication_guard:
-                await self.server_handle.begin_weight_update.remote()
-            future = await self._execute_method(
-                "update_weights_from_ipc",
-                non_block=True,
-                kwargs={**kwargs, "use_shm": self.use_shm},
-            )
 
-            bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
-            sender = BucketedWeightSender(
-                zmq_handle=self.zmq_handle,
-                bucket_size_mb=bucket_size_mb,
-                use_shm=self.use_shm,
-            )
-            if _should_expand_vllm_moe_params() and not (
-                kwargs.get("peft_config") is not None and kwargs.get("base_sync_done", False)
-            ):
-                weights = _iter_vllm_compatible_moe_params(weights)
-            await sender.async_send_weights(weights)
+        future = await self._execute_method(
+            "update_weights_from_ipc",
+            non_block=True,
+            kwargs={**kwargs, "use_shm": self.use_shm},
+        )
 
-            if future is not None:
-                await future
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        await sender.async_send_weights(weights)
 
-            # Reset caches and expose the new identity only after the local
-            # update, manifest validation, CUDA sync, and state reset complete.
-            if publication_guard:
-                await self.server_handle.clear_kv_cache.remote()
-                if global_steps is not None:
-                    await self.server_handle.set_global_steps.remote(global_steps)
-                if policy_identity is not None:
-                    await self.server_handle.stage_behavior_policy_identity.remote(policy_identity)
-                else:
-                    await self.server_handle.finish_weight_update_without_identity.remote()
-        except BaseException as exc:
-            if publication_guard:
-                try:
-                    await self.server_handle.poison_weight_update.remote(repr(exc))
-                except BaseException:
-                    logger.exception("failed to mark rollout server poisoned after weight update error")
-            raise
+        if future is not None:
+            await future
+
+        # reset caches after updating weights
+        if self._has_server:
+            await self.server_handle.clear_kv_cache.remote()
+            if global_steps is not None:
+                await self.server_handle.set_global_steps.remote(global_steps)
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
-        return policy_identity
-
-    async def activate_weight_update(self):
-        """Expose staged weights after the request cache has resumed successfully."""
-        if self._ensure_server_handle():
-            await self.server_handle.activate_weight_update.remote()
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

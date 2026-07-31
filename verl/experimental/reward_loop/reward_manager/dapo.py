@@ -18,7 +18,6 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
-from verl.workers.reward_manager.repetition import is_repetition_truncated
 
 
 @register("dapo")
@@ -62,12 +61,6 @@ class DAPORewardManager(RewardManagerBase):
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
 
-        if is_repetition_truncated(data_item.non_tensor_batch):
-            return {
-                "reward_score": 0.0,
-                "reward_extra_info": {"score": 0.0, "acc": 0.0, "repetition_truncated": True},
-            }
-
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
@@ -106,12 +99,9 @@ class DAPORewardManager(RewardManagerBase):
             score = result["score"]
             for key, value in result.items():
                 reward_extra_info[key] = value
-            reward_extra_info.setdefault("acc", score)
         else:
             score = result
-            reward_extra_info["score"] = score
             reward_extra_info["acc"] = score
-        reward_extra_info["repetition_truncated"] = False
 
         reward = score
 

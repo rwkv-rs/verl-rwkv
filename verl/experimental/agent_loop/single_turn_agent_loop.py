@@ -17,8 +17,6 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
-from verl.trainer.ppo.v1.policy_identity import IDENTITY_TAG_KEYS, canonical_digest
-from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector, repetition_extra_fields
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -40,15 +38,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
         priority = int(priority)
-        validate = bool(kwargs.pop("__validate__", False))
         messages = list(kwargs["raw_prompt"])
-        identity_values = {key: kwargs.get(key) for key in IDENTITY_TAG_KEYS}
-        present_identity_keys = {key for key, value in identity_values.items() if value is not None}
-        if present_identity_keys and present_identity_keys != set(IDENTITY_TAG_KEYS):
-            missing = sorted(set(IDENTITY_TAG_KEYS) - present_identity_keys)
-            raise RuntimeError(f"rollout request has partial behavior-policy identity: missing {missing}")
-        expected_policy_identity = identity_values if present_identity_keys else None
-        expected_sampling_digest = canonical_digest(sampling_params)
 
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -68,14 +58,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 videos=videos,
                 audios=audios,
                 mm_processor_kwargs=mm_processor_kwargs,
-                validate=validate,
             )
 
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
-            token_output: TokenOutput = await self.server_manager.generate(
+            output: TokenOutput = await self.server_manager.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
@@ -84,65 +73,24 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
-                expected_policy_identity=expected_policy_identity,
-                expected_sampling_digest=expected_sampling_digest,
             )
         if metrics.get("num_preempted") is None:
-            metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
+            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
 
         if use_continuous_token:
             merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(
                 prompt_ids,
-                token_output.token_ids,
+                output.token_ids,
                 [],
-                [] if token_output.log_probs else None,
-                assistant_logprobs=token_output.log_probs if token_output.log_probs else None,
+                [] if output.log_probs else None,
+                assistant_logprobs=output.log_probs if output.log_probs else None,
             )
             response_ids = merge_result.token_ids[-len(response_mask) :] if response_mask else []
             prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
         else:
-            response_ids = token_output.token_ids
-            response_mask = [1] * len(token_output.token_ids)
-            response_logprobs = token_output.log_probs
-
-        extra_fields = dict(token_output.extra_fields)
-        original_response_length = int(extra_fields.get("original_response_length") or len(response_ids))
-        repetition_detection_enabled = sampling_params.get("repetition_detection", True) is not None
-        truncation_length = None
-        repetition_detector = None
-        if repetition_detection_enabled:
-            repetition_detector = ConsecutiveRepetitionDetector()
-            truncation_length = repetition_detector.observe(response_ids)
-        if truncation_length is not None:
-            assert repetition_detector is not None
-            response_ids = response_ids[:truncation_length]
-            response_mask = response_mask[:truncation_length]
-            response_logprobs = response_logprobs[:truncation_length] if response_logprobs else None
-            extra_fields.update(
-                repetition_extra_fields(
-                    truncated=True,
-                    truncation_length=truncation_length,
-                    original_response_length=original_response_length,
-                    matched_rule=repetition_detector.matched_rule,
-                    matched_reason=repetition_detector.matched_reason,
-                    matched_text_stats=repetition_detector.matched_text_stats,
-                )
-            )
-        elif "repetition_truncated" not in extra_fields:
-            extra_fields.update(
-                repetition_extra_fields(
-                    truncated=False,
-                    truncation_length=None,
-                    original_response_length=original_response_length,
-                )
-            )
-
-        routed_experts = token_output.routed_experts
-        if truncation_length is not None and routed_experts is not None:
-            routed_experts = routed_experts[: len(prompt_ids) + len(response_ids)]
-
-        extra_fields["stop_reason"] = token_output.stop_reason
-        extra_fields["response_token_count"] = min(len(response_ids), self.response_length)
+            response_ids = output.token_ids
+            response_mask = [1] * len(output.token_ids)
+            response_logprobs = output.log_probs
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -150,13 +98,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             routed_experts=(
-                routed_experts[: len(prompt_ids) + self.response_length] if routed_experts is not None else None
+                output.routed_experts[: len(prompt_ids) + self.response_length]
+                if output.routed_experts is not None
+                else None
             ),
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=mm_processor_kwargs,
             num_turns=2,
             metrics=metrics,
-            extra_fields=extra_fields,
+            extra_fields=output.extra_fields,
         )
 
         # keeping the schema consistent with tool_agent_loop

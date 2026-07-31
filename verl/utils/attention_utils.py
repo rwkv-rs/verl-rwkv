@@ -14,39 +14,7 @@
 
 from typing import Callable
 
-import torch
-import torch.nn.functional as F
-from einops import rearrange as einops_rearrange
-
 _index_first_axis, _pad_input, _rearrange, _unpad_input = None, None, None, None
-
-
-def _torch_index_first_axis(input: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    return input.index_select(0, indices)
-
-
-def _torch_pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch: int, seqlen: int) -> torch.Tensor:
-    output = hidden_states.new_zeros((batch * seqlen, *hidden_states.shape[1:]))
-    output[indices] = hidden_states
-    return output.reshape(batch, seqlen, *hidden_states.shape[1:])
-
-
-def _torch_unpad_input(
-    hidden_states: torch.Tensor, attention_mask: torch.Tensor, unused_mask: torch.Tensor | None = None
-):
-    all_masks = attention_mask + unused_mask if unused_mask is not None else attention_mask
-    seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
-    used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.reshape(-1), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    return (
-        _torch_index_first_axis(hidden_states.reshape(-1, *hidden_states.shape[2:]), indices),
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-        used_seqlens_in_batch,
-    )
 
 
 def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
@@ -59,15 +27,7 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        try:
-            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-        except ModuleNotFoundError as exc:
-            if exc.name not in {"flash_attn", "flash_attn_2_cuda"}:
-                raise
-            index_first_axis = _torch_index_first_axis
-            pad_input = _torch_pad_input
-            rearrange = einops_rearrange
-            unpad_input = _torch_unpad_input
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 

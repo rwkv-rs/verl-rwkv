@@ -171,54 +171,6 @@ def _to_internal(
     )
 
 
-def _postprocess_worker(*, prompt_length: int, response_length: int):
-    class _DummyWorker:
-        _compute_batched_position_ids = AgentLoopWorker._compute_batched_position_ids
-        distillation_enabled = False
-
-        def __init__(self):
-            self.rollout_config = OmegaConf.create({"prompt_length": prompt_length, "response_length": response_length})
-            self.processor = None
-            self.reward_loop_worker_handles = None
-            self.tokenizer = _FakeTokenizer()
-
-    return _DummyWorker()
-
-
-def test_agent_loop_postprocess_pads_sparse_reward_extra_info_on_cpu():
-    metrics = AgentLoopMetrics()
-    internal_a = _to_internal(
-        output_prompt_ids=[101, 102],
-        output_response_ids=[11, 12],
-        output_response_mask=[1, 1],
-        metrics=metrics,
-        extra_fields={"reward_extra_info": {"score": 0.0, "acc": 0.0, "repetition_truncated": True}},
-        num_turns=2,
-        prompt_len=2,
-        response_len=2,
-    )
-    internal_b = _to_internal(
-        output_prompt_ids=[201, 202],
-        output_response_ids=[21, 22],
-        output_response_mask=[1, 1],
-        metrics=metrics,
-        extra_fields={"reward_extra_info": {"acc": 0.5, "repetition_truncated": False}},
-        num_turns=2,
-        prompt_len=2,
-        response_len=2,
-    )
-    internal_a.reward_score = 0.0
-    internal_b.reward_score = 0.5
-    dummy_worker = _postprocess_worker(prompt_length=2, response_length=2)
-
-    merged = AgentLoopWorker._postprocess(dummy_worker, inputs=[internal_a, internal_b])
-
-    assert set(merged.meta_info["reward_extra_keys"]) == {"score", "acc", "repetition_truncated"}
-    assert merged.non_tensor_batch["score"].tolist() == [0.0, None]
-    assert merged.non_tensor_batch["acc"].tolist() == [0.0, 0.5]
-    assert merged.non_tensor_batch["repetition_truncated"].tolist() == [True, False]
-
-
 @pytest.mark.asyncio
 async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu():
     # Minimal config surface used by the agent loops.
@@ -260,8 +212,6 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     # Agent loop outputs should always contain these fields with consistent types.
     assert out.extra_fields["turn_scores"] == []
     assert out.extra_fields["tool_rewards"] == []
-    assert out.extra_fields["stop_reason"] is None
-    assert out.extra_fields["response_token_count"] == 4
 
     internal_a = _to_internal(
         output_prompt_ids=out.prompt_ids,
@@ -275,7 +225,11 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     )
 
     # Mimic two "worker chunks" and concatenate as in training.
-    dummy_worker = _postprocess_worker(prompt_length=16, response_length=16)
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
     merged = AgentLoopWorker._postprocess(
         dummy_worker,
         inputs=[internal_a],
@@ -350,10 +304,10 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
 
     expected = torch.tensor(routed_experts.copy()).unsqueeze(0)
     assert internal.routed_experts is not None
-    assert internal.routed_experts.shape == (1, 7, 2, 1)
-    torch.testing.assert_close(internal.routed_experts[:, 1:5], expected)
-    assert torch.count_nonzero(internal.routed_experts[:, :1]) == 0
-    assert torch.count_nonzero(internal.routed_experts[:, 5:]) == 0
+    assert internal.routed_experts.shape == (1, 8, 2, 1)
+    torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
+    assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
+    assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
 
 
 class _FakeTokenizerCustomPad:

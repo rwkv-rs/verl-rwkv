@@ -354,7 +354,6 @@ def rearrange_micro_batches(
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
     force_group_size=1,
-    allow_oversized_singleton=False,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -368,8 +367,6 @@ def rearrange_micro_batches(
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
         use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
         force_group_size (int, optional): force consecutive samples to be in the same micro-batch (for RM training).
-        allow_oversized_singleton (bool, optional): permit a sequence above the aggregate token target;
-            the scheduler isolates it in a singleton micro-batch.
 
     Returns:
         List[TensorDict]: the micro-batches.
@@ -379,15 +376,13 @@ def rearrange_micro_batches(
     input_ids = batch["input_ids"]
     if input_ids.is_nested:
         seq_len_effective: torch.Tensor = input_ids.offsets().diff()
-        max_seq_len = max(seq_len_effective)
     else:
         seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
-        max_seq_len = max(seq_len_effective)
+    max_seq_len = int(seq_len_effective.max().item())
 
-    if not allow_oversized_singleton:
-        assert max_token_len >= max_seq_len, (
-            f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
-        )
+    assert max_token_len >= max_seq_len, (
+        f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
+    )
 
     # Validate force_group_size
     batch_size = len(seq_len_effective)
@@ -440,25 +435,6 @@ def rearrange_micro_batches(
         # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
         workloads = calculate_workload(seq_len_effective).cpu().tolist()
         micro_bsz_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
-
-    if allow_oversized_singleton:
-        assert force_group_size == 1, "oversized singleton isolation requires force_group_size=1"
-        oversized_indices = [idx for idx, length in enumerate(seq_len_effective.tolist()) if length > max_token_len]
-        if oversized_indices:
-            oversized_set = set(oversized_indices)
-            regular_indices = [idx for idx in range(batch_size) if idx not in oversized_set]
-            regular_partitions = []
-            if regular_indices:
-                regular_partition_count = max(1, min(len(regular_indices), num_micro_batches - len(oversized_indices)))
-                relative_partitions = get_seqlen_balanced_partitions(
-                    [workloads[idx] for idx in regular_indices],
-                    regular_partition_count,
-                    equal_size=False,
-                )
-                regular_partitions = [
-                    [regular_indices[relative_idx] for relative_idx in partition] for partition in relative_partitions
-                ]
-            micro_bsz_idx = [[idx] for idx in oversized_indices] + regular_partitions
 
     if use_dynamic_bsz_balance:
         # Use the sum of squared sequence lengths to approximate attention computation workload

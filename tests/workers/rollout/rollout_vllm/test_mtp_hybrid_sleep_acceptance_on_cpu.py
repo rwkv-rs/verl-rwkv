@@ -39,12 +39,6 @@ class _FakeMtpEngine:
     async def reset_encoder_cache(self):
         pass
 
-    async def wake_up(self, tags):
-        self.wake_tags = tags
-
-    async def reset_prefix_cache(self, **kwargs):
-        self.reset_prefix_cache_kwargs = kwargs
-
     def sync_actor_weights(self):
         pass
 
@@ -53,51 +47,6 @@ class _FakeMtpEngine:
         num_accepted_tokens = num_draft_tokens if self.mtp_drafter_available else 0
         num_verify_steps = 1
         return num_draft_tokens, num_accepted_tokens, num_verify_steps
-
-
-def _make_colocated_server(*, lora_rank: int = 0, lora: dict | None = None):
-    server = object.__new__(vllm_async_server.vLLMHttpServer)
-    server.node_rank = 0
-    server.rollout_mode = vllm_async_server.RolloutMode.COLOCATED
-    server.config = SimpleNamespace(
-        free_cache_engine=True,
-        mtp=SimpleNamespace(enable=False, enable_rollout=False),
-    )
-    server.model_config = SimpleNamespace(lora_rank=lora_rank, lora=lora or {})
-    server.engine = _FakeMtpEngine()
-    server.weight_update_state = "active"
-    server.weight_update_failure = None
-    server.behavior_policy_identity = {"policy_version": 1}
-    return server
-
-
-def test_colocated_full_weight_sleep_discards_old_inference_weights(monkeypatch):
-    monkeypatch.setattr(vllm_async_server, "is_torch_npu_available", lambda check_device=False: False)
-    server = _make_colocated_server()
-
-    asyncio.run(server.sleep())
-
-    assert not server.engine.mtp_drafter_available
-    assert server.weight_update_state == "sleeping"
-    assert server.behavior_policy_identity is None
-
-
-def test_colocated_adapter_sleep_keeps_base_weights(monkeypatch):
-    monkeypatch.setattr(vllm_async_server, "is_torch_npu_available", lambda check_device=False: False)
-    server = _make_colocated_server(lora_rank=8, lora={"rank": 8, "merge": False})
-
-    asyncio.run(server.sleep())
-
-    assert server.engine.mtp_drafter_available
-    assert server.weight_update_state == "sleeping"
-
-
-def test_colocated_wake_respects_two_phase_tags():
-    server = _make_colocated_server()
-
-    asyncio.run(server.wake_up(tags=["weights"]))
-
-    assert server.engine.wake_tags == ["weights"]
 
 
 def test_mtp_hybrid_sleep_keeps_drafter_available_for_nonzero_acceptance(monkeypatch):

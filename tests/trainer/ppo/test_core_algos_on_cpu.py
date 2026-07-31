@@ -20,19 +20,16 @@ import pytest
 import torch
 
 import verl.trainer.ppo.core_algos
-from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
-    compute_maxrl_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
     kl_penalty,
     register_adv_est,
 )
-from verl.trainer.ppo.ray_trainer import compute_advantage
 
 
 def mock_test_fn():
@@ -281,114 +278,6 @@ def test_grpo_vectorized_matches_original_for_low_variance_rewards():
 
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
-
-
-def test_maxrl_outcome_advantage_uses_group_mean_probability():
-    token_level_rewards = torch.tensor([[1.0], [0.0], [1.0], [1.0], [0.0], [0.0]], dtype=torch.float32)
-    response_mask = torch.ones_like(token_level_rewards)
-    index = np.array(["a", "a", "a", "b", "b", "b"], dtype=object)
-
-    advantages, returns = compute_maxrl_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-        epsilon=1e-6,
-    )
-
-    group_a_mean = 2.0 / 3.0
-    group_b_mean = 1.0 / 3.0
-    expected = torch.tensor(
-        [
-            [(1.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(0.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(1.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(1.0 - group_b_mean) / (group_b_mean + 1e-6)],
-            [(0.0 - group_b_mean) / (group_b_mean + 1e-6)],
-            [(0.0 - group_b_mean) / (group_b_mean + 1e-6)],
-        ],
-        dtype=torch.float32,
-    )
-
-    assert torch.allclose(advantages, expected, rtol=1e-5, atol=1e-6)
-    assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
-
-
-def test_maxrl_outcome_advantage_treats_nonpositive_rewards_as_failures():
-    token_level_rewards = torch.tensor([[1.0], [-1.0], [0.0], [-1.0], [0.0], [0.0]], dtype=torch.float32)
-    response_mask = torch.ones_like(token_level_rewards)
-    index = np.array(["a", "a", "a", "b", "b", "b"], dtype=object)
-
-    advantages, returns = compute_maxrl_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-        epsilon=1e-6,
-    )
-
-    group_a_mean = 1.0 / 3.0
-    expected = torch.tensor(
-        [
-            [(1.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(0.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(0.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [0.0],
-            [0.0],
-            [0.0],
-        ],
-        dtype=torch.float32,
-    )
-
-    assert torch.isfinite(advantages).all()
-    assert advantages.abs().max() < 10.0
-    assert torch.allclose(advantages, expected, rtol=1e-5, atol=1e-6)
-    assert torch.allclose(returns, expected, rtol=1e-5, atol=1e-6)
-
-
-def test_maxrl_outcome_advantage_reuses_materialized_binary_success():
-    token_level_rewards = torch.tensor([[10.0], [10.0]], dtype=torch.float32)
-    response_mask = torch.ones_like(token_level_rewards)
-    index = np.array(["a", "a"], dtype=object)
-
-    advantages, _ = compute_maxrl_outcome_advantage(
-        token_level_rewards=token_level_rewards,
-        response_mask=response_mask,
-        index=index,
-        binary_success=torch.tensor([True, False]),
-    )
-
-    assert torch.allclose(advantages, torch.tensor([[1.0], [-1.0]]), atol=1e-5)
-
-
-def test_ray_trainer_compute_advantage_dispatches_maxrl():
-    token_level_rewards = torch.tensor([[1.0], [0.0], [1.0], [1.0], [0.0], [0.0]], dtype=torch.float32)
-    response_mask = torch.ones_like(token_level_rewards)
-    index = np.array(["a", "a", "a", "b", "b", "b"], dtype=object)
-    data = DataProto.from_dict(
-        tensors={
-            "token_level_rewards": token_level_rewards,
-            "response_mask": response_mask,
-        },
-        non_tensors={"uid": index},
-    )
-    register_adv_est("maxrl")(compute_maxrl_outcome_advantage)
-
-    result = compute_advantage(data, adv_estimator="maxrl")
-
-    group_a_mean = 2.0 / 3.0
-    group_b_mean = 1.0 / 3.0
-    expected = torch.tensor(
-        [
-            [(1.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(0.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(1.0 - group_a_mean) / (group_a_mean + 1e-6)],
-            [(1.0 - group_b_mean) / (group_b_mean + 1e-6)],
-            [(0.0 - group_b_mean) / (group_b_mean + 1e-6)],
-            [(0.0 - group_b_mean) / (group_b_mean + 1e-6)],
-        ],
-        dtype=torch.float32,
-    )
-    assert torch.allclose(result.batch["advantages"], expected, rtol=1e-5, atol=1e-6)
-    assert torch.allclose(result.batch["returns"], expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize(

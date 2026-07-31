@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -47,22 +48,24 @@ def test_seqlen_balancing():
     torch.testing.assert_close(new_batch, dataproto.batch)
 
 
-def test_rearrange_micro_batches_isolates_oversized_sequences():
-    input_ids = torch.arange(30).reshape(3, 10)
+def test_seqlen_balancing_uses_effective_lengths_for_padded_batches():
+    input_ids = torch.arange(20).reshape(2, 10)
     attention_mask = torch.tensor(
         [
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
-            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 1, 1, 1],
             [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
         ]
     )
     batch = DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask}).batch
 
-    micro_batches, partitions = rearrange_micro_batches(batch, max_token_len=8, allow_oversized_singleton=True)
+    micro_batches, micro_batch_indices = rearrange_micro_batches(batch, max_token_len=4)
+    reordered = torch.cat(micro_batches)
+    flat_indices = [index for indices in micro_batch_indices for index in indices]
+    restored = reordered[torch.tensor(get_reverse_idx(flat_indices))]
 
-    oversized_partition = next(partition for partition in partitions if 0 in partition)
-    assert oversized_partition == [0]
-    assert sum(len(micro_batch) for micro_batch in micro_batches) == 3
+    torch.testing.assert_close(restored, batch)
+    with pytest.raises(AssertionError, match="max_token_len"):
+        rearrange_micro_batches(batch, max_token_len=3)
 
 
 def test_dynamic_batch():

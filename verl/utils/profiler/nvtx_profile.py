@@ -24,32 +24,6 @@ from verl.plugin.platform import get_platform
 from .config import NsightToolConfig
 from .profile import DistProfiler, ProfilerConfig
 
-# ``nvtx`` only resolves a small built-in color set without matplotlib.  VERL
-# uses additional CSS color names (for example ``olive`` and ``brown``), and a
-# profiler run must not acquire a heavyweight plotting dependency merely to
-# encode an NVTX attribute.
-_NVTX_COLOR_RGB = {
-    "black": 0x000000,
-    "blue": 0x0000FF,
-    "brown": 0xA52A2A,
-    "cyan": 0x00FFFF,
-    "gray": 0x808080,
-    "green": 0x008000,
-    "grey": 0x808080,
-    "olive": 0x808000,
-    "orange": 0xFFA500,
-    "pink": 0xFFC0CB,
-    "purple": 0x800080,
-    "red": 0xFF0000,
-    "yellow": 0xFFFF00,
-}
-
-
-def _normalize_color(color: Optional[str]) -> Optional[str | int]:
-    if color is None:
-        return None
-    return _NVTX_COLOR_RGB.get(color.lower(), color)
-
 
 def mark_start_range(
     message: Optional[str] = None,
@@ -69,7 +43,7 @@ def mark_start_range(
         category (str, optional):
             The category of the range. Defaults to None.
     """
-    return nvtx.start_range(message=message, color=_normalize_color(color), domain=domain, category=category)
+    return nvtx.start_range(message=message, color=color, domain=domain, category=category)
 
 
 def mark_end_range(range_id: str) -> None:
@@ -103,7 +77,7 @@ def mark_annotate(
 
     def decorator(func):
         profile_message = message or func.__name__
-        return nvtx.annotate(profile_message, color=_normalize_color(color), domain=domain, category=category)(func)
+        return nvtx.annotate(profile_message, color=color, domain=domain, category=category)(func)
 
     return decorator
 
@@ -162,6 +136,18 @@ class NsightSystemsProfiler(DistProfiler):
     def stop(self):
         if not self.discrete:
             get_platform().profiler_stop()
+
+    def step(self):
+        """No-op per-mini-batch step hook.
+
+        Nsight Systems profiling is controlled via start/stop and has no per-step schedule
+        to advance. It must still be defined here: without it, the dispatcher's
+        ``getattr(self._impl, "step", lambda: None)`` resolves to the inherited
+        ``DistProfiler.step`` (backend impls subclass ``DistProfiler`` but never run its
+        ``__init__``), which then reads dispatcher-only state such as ``_enable`` and raises
+        ``AttributeError``.
+        """
+        return
 
     def annotate(
         self,

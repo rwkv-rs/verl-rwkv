@@ -12,20 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.metadata
 import json
 import logging
 import math
 import os
-import signal
-import subprocess
-import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from pathlib import Path
 from pprint import pprint
 from typing import Any, Optional
 
@@ -76,33 +71,22 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_teacher_policy,
 )
-from verl.trainer.ppo.v1.effective_groups import (
-    CandidateDatasetPosition,
-    CandidateWavePlanner,
-    EffectiveRoundState,
-    EffectiveSamplingCheckpoint,
-    GracefulRoundCancellation,
-    GroupOutcome,
-    binary_success_from_rewards,
-    classify_complete_groups,
-    effective_training_should_stop,
-    strict_rollout_group_capacity,
-)
-from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
+from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
-from verl.trainer.tokenizer import build_ppo_tokenizer_and_processor
+from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
 from verl.utils.debug.metrics import calculate_debug_metrics
+from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import load_extern_type
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
-from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, ValidationGenerationsLogger
 from verl.workers.config import CriticConfig, DistillationConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
@@ -151,11 +135,11 @@ class PPOTrainer(ABC):
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
-        self._effective_group_acceptance_rate = 0.20
-        self._effective_sampling_totals: dict[str, float] = defaultdict(float)
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
         )
+        # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
+        self.local_trigger_step = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -165,11 +149,15 @@ class PPOTrainer(ABC):
         """
         sampler_config = self.config.trainer.v1.sampler
         custom_sampler = sampler_config.get("custom_sampler", None)
-        sampler_cls = ReplayBuffer
-        if custom_sampler is not None and custom_sampler.get("path") and custom_sampler.get("name"):
+        has_custom_sampler = bool(
+            custom_sampler is not None and custom_sampler.get("path") and custom_sampler.get("name")
+        )
+        if has_custom_sampler:
             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
+        else:
+            sampler_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
 
-        return sampler_cls(
+        replay_buffer_kwargs = dict(
             trainer_mode=self.trainer_mode,
             trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
             max_off_policy_threshold=sampler_config.max_off_policy_threshold,
@@ -177,6 +165,56 @@ class PPOTrainer(ABC):
             sampler_kwargs=sampler_config.sampler_kwargs,
             refill_fn=self._add_prompts_to_generate,
         )
+        # Preserve the existing constructor contract for external samplers; custom implementations own
+        # their filtering semantics and can consume algorithm.filter_groups through their own config.
+        if not has_custom_sampler:
+            filter_groups_metric = self._resolve_filter_groups_metric()
+            sync_refill_failed_groups = bool(sampler_config.get("sync_refill_failed_groups", False))
+            replay_buffer_kwargs.update(
+                filter_groups_metric=filter_groups_metric,
+                sync_refill_failed_groups=sync_refill_failed_groups,
+            )
+            if sampler_cls is ReplayBuffer:
+                filter_groups = self.config.algorithm.get("filter_groups", None)
+                max_inflight_gen_batches = 1
+                if filter_groups_metric is not None:
+                    max_inflight_gen_batches = filter_groups.get("max_inflight_gen_batches", 1)
+                train_batch_size = self.config.data.train_batch_size
+                replay_buffer_kwargs.update(
+                    train_batch_size=train_batch_size,
+                    gen_batch_size=1
+                    if filter_groups_metric is not None or sync_refill_failed_groups
+                    else (self.config.data.get("gen_batch_size", None) or train_batch_size),
+                    max_inflight_gen_batches=max_inflight_gen_batches,
+                )
+        return sampler_cls(**replay_buffer_kwargs)
+
+    def _resolve_filter_groups_metric(self) -> str | None:
+        """Resolve DAPO's group metric and verify that rollout computes it before sampling."""
+        filter_groups = self.config.algorithm.get("filter_groups", None)
+        filter_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
+        if not filter_enabled:
+            return None
+
+        filter_metric = filter_groups.get("metric", None)
+        if not filter_metric:
+            raise ValueError("algorithm.filter_groups.metric must be set when group filtering is enabled")
+
+        reward_model = self.config.reward.reward_model
+        streaming_reward_path = not reward_model.enable or reward_model.enable_resource_pool
+        assert streaming_reward_path, (
+            "algorithm.filter_groups requires the reward metric at sampling time: use rule-based reward or "
+            "reward.reward_model.enable_resource_pool=True. A colocated reward model computes rewards only "
+            "after replay-buffer sampling."
+        )
+        max_num_gen_batches = filter_groups.get("max_num_gen_batches", 0)
+        if max_num_gen_batches > 0:
+            logger.warning(
+                "algorithm.filter_groups.max_num_gen_batches=%s is ignored by the built-in V1 ReplayBuffer; "
+                "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
+                max_num_gen_batches,
+            )
+        return str(filter_metric)
 
     def init(self):
         """Initialize all components of the trainer.
@@ -214,12 +252,21 @@ class PPOTrainer(ABC):
             critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
             critic_cfg.engine.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
             critic_cfg.engine.max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+
+            # Wire the critic profiler config via the hydra path (real dataclass tool_config), so the
+            # standalone critic TrainingWorker gets a working DistProfiler instead of a silent no-op.
+            critic_omega_profiler_config = self.config.critic.get("profiler", {})
+            critic_profiler_config = (
+                omega_conf_to_dataclass(critic_omega_profiler_config) if critic_omega_profiler_config else None
+            )
+
             worker_cfg = TrainingWorkerConfig(
                 model_type="value_model",
                 model_config=critic_cfg.model,
                 engine_config=critic_cfg.engine,
                 optimizer_config=critic_cfg.optim,
                 checkpoint_config=critic_cfg.checkpoint,
+                profiler_config=critic_profiler_config,
             )
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=worker_cfg)
@@ -360,29 +407,25 @@ class PPOTrainer(ABC):
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.dapo_filtered_reward_logger = DapoFilteredRewardTableLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+        )
 
         # perform validation before training
         if self.config.trainer.get("val_before_train", True):
             self.on_validate_begin()
-            initial_validation_timing = {}
-            with marked_timer("testing", initial_validation_timing, color="green"):
-                val_metrics = self._validate()
+            val_metrics = self._validate()
             self.on_validate_end()
             assert val_metrics, f"{val_metrics=}"
-            val_metrics["timing_s/testing"] = initial_validation_timing["testing"]
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
-                self.logger.finish()
                 return
 
-        effective_group_sampling = self._effective_group_sampling_enabled()
         current_epoch = self.global_steps // self.steps_per_epoch
-        progress_total = (
-            self.config.trainer.total_training_steps if effective_group_sampling else self.total_training_steps
-        )
-        progress_bar = tqdm(total=progress_total, initial=self.global_steps, desc="Training Progress")
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
@@ -398,24 +441,9 @@ class PPOTrainer(ABC):
         self.next_step_profile = False
 
         self.on_train_begin()
-        self._graceful_stop_requested = False
-        previous_signal_handlers: dict[int, Any] = {}
-        if effective_group_sampling:
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                previous_signal_handlers[signum] = signal.getsignal(signum)
-                signal.signal(
-                    signum,
-                    lambda received, _frame: setattr(
-                        self,
-                        "_graceful_stop_requested",
-                        received,
-                    ),
-                )
         last_val_metrics = None
-        while effective_group_sampling or (
-            current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps
-        ):
-            is_last_step = not effective_group_sampling and self.global_steps >= self.total_training_steps
+        while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
+            is_last_step = self.global_steps >= self.total_training_steps
             metrics = {}
             self.timing_raw = {}
 
@@ -424,45 +452,18 @@ class PPOTrainer(ABC):
                 self.on_step_begin()
 
                 self._start_profiling()
-                try:
-                    batch = self.step(metrics, self.timing_raw)
-                except GracefulRoundCancellation:
-                    self._stop_profiling()
-                    # The round snapshot has restored the dataloader and sampling
-                    # state. Persist the prior policy version as a new clean boundary.
-                    self.global_steps -= 1
-                    self._save_checkpoint()
-                    break
+                batch = self.step(metrics, self.timing_raw)
                 self._stop_profiling()
-                if effective_group_sampling:
-                    target_passes = int(self.config.trainer.total_epochs)
-                    is_last_step = effective_training_should_stop(
-                        global_step=self.global_steps,
-                        configured_total_training_steps=self.config.trainer.total_training_steps,
-                        candidate_dataset_passes_completed=self._candidate_dataset_passes_completed,
-                        target_candidate_dataset_passes=target_passes,
-                        graceful_stop_requested=bool(self._graceful_stop_requested),
-                    )
-                    metrics.update(
-                        {
-                            "training/effective_sampling/candidate_dataset_pass": (
-                                self._candidate_dataset_passes_completed
-                            ),
-                            "training/effective_sampling/candidate_cursor": (self._candidate_prompts_in_current_pass),
-                            "training/effective_sampling/optimizer_step": self.global_steps,
-                        }
-                    )
 
-                self.on_step_end()
-                metrics.update(self._consume_sync_metrics())
-
-                # Persist dataloader/effective-sampling progress only after the
-                # optimizer and all-replica policy publication both succeed.
+                # 2. save checkpoint
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
                     with marked_timer("save_checkpoint", self.timing_raw, color="green"):
                         self._save_checkpoint()
+
+                self.on_step_end()
+                metrics.update(self._consume_sync_metrics())
 
             # 4. validate
             if self.config.trainer.test_freq > 0 and (
@@ -487,30 +488,25 @@ class PPOTrainer(ABC):
             # 7. cleanup transfer queue
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
+            dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
             self.logger.log(data=metrics, step=self.global_steps)
+            if dapo_filtered_reward_counts:
+                self.dapo_filtered_reward_logger.log(
+                    self.config.trainer.logger, dapo_filtered_reward_counts, self.global_steps
+                )
             progress_bar.update(1)
             self.global_steps += 1
             SkipManager.set_step(self.global_steps)
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
-            if effective_group_sampling:
-                current_epoch = self._candidate_dataset_passes_completed
-            if effective_group_sampling and is_last_step:
-                self.on_train_end()
-                break
             if is_last_step:
-                self.on_train_end()
                 self._shutdown_dump_executor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
-                self.logger.finish()
                 return
 
         self.on_train_end()
-        for signum, previous_handler in previous_signal_handlers.items():
-            signal.signal(signum, previous_handler)
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
-        self.logger.finish()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         train_batch_size = self.config.data.train_batch_size
@@ -520,55 +516,14 @@ class PPOTrainer(ABC):
         )
         sample_batch_size = train_batch_size // self.parameter_sync_step
 
-        effective_group_sampling = self._effective_group_sampling_enabled()
-        if effective_group_sampling and self.parameter_sync_step != 1:
-            raise ValueError("strict MaxRL effective-group sampling requires parameter_sync_step=1")
-        if effective_group_sampling:
-            self._effective_round_snapshot = {
-                "dataloader": self.train_dataloader.state_dict(),
-                "candidate_dataset_passes_completed": self._candidate_dataset_passes_completed,
-                "candidate_prompts_in_current_pass": self._candidate_prompts_in_current_pass,
-                "acceptance_rate": self._effective_group_acceptance_rate,
-                "metric_totals": dict(self._effective_sampling_totals),
-            }
-
-        # Feed either one ordinary train batch or the first bounded MaxRL candidate wave.
-        with marked_timer("feed", timing_raw):
-            if effective_group_sampling:
-                train_batch_size = self.config.data.train_batch_size
-                rollout_config = self.config.actor_rollout_ref.rollout
-                runtime_group_capacity = strict_rollout_group_capacity(
-                    replica_count=len(self.llm_server_manager.server_addresses),
-                    max_num_seqs_per_replica=int(rollout_config.max_num_seqs),
-                    max_num_batched_tokens_per_replica=int(rollout_config.max_num_batched_tokens),
-                    responses_per_prompt=int(rollout_config.n),
-                )
-                self._effective_group_planner = CandidateWavePlanner(
-                    target_groups=train_batch_size,
-                    # TransferQueue accepts an exact prompt count, so strict
-                    # effective-group waves do not need the ordinary training
-                    # batch quantum. A one-group quantum avoids surplus while
-                    # preserving complete n-response groups.
-                    group_quantum=1,
-                    max_candidate_groups=train_batch_size * 32,
-                    max_wave_groups=min(train_batch_size * 32, runtime_group_capacity),
-                    acceptance_rate=self._effective_group_acceptance_rate,
-                )
-                initial_wave = self._effective_group_planner.plan(accepted_groups=0)
-                self.llm_server_manager.start_runtime_metrics()
-                try:
-                    self._add_prompts_to_generate(initial_wave)
-                except BaseException:
-                    self.llm_server_manager.stop_runtime_metrics()
-                    raise
-            else:
-                self._add_batch_to_generate()
+        self._add_batch_to_generate()
 
         metrics_aggregator = MetricsAggregator()
         combined_keys: list = []
         combined_tags: list = []
         combined_partition_id = "train"
-        for _ in range(self.parameter_sync_step):
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
             batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
             sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
@@ -585,28 +540,17 @@ class PPOTrainer(ABC):
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
-            reward_already_computed = self._effective_group_sampling_enabled()
-            if reward_already_computed:
-                try:
-                    batch, off_policy_metrics = self._sample_effective_maxrl_batch(
-                        sample_batch_size,
-                        metrics,
-                    )
-                finally:
-                    metrics.update(self.llm_server_manager.stop_runtime_metrics())
-            else:
-                batch, off_policy_metrics = self.replay_buffer.sample(
-                    global_steps=self.global_steps,
-                    partition_id="train",
-                    batch_size=sample_batch_size,
-                )
+            batch, off_policy_metrics = self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=sample_batch_size,
+            )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-            self.on_batch_prepared(batch)
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
-        if not reward_already_computed and self.reward_loop_manager.reward_loop_worker_handles is None:
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
@@ -642,166 +586,6 @@ class PPOTrainer(ABC):
                 batch = self._update_actor(batch, metrics=metrics)
 
         return batch
-
-    def _effective_group_sampling_enabled(self) -> bool:
-        return self.trainer_mode == "sync" and str(self.config.algorithm.adv_estimator).lower() == "maxrl"
-
-    def _sample_effective_maxrl_batch(
-        self,
-        target_groups: int,
-        metrics: dict,
-    ) -> tuple[KVBatchMeta, dict]:
-        """Collect a full strict MaxRL batch from binary-variant prompt groups."""
-
-        responses_per_prompt = int(self.config.actor_rollout_ref.rollout.n)
-        planner: CandidateWavePlanner = self._effective_group_planner
-        accepted_keys: list[str] = []
-        accepted_tags: list[dict] = []
-        candidate_data_ids: list[str] = []
-        accepted_data_ids: list[str] = []
-        round_state = EffectiveRoundState.create(target_groups, responses_per_prompt)
-        all_wrong_groups = 0
-        all_correct_groups = 0
-        surplus_groups = 0
-        off_policy_metrics: dict = {}
-        fill_started = time.monotonic()
-        wave_groups = planner.plan(accepted_groups=0)
-        round_state.submit_wave(wave_groups)
-
-        while round_state.accepted_groups < target_groups:
-            if wave_groups <= 0:
-                dominant = "all-wrong" if all_wrong_groups >= all_correct_groups else "all-correct"
-                raise RuntimeError(
-                    "strict MaxRL could not fill an effective batch before the candidate "
-                    f"safety limit: accepted={round_state.accepted_groups}/{target_groups}, "
-                    f"candidate={round_state.candidate_groups}, all_wrong={all_wrong_groups}, "
-                    f"all_correct={all_correct_groups}, dominant={dominant}"
-                )
-
-            candidate_batch, wave_off_policy_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=wave_groups,
-            )
-            off_policy_metrics.update(wave_off_policy_metrics)
-            if self.reward_loop_manager.reward_loop_worker_handles is None:
-                candidate_batch = self._compute_reward_colocate(candidate_batch, metrics=metrics)
-
-            reward_data = tq.kv_batch_get(
-                keys=candidate_batch.keys,
-                partition_id=candidate_batch.partition_id,
-                select_fields=["uid", "index", "rm_scores"],
-            )
-            padded_rewards = reward_data["rm_scores"].to_padded_tensor(0.0)
-            binary_success = binary_success_from_rewards(padded_rewards)
-            # TransferQueue's real non-tensor backend returns a LinkedList.
-            # Datasets are also free to use string identifiers (DAPO uses UUIDs),
-            # so treat the source index as an opaque data id.
-            uids = [str(uid) for uid in reward_data["uid"]]
-            wave_data_ids = [str(index) for index in reward_data["index"]]
-            candidate_data_ids.extend(wave_data_ids)
-            remaining_groups = target_groups - round_state.accepted_groups
-            selection = classify_complete_groups(
-                uids,
-                binary_success,
-                responses_per_prompt=responses_per_prompt,
-                target_groups=remaining_groups,
-            )
-            round_state.complete_wave(selection)
-
-            tq.kv_batch_put(
-                keys=candidate_batch.keys,
-                partition_id=candidate_batch.partition_id,
-                fields=TensorDict(
-                    {"binary_success": binary_success},
-                    batch_size=len(candidate_batch),
-                ),
-            )
-
-            accepted_indices = selection.accepted_row_indices
-            accepted_data_ids.extend(wave_data_ids[index] for index in accepted_indices)
-            accepted_keys.extend(candidate_batch.keys[index] for index in accepted_indices)
-            accepted_tags.extend(candidate_batch.tags[index] for index in accepted_indices)
-            discarded_indices = selection.discarded_row_indices
-            if discarded_indices:
-                tq.kv_clear(
-                    partition_id=candidate_batch.partition_id,
-                    keys=[candidate_batch.keys[index] for index in discarded_indices],
-                )
-
-            wave_effective = len(selection.accepted) + len(selection.surplus)
-            planner.observe(wave_groups, wave_effective)
-            self._effective_group_acceptance_rate = planner.acceptance_rate
-            all_wrong_groups += sum(group.outcome is GroupOutcome.ALL_WRONG for group in selection.rejected)
-            all_correct_groups += sum(group.outcome is GroupOutcome.ALL_CORRECT for group in selection.rejected)
-            surplus_groups += len(selection.surplus)
-            if round_state.accepted_groups < target_groups:
-                if self._graceful_stop_requested:
-                    if accepted_keys:
-                        tq.kv_clear(
-                            partition_id=candidate_batch.partition_id,
-                            keys=accepted_keys,
-                        )
-                    snapshot = self._effective_round_snapshot
-                    self.train_dataloader.load_state_dict(snapshot["dataloader"])
-                    self.train_dataloader_it = None
-                    self._candidate_dataset_passes_completed = snapshot["candidate_dataset_passes_completed"]
-                    self._candidate_prompts_in_current_pass = snapshot["candidate_prompts_in_current_pass"]
-                    self._effective_group_acceptance_rate = snapshot["acceptance_rate"]
-                    self._effective_sampling_totals = defaultdict(float, snapshot["metric_totals"])
-                    raise GracefulRoundCancellation
-                wave_groups = planner.plan(round_state.accepted_groups)
-                if wave_groups > 0:
-                    round_state.submit_wave(wave_groups)
-                    self._add_prompts_to_generate(wave_groups)
-
-        expected_trajectories = target_groups * responses_per_prompt
-        if len(accepted_keys) != expected_trajectories:
-            raise RuntimeError(
-                "strict MaxRL effective batch cardinality mismatch: "
-                f"expected {expected_trajectories}, got {len(accepted_keys)}"
-            )
-
-        prefix = "training/effective_sampling"
-        round_metrics = {
-            "candidate_groups": round_state.candidate_groups,
-            "accepted_groups": round_state.accepted_groups,
-            "all_wrong_groups": all_wrong_groups,
-            "all_correct_groups": all_correct_groups,
-            "surplus_groups": surplus_groups,
-            "refill_waves": round_state.refill_waves,
-            "planned_initial_wave_groups": round_state.wave_groups[0],
-            "initial_wave_groups": round_state.completed_wave_groups[0],
-            "refill_candidate_groups": sum(round_state.completed_wave_groups[1:]),
-            "max_wave_groups": max(round_state.completed_wave_groups),
-            "runtime_wave_capacity_groups": planner.max_wave_groups,
-            "generated_trajectories": round_state.candidate_groups * responses_per_prompt,
-        }
-        for key, value in round_metrics.items():
-            self._effective_sampling_totals[key] += value
-        metrics.update({f"{prefix}/{key}": value for key, value in round_metrics.items()})
-        metrics.update(
-            {
-                f"{prefix}/in_flight_groups": round_state.in_flight_groups,
-                f"{prefix}/effective_batch_trajectories": len(accepted_keys),
-                f"{prefix}/acceptance_rate": round_state.accepted_groups / round_state.candidate_groups,
-                f"{prefix}/all_wrong_rate": all_wrong_groups / round_state.candidate_groups,
-                f"{prefix}/all_correct_rate": all_correct_groups / round_state.candidate_groups,
-                f"{prefix}/rollout_amplification": round_state.candidate_groups / target_groups,
-                f"{prefix}/fill_latency_s": time.monotonic() - fill_started,
-                f"{prefix}/candidate_data_id_unique": len(set(candidate_data_ids)),
-                f"{prefix}/accepted_data_id_unique": len(set(accepted_data_ids)),
-            }
-        )
-        metrics.update({f"{prefix}/cumulative_{key}": value for key, value in self._effective_sampling_totals.items()})
-        return (
-            KVBatchMeta(
-                partition_id="train",
-                keys=accepted_keys,
-                tags=accepted_tags,
-            ),
-            off_policy_metrics,
-        )
 
     # ------------------------------ abstract methods ------------------------------
 
@@ -850,15 +634,28 @@ class PPOTrainer(ABC):
         """Called after sampling a batch from replay buffer."""
         return
 
-    def on_batch_prepared(self, batch: KVBatchMeta):
-        """Validate a sampled batch before reward, policy loss, or optimizer work."""
-        return
-
     # ------------------------------ common methods ------------------------------
+
+    def _get_n_gpus_for_throughput(self) -> int:
+        """Return the total number of GPUs used for throughput normalization.
+
+        By default this is the trainer-side GPU count from the resource pool
+        manager.  Modes that use additional dedicated GPUs (e.g. separate-async
+        standalone rollout) should override this to include them.
+        """
+        return self.resource_pool_manager.get_n_gpus()
 
     def _init_tokenizer(self):
         """Initialize tokenizer."""
-        self.tokenizer, self.processor = build_ppo_tokenizer_and_processor(self.config)
+        # Download the checkpoint from HDFS to the local machine.
+        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        local_path = copy_to_local(
+            self.config.actor_rollout_ref.model.path, use_shm=self.config.actor_rollout_ref.model.get("use_shm", False)
+        )
+        trust_remote_code = self.config.data.get("trust_remote_code", False)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # Used for multimodal LLM, could be None
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
@@ -870,79 +667,52 @@ class PPOTrainer(ABC):
             is_train=True,
             max_samples=self.config.data.get("train_max_samples", -1),
         )
-        external_evaluation = self.config.trainer.get("external_evaluation", None)
-        validation_enabled = not external_evaluation and bool(
-            self.config.trainer.get("val_before_train", True)
-            or self.config.trainer.get("val_only", False)
-            or self.config.trainer.test_freq > 0
+        self.val_dataset = create_rl_dataset(
+            self.config.data.val_files,
+            self.config.data,
+            self.tokenizer,
+            self.processor,
+            is_train=False,
+            max_samples=self.config.data.get("val_max_samples", -1),
         )
-        if validation_enabled:
-            self.val_dataset = create_rl_dataset(
-                self.config.data.val_files,
-                self.config.data,
-                self.tokenizer,
-                self.processor,
-                is_train=False,
-                max_samples=self.config.data.get("val_max_samples", -1),
-            )
-        else:
-            self.val_dataset = None
-        # Async drop refills an arbitrary number of dropped prompts, which must divide gen_batch_size,
-        # so force gen_batch_size=1.
-        if self.trainer_mode != "sync" and self.config.trainer.v1.sampler.max_off_policy_strategy == "drop":
+
+        # Exact refill counts require single-prompt dataloader fetches.
+        filter_groups = self.config.algorithm.get("filter_groups", None)
+        dapo_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
+        sync_refill_failed_groups = bool(self.config.trainer.v1.sampler.get("sync_refill_failed_groups", False))
+        requires_exact_refill = self.trainer_mode != "sync" or dapo_enabled or sync_refill_failed_groups
+        if requires_exact_refill:
             user_gen_batch_size = self.config.data.get("gen_batch_size", None)
             if user_gen_batch_size not in (None, 1):
-                logger.warning(
-                    f"data.gen_batch_size={user_gen_batch_size} is overridden to 1: the async 'drop' "
-                    f"off-policy strategy refills an arbitrary number of prompts, which requires gen_batch_size=1."
-                )
+                logger.warning(f"data.gen_batch_size={user_gen_batch_size} is overridden to 1.")
             elif user_gen_batch_size is None:
-                logger.info("data.gen_batch_size defaulted to 1 for the async 'drop' off-policy strategy.")
+                logger.info("data.gen_batch_size defaulted to 1.")
             with open_dict(self.config):
                 self.config.data.gen_batch_size = 1
 
-        # Strict MaxRL consumes every candidate row and coalesces exact candidate
-        # waves itself, including across dataset-pass boundaries.
-        effective_group_sampling = (
-            self.trainer_mode == "sync" and str(self.config.algorithm.adv_estimator).lower() == "maxrl"
-        )
-        gen_batch_size = (
-            1
-            if effective_group_sampling
-            else self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
-        )
-        if effective_group_sampling:
-            with open_dict(self.config):
-                self.config.data.gen_batch_size = 1
+        # use gen_batch_size as the batch size for the dataloader if set, otherwise use train_batch_size
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=gen_batch_size,
             num_workers=self.config.data["dataloader_num_workers"],
-            drop_last=not effective_group_sampling,
+            drop_last=True,
             collate_fn=collate_fn,
             sampler=create_rl_sampler(self.config.data, self.train_dataset),
         )
         self.train_dataloader_it = None
-        self._candidate_dataset_passes_completed = 0
-        self._candidate_prompts_in_current_pass = 0
-        if self.val_dataset is not None:
-            self.val_dataloader = StatefulDataLoader(
-                dataset=self.val_dataset,
-                batch_size=self.config.data.val_batch_size or len(self.val_dataset),
-                num_workers=self.config.data["dataloader_num_workers"],
-                shuffle=self.config.data.get("validation_shuffle", True),
-                drop_last=False,
-                collate_fn=collate_fn,
-            )
-            logger.info(
-                f"train and validate dataloader initialized, train dataset size: "
-                f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
-            )
-        else:
-            self.val_dataloader = None
-            logger.info(
-                f"train dataloader initialized without validation, train dataset size: {len(self.train_dataset)}"
-            )
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=self.config.data.val_batch_size or len(self.val_dataset),
+            num_workers=self.config.data["dataloader_num_workers"],
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+        logger.info(
+            f"train and validate dataloader initialized, train dataset size: "
+            f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
+        )
 
         self.steps_per_epoch = len(self.train_dataset) // self.config.data.train_batch_size
 
@@ -1070,29 +840,8 @@ class PPOTrainer(ABC):
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
-        elif self._effective_group_sampling_enabled():
-            raise RuntimeError("strict MaxRL checkpoint is missing data.pt with sampler RNG/cursor state")
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
-        if self._effective_group_sampling_enabled():
-            effective_state_path = os.path.join(global_step_folder, "effective_sampling.pt")
-            if not os.path.exists(effective_state_path):
-                raise RuntimeError(
-                    "strict MaxRL checkpoint is missing effective_sampling.pt; "
-                    "restart explicitly from a new candidate dataset pass"
-                )
-            try:
-                effective_state = EffectiveSamplingCheckpoint.from_dict(
-                    torch.load(effective_state_path, weights_only=False),
-                    dataset_size=len(self.train_dataset),
-                    expected_optimizer_step=self.global_steps,
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(str(exc)) from exc
-            self._candidate_dataset_passes_completed = effective_state.position.completed_passes
-            self._candidate_prompts_in_current_pass = effective_state.position.cursor
-            self._effective_group_acceptance_rate = effective_state.acceptance_rate
-            self._effective_sampling_totals = defaultdict(float, effective_state.metric_totals)
 
         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
         # deferred to fit() to use the agent_loop_manager.
@@ -1192,19 +941,6 @@ class PPOTrainer(ABC):
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
-        if self._effective_group_sampling_enabled():
-            torch.save(
-                {
-                    "schema_version": 1,
-                    "candidate_dataset_passes_completed": self._candidate_dataset_passes_completed,
-                    "candidate_prompts_in_current_pass": self._candidate_prompts_in_current_pass,
-                    "acceptance_rate": self._effective_group_acceptance_rate,
-                    "policy_version": self.global_steps,
-                    "optimizer_step": self.global_steps,
-                    "metric_totals": dict(self._effective_sampling_totals),
-                },
-                os.path.join(local_global_step_folder, "effective_sampling.pt"),
-            )
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -1228,10 +964,6 @@ class PPOTrainer(ABC):
             f.write(str(self.global_steps))
 
     def _validate(self) -> dict[str, float]:
-        external_evaluation = self.config.trainer.get("external_evaluation", None)
-        if external_evaluation:
-            return self._validate_external(external_evaluation)
-
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -1385,117 +1117,6 @@ class PPOTrainer(ABC):
             )
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
-
-    def _validate_external(self, external_evaluation: DictConfig) -> dict[str, float]:
-        """Evaluate the current actor through the existing rollout HTTP replicas."""
-
-        command = list(external_evaluation.command)
-        if not command or any(not isinstance(argument, str) or not argument for argument in command):
-            raise RuntimeError("trainer.external_evaluation.command must contain command arguments")
-
-        checkpoint_root = Path(self.config.trainer.default_local_dir).resolve()
-        checkpoint_file = checkpoint_root / f"global_step_{self.global_steps}" / "actor" / "rwkv_lm.pth"
-        checkpoint_config = checkpoint_file.parent / "config.json"
-        if not checkpoint_file.is_file() or not checkpoint_config.is_file():
-            self._save_checkpoint()
-        missing_checkpoint_files = [path for path in (checkpoint_file, checkpoint_config) if not path.is_file()]
-        if missing_checkpoint_files:
-            missing_paths = ", ".join(str(path) for path in missing_checkpoint_files)
-            raise RuntimeError(f"external evaluation checkpoint is incomplete: {missing_paths}")
-
-        weight_root_raw = os.environ.get("WEIGHT_PATH")
-        if not weight_root_raw:
-            raise RuntimeError("external evaluation requires WEIGHT_PATH")
-        weight_root = Path(weight_root_raw).resolve()
-        try:
-            relative_weight = checkpoint_file.relative_to(weight_root)
-        except ValueError as error:
-            raise RuntimeError("external evaluation checkpoint must be below WEIGHT_PATH") from error
-
-        result_path = checkpoint_file.parent / "lighteval_metrics.json"
-        result_path.unlink(missing_ok=True)
-        rollout_config = self.config.actor_rollout_ref.rollout
-        max_model_len = rollout_config.get("max_model_len")
-        if not isinstance(max_model_len, int) or isinstance(max_model_len, bool) or max_model_len <= 0:
-            max_model_len = int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length)
-        max_concurrency = rollout_config.get("max_num_seqs")
-        if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool) or max_concurrency <= 0:
-            raise RuntimeError("external evaluation requires rollout.max_num_seqs")
-        wkv_mode = os.environ.get("VLLM_RWKV7_WKV_MODE")
-        if wkv_mode not in {"fp16", "fp32io16"}:
-            raise RuntimeError("external evaluation requires VLLM_RWKV7_WKV_MODE")
-        addresses = list(self.llm_server_manager.get_addresses())
-        if (
-            not addresses
-            or any(
-                not isinstance(address, str) or not address or address != address.strip() or "://" in address
-                for address in addresses
-            )
-            or len(set(addresses)) != len(addresses)
-        ):
-            raise RuntimeError("external evaluation requires unique rollout server addresses")
-        pool_manifest_path = checkpoint_file.parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
-        pool_payload = {
-            "schema_version": 1,
-            "global_step": self.global_steps,
-            "wkv_mode": wkv_mode,
-            "vllm_version": importlib.metadata.version("vllm"),
-            "max_model_len": max_model_len,
-            "replicas": [
-                {
-                    "base_url": f"http://{address}",
-                    "max_concurrency": max_concurrency,
-                }
-                for address in addresses
-            ],
-        }
-        try:
-            descriptor = os.open(
-                pool_manifest_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(pool_payload, stream, sort_keys=True)
-                stream.write("\n")
-            child_env = os.environ.copy()
-            child_env.update(
-                {
-                    "MAXRL_EVAL_WEIGHT": relative_weight.as_posix(),
-                    "MAXRL_EVAL_RESULT_PATH": str(result_path),
-                    "MAXRL_EVAL_STEP": str(self.global_steps),
-                    "HELICOPTER_VLLM_POOL_MANIFEST": str(pool_manifest_path),
-                }
-            )
-            subprocess.run(
-                command,
-                cwd=child_env.get("HELICOPTER_PRODUCT_ROOT"),
-                env=child_env,
-                check=True,
-            )
-        finally:
-            pool_manifest_path.unlink(missing_ok=True)
-
-        if not result_path.is_file():
-            raise RuntimeError(f"external evaluation did not write metrics: {result_path}")
-        with result_path.open(encoding="utf-8") as stream:
-            payload = json.load(stream)
-        metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        if not isinstance(metrics, dict) or not metrics:
-            raise RuntimeError("external evaluation result requires a non-empty metrics object")
-
-        validated: dict[str, float] = {}
-        for name, value in metrics.items():
-            if not isinstance(name, str) or not name or isinstance(value, bool):
-                raise RuntimeError("external evaluation returned an invalid metric")
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(f"external evaluation metric is not numeric: {name}") from error
-            if not math.isfinite(numeric):
-                raise RuntimeError(f"external evaluation metric is not finite: {name}")
-            validated[f"val-core/{name}"] = numeric
-        return validated
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1709,16 +1330,6 @@ class PPOTrainer(ABC):
             batch_dict = next(self.train_dataloader_it)
 
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
-        if self._effective_group_sampling_enabled():
-            position = CandidateDatasetPosition(
-                self._candidate_dataset_passes_completed,
-                self._candidate_prompts_in_current_pass,
-            ).advance(
-                len(batch_dict["raw_prompt"]),
-                dataset_size=len(self.train_dataset),
-            )
-            self._candidate_dataset_passes_completed = position.completed_passes
-            self._candidate_prompts_in_current_pass = position.cursor
         return tu.get_tensordict(batch_dict)
 
     def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
@@ -1740,17 +1351,7 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
-        rollout_metadata = self.get_rollout_metadata()
-        for key, value in rollout_metadata.items():
-            tu.assign_non_tensor_data(batch, key, value)
-
-        prompt_tag = {
-            "is_prompt": True,
-            "status": "pending",
-            "global_steps": self.global_steps,
-            **rollout_metadata,
-        }
-        tags = [dict(prompt_tag) for _ in range(len(batch))]
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(
                 keys=list(batch["uid"]),
@@ -1776,10 +1377,6 @@ class PPOTrainer(ABC):
         """Add one training batch to the AgentLoopManager."""
         batch = self._next_train_batch()
         self._submit_batch_to_rollout(batch)
-
-    def get_rollout_metadata(self) -> dict[str, Any]:
-        """Return immutable metadata attached to every request in the next rollout."""
-        return {}
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
         """Compute the reward score with a colocated reward model."""
@@ -1870,14 +1467,6 @@ class PPOTrainer(ABC):
         else:
             dp_rank_mapping = worker_group._dispatch_info[role]
         dp_size = max(dp_rank_mapping) + 1
-
-        if self._effective_group_sampling_enabled():
-            expected = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-            if len(batch) != expected or any(tag.get("is_padding", False) for tag in batch.tags):
-                raise RuntimeError(
-                    "strict MaxRL requires a complete non-padding effective batch: "
-                    f"expected={expected}, actual={len(batch)}"
-                )
 
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
@@ -2006,8 +1595,6 @@ class PPOTrainer(ABC):
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
-        if self._effective_group_sampling_enabled():
-            fields.append("binary_success")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
@@ -2132,8 +1719,7 @@ class PPOTrainer(ABC):
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
-        batch_tags = batch.tags
-        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch_tags], dtype=bool)
+        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
             "prompts",
             "responses",
@@ -2198,75 +1784,8 @@ class PPOTrainer(ABC):
         )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-        n_gpus = self.resource_pool_manager.get_n_gpus()
+        n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-        actual_samples = int(non_padding_mask.sum())
-        actual_prompt_tokens = int(prompt_length[non_padding_mask].sum().item()) if actual_samples else 0
-        actual_response_tokens = int(response_length[non_padding_mask].sum().item()) if actual_samples else 0
-        actual_total_tokens = actual_prompt_tokens + actual_response_tokens
-        actual_policy_loss_tokens = int(metrics_batch.batch["response_mask"].sum().item()) if actual_samples else 0
-        metrics.update(
-            {
-                "training/actual_samples": actual_samples,
-                "training/actual_prompt_tokens": actual_prompt_tokens,
-                "training/actual_response_tokens": actual_response_tokens,
-                "training/actual_total_tokens": actual_total_tokens,
-                "training/actual_policy_loss_tokens": actual_policy_loss_tokens,
-            }
-        )
-        for stage, seconds, tokens in (
-            ("rollout", timing_raw.get("gen"), actual_response_tokens),
-            ("train", timing_raw.get("update_actor"), actual_policy_loss_tokens),
-            ("full_step", timing_raw.get("step"), actual_total_tokens),
-        ):
-            if seconds is not None and seconds > 0:
-                metrics[f"throughput/{stage}_tokens_per_second"] = tokens / seconds
-                metrics[f"throughput/{stage}_samples_per_second"] = actual_samples / seconds
-                metrics[f"timing/{stage}_seconds"] = seconds
-
-        # ``batch`` above is intentionally replaced by the metric DataProto;
-        # keep using the original TransferQueue tags captured before that
-        # conversion for strict policy identity and rollout-tail metrics.
-        identity_tags = [tag for tag in batch_tags if not tag.get("is_padding", False)]
-        if identity_tags and all(tag.get("policy_version") is not None for tag in identity_tags):
-            policy_versions = {tag["policy_version"] for tag in identity_tags}
-            weight_digests = {tag["weight_digest"] for tag in identity_tags}
-            sampling_digests = {tag["sampling_config_digest"] for tag in identity_tags}
-            runtime_identities = {tag["runtime_identity"] for tag in identity_tags}
-            metrics.update(
-                {
-                    "training/on_policy/policy_version": next(iter(policy_versions)),
-                    "training/on_policy/version_count": len(policy_versions),
-                    "training/on_policy/weight_digest_count": len(weight_digests),
-                    "training/on_policy/sampling_config_count": len(sampling_digests),
-                    "training/on_policy/runtime_identity_count": len(runtime_identities),
-                }
-            )
-        generation_seconds = [float(tag.get("generation_seconds", 0.0)) for tag in identity_tags]
-        if generation_seconds:
-            group_completion: dict[str, float] = {}
-            for tag, duration in zip(identity_tags, generation_seconds, strict=True):
-                group_id = str(tag.get("group_id"))
-                group_completion[group_id] = max(group_completion.get(group_id, 0.0), duration)
-            completion_values = sorted(group_completion.values())
-            p95_index = max(0, math.ceil(len(completion_values) * 0.95) - 1)
-            preemptions = [int(tag.get("num_preempted", -1)) for tag in identity_tags]
-            known_preemptions = [value for value in preemptions if value >= 0]
-            metrics.update(
-                {
-                    "training/rollout_request_generation_seconds/min": min(generation_seconds),
-                    "training/rollout_request_generation_seconds/max": max(generation_seconds),
-                    "training/rollout_group_completion_seconds/min": min(completion_values),
-                    "training/rollout_group_completion_seconds/p95": completion_values[p95_index],
-                    "training/rollout_group_completion_seconds/max": max(completion_values),
-                    "training/rollout_group_tail_seconds": max(completion_values) - min(completion_values),
-                    "training/rollout_preemptions": sum(known_preemptions) if known_preemptions else -1,
-                    "training/rollout_train_overlap_seconds": 0.0,
-                    "training/rollout_effective_concurrency": (
-                        sum(generation_seconds) / timing_raw["gen"] if timing_raw.get("gen", 0) > 0 else 0.0
-                    ),
-                }
-            )
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 

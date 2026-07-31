@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,36 +14,26 @@
 
 import asyncio
 
-import torch
-from tensordict import TensorDict
-
-from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
+from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
 
 
-class _AsyncRemoteMethod:
-    def __init__(self, worker_id: int, completions: list[tuple[int, int]]) -> None:
-        self.worker_id = worker_id
-        self.completions = completions
+def test_settle_session_tasks_waits_for_siblings_after_failure():
+    async def run():
+        settled = asyncio.Event()
 
-    def remote(self, chunk: TensorDict):
-        async def complete() -> None:
-            await asyncio.sleep(0)
-            self.completions.append((self.worker_id, len(chunk)))
+        async def fail():
+            raise RuntimeError("session failed")
 
-        return complete()
+        async def finish_later():
+            await asyncio.sleep(0.01)
+            settled.set()
 
+        tasks = [asyncio.create_task(fail()), asyncio.create_task(finish_later())]
+        errors = await _settle_session_tasks(tasks)
 
-class _Worker:
-    def __init__(self, worker_id: int, completions: list[tuple[int, int]]) -> None:
-        self.generate_sequences = _AsyncRemoteMethod(worker_id, completions)
+        assert settled.is_set()
+        assert all(task.done() for task in tasks)
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
 
-
-def test_tq_dispatch_awaits_worker_acknowledgements_without_ray_get():
-    completions: list[tuple[int, int]] = []
-    manager = AgentLoopManagerTQ.__new__(AgentLoopManagerTQ)
-    manager.agent_loop_workers = [_Worker(0, completions), _Worker(1, completions)]
-    prompts = TensorDict({"input_ids": torch.arange(8).reshape(4, 2)}, batch_size=[4])
-
-    manager.generate_sequences(prompts)
-
-    assert sorted(completions) == [(0, 2), (1, 2)]
+    asyncio.run(run())

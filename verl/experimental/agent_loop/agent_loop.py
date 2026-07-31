@@ -76,59 +76,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
-RAPID_PENALTY_DECAY_DEFAULT = 0.996
-
-
-def build_agent_loop_sampling_params(config: Any, *, validate: bool) -> dict[str, Any]:
-    """Build sampling parameters for training or validation agent loops."""
-
-    def sampling_value(sampling_config: Any, key: str, default: Any) -> Any:
-        if hasattr(sampling_config, "get"):
-            return sampling_config.get(key, default)
-        return getattr(sampling_config, key, default)
-
-    sampling_config = config.val_kwargs if validate else config
-    logprobs = sampling_value(sampling_config, "logprobs", None) if validate else config.calculate_log_probs
-    sampling_params = dict(
-        temperature=sampling_config.temperature,
-        top_p=sampling_config.top_p,
-        top_k=sampling_config.top_k,
-        presence_penalty=sampling_value(sampling_config, "presence_penalty", 0.0),
-        frequency_penalty=sampling_value(sampling_config, "frequency_penalty", 0.0),
-        repetition_penalty=sampling_value(sampling_config, "repetition_penalty", 1.0),
-        penalty_decay=sampling_value(sampling_config, "penalty_decay", RAPID_PENALTY_DECAY_DEFAULT),
-        logprobs=logprobs,
-    )
-    if validate:
-        # Validation matches the offline evaluator, which does not enable the
-        # rollout-only repetition detector.
-        sampling_params["repetition_detection"] = None
-    return sampling_params
-
-
-def _right_pad_prompt_batch(
-    prompt_rows: list[torch.Tensor],
-    *,
-    pad_token_id: int,
-    max_length: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Right-pad variable prompt rows and mask padding out of attention."""
-    if not prompt_rows:
-        return (
-            torch.empty((0, 0), dtype=torch.long),
-            torch.empty((0, 0), dtype=torch.long),
-        )
-    flat_rows = [row.reshape(-1).to(dtype=torch.long) for row in prompt_rows]
-    max_width = max_length if max_length is not None else max(row.numel() for row in flat_rows)
-    if any(row.numel() > max_width for row in flat_rows):
-        raise ValueError(f"Prompt row exceeds padded prompt width {max_width}")
-    prompt_ids = torch.full((len(flat_rows), max_width), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((len(flat_rows), max_width), dtype=torch.long)
-    for index, row in enumerate(flat_rows):
-        width = row.numel()
-        prompt_ids[index, :width] = row
-        attention_mask[index, :width] = 1
-    return prompt_ids, attention_mask
 
 
 class AgentLoopMetrics(BaseModel):
@@ -201,12 +148,12 @@ class AgentLoopOutput(BaseModel):
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
-    """Internal agent loop output before final batch-level prompt padding."""
+    """Internal agent loop output with padded sequences."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     prompt_ids: torch.Tensor
-    """Prompt token ids with the single leading RWKV context token."""
+    """Padded prompt token ids."""
     response_ids: torch.Tensor
     """Padded response token ids."""
     input_ids: torch.Tensor
@@ -276,11 +223,7 @@ class AgentLoopBase(ABC):
         self.processor = processor
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
-        self.apply_chat_template_kwargs = dict(self.data_config.get("apply_chat_template_kwargs", {}) or {})
-        self.val_apply_chat_template_kwargs = dict(self.apply_chat_template_kwargs)
-        self.val_apply_chat_template_kwargs.update(
-            dict(self.data_config.get("val_apply_chat_template_kwargs", {}) or {})
-        )
+        self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
         self.continuous_token_builder = None
         self.enable_continuous_token = False
@@ -300,7 +243,6 @@ class AgentLoopBase(ABC):
             # Continuous Token re-renders non-assistant turns from the full message list, so it does
             # not need the incremental turn separator.
             self.turn_separator = []
-            self.val_system_prompt = None
         else:
             if continuous_token_config.enable and self.processor is not None:
                 logger.warning(
@@ -311,7 +253,6 @@ class AgentLoopBase(ABC):
             # Turn separator dropped when the model stops at the assistant close token; restored at
             # turn boundaries in ``ToolAgentLoop._handle_processing_tools_state``.
             self.turn_separator = initialize_turn_separator(processing_class, **self.apply_chat_template_kwargs)
-            self.val_system_prompt = initialize_system_prompt(processing_class, **self.val_apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
@@ -419,10 +360,12 @@ class AgentLoopBase(ABC):
     def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
-            raise ValueError(
-                f"Templated prompt produced {len(prompt_ids)} tokens, exceeding the "
-                f"model context limit={prompt_length}; prompts are never silently truncated."
+            logger.warning(
+                "Prompt of %d tokens exceeds rollout.prompt_length=%d; left-truncating.",
+                len(prompt_ids),
+                prompt_length,
             )
+            return prompt_ids[-prompt_length:]
         return prompt_ids
 
     async def apply_chat_template(
@@ -434,7 +377,6 @@ class AgentLoopBase(ABC):
         audios: list[Any] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         remove_system_prompt: bool = False,
-        validate: bool = False,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
 
@@ -448,7 +390,6 @@ class AgentLoopBase(ABC):
         Returns:
             list[int]: Prompt token ids.
         """
-        apply_kwargs = dict(self.val_apply_chat_template_kwargs if validate else self.apply_chat_template_kwargs)
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
@@ -458,7 +399,7 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=False,
-                    **apply_kwargs,
+                    **self.apply_chat_template_kwargs,
                 ),
             )
 
@@ -482,19 +423,19 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **apply_kwargs,
+                    **self.apply_chat_template_kwargs,
                 ),
             )
             prompt_ids = normalize_token_ids(tokenized_prompt)
 
         if remove_system_prompt:
-            system_prompt = self.val_system_prompt if validate else self.system_prompt
-            prompt_ids = prompt_ids[len(system_prompt) :]
+            prompt_ids = prompt_ids[len(self.system_prompt) :]
 
-        # ``rollout.prompt_length`` is the model context envelope. Each request
-        # independently receives the remaining context as its response budget.
-        # Multimodal prompts cannot be sliced because placeholder tokens must
-        # remain aligned 1:1 with ``multi_modal_inputs`` features.
+        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
+        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
+        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
+        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
+        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
             if images or videos or audios:
@@ -606,6 +547,10 @@ class AgentLoopWorker:
             self.model_config.tokenizer.chat_template = self.model_config.custom_chat_template
 
         trace_config = self.rollout_config.trace
+        if trace_config.get("token2text", False):
+            # rollout_trace_op runs on the LLM client, so provide the tokenizer
+            # needed to decode each generate call's prompt and response tokens.
+            self.llm_client.tokenizer = self.tokenizer
         RolloutTraceConfig.init(
             self.rollout_config.trace.project_name,
             self.rollout_config.trace.experiment_name,
@@ -646,12 +591,24 @@ class AgentLoopWorker:
         """
         config = self.rollout_config
         validate = batch.meta_info.get("validate", False)
-        sampling_params = build_agent_loop_sampling_params(config, validate=validate)
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
             params["top_k"] = -1
             params["temperature"] = 0
+
+        # override sampling params for validation
+        if validate:
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["top_k"] = config.val_kwargs.top_k
+            sampling_params["temperature"] = config.val_kwargs.temperature
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -737,8 +694,7 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            run_kwargs = {**kwargs, "__validate__": trajectory["validate"]}
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -778,17 +734,15 @@ class AgentLoopWorker:
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
-        # NOTE: the legacy vLLM SPMD rollout left-padded prompt ids to a fixed
-        # prompt_length here. For RWKV that turns EOS token 0 into hundreds of
-        # real-looking prefix tokens, so the sample keeps one attended leading
-        # 0 and the final batch right-pads to a concat-safe fixed width.
-        # prompt_ids: one leading 0 plus prompt tokens (e.g., [0,1,2,3,4])
+        # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
+        # deprecated vLLM SPMD rollout implementation.
+        # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
         # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
         # input_ids: concatenation of prompt + response
         # Mask:
         # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
-        # - prompt_attention_mask: 1s for the leading 0 and prompt tokens
-        #   e.g., [1,1,1,1,1]
+        # - prompt_attention_mask: 0s for padding, 1s for tokens
+        #   e.g., [0,0,0,0,1,1,1,1]
         # - response_attention_mask: 0s for padding, 1s for tokens
         #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
         # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
@@ -798,18 +752,13 @@ class AgentLoopWorker:
         # - position_ids: sequential positions for tokens, starting at 0
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
-        prompt_token_ids = list(output.prompt_ids)
-        if self.rollout_config.get("rwkv_prompt_template") is not None:
-            from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
-
-            prompt_token_ids = ensure_rwkv_prompt_bos_token(
-                prompt_token_ids,
-                max_length=self.rollout_config.prompt_length,
-            )
-        prompt_output = {
-            "input_ids": torch.tensor([prompt_token_ids], dtype=torch.long),
-            "attention_mask": torch.ones((1, len(prompt_token_ids)), dtype=torch.long),
-        }
+        # TODO(wuxibin): remove padding and use tensordict.
+        prompt_output = self._pad_token_ids(
+            output.prompt_ids,
+            max_length=self.rollout_config.prompt_length,
+            padding_side="left",
+            return_attention_mask=True,
+        )
 
         response_output = self._pad_token_ids(
             output.response_ids,
@@ -849,7 +798,7 @@ class AgentLoopWorker:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
-            # Account for the extra leading RWKV context token inserted for training.
+            # Calculate start position: left padding means original prompt starts at the end
             start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
@@ -875,7 +824,7 @@ class AgentLoopWorker:
         await self._compute_score([output], kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
-            prompt_ids=prompt_token_ids,
+            prompt_ids=output.prompt_ids,
             response_ids=output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
@@ -893,7 +842,7 @@ class AgentLoopWorker:
                 teacher_logprobs,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
-                prompt_length=len(prompt_token_ids),
+                prompt_length=len(output.prompt_ids),
                 response_length=len(output.response_ids),
                 pad_token_id=self.tokenizer.pad_token_id,
             )
@@ -1083,57 +1032,6 @@ class AgentLoopWorker:
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 
-    def _compute_batched_position_ids(
-        self,
-        inputs: list[_InternalAgentLoopOutput],
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.processor is None or not hasattr(self.processor, "get_rope_index"):
-            return compute_position_id_with_mask(attention_mask)
-
-        position_ids = []
-        for index, input_item in enumerate(inputs):
-            multi_modal_inputs = dict(input_item.multi_modal_inputs or {})
-            position_ids.append(
-                self._compute_position_ids(
-                    input_ids[index : index + 1],
-                    attention_mask[index : index + 1],
-                    multi_modal_inputs,
-                    input_item.mm_processor_kwargs
-                    if input_item.mm_processor_kwargs is not None
-                    else self._get_mm_processor_kwargs(
-                        input_item.multi_modal_data.get("audios") if input_item.multi_modal_data else None
-                    ),
-                )
-            )
-        return torch.cat(position_ids, dim=0)
-
-    def _pad_full_sequence_optional(
-        self,
-        rows: list[torch.Tensor],
-        inputs: list[_InternalAgentLoopOutput],
-        prompt_width: int,
-        *,
-        pad_value: int | float,
-    ) -> torch.Tensor:
-        response_width = inputs[0].response_ids.shape[1]
-        first_row = rows[0]
-        trailing_shape = tuple(first_row.shape[2:])
-        padded = torch.full(
-            (len(rows), prompt_width + response_width, *trailing_shape),
-            pad_value,
-            dtype=first_row.dtype,
-        )
-        for index, (row, input_item) in enumerate(zip(rows, inputs, strict=True)):
-            flat_row = row.squeeze(0)
-            prompt_length = input_item.prompt_ids.shape[1]
-            padded[index, :prompt_length] = flat_row[:prompt_length]
-            padded[index, prompt_width : prompt_width + response_width] = flat_row[
-                prompt_length : prompt_length + response_width
-            ]
-        return padded
-
     def _postprocess(
         self,
         inputs: list[_InternalAgentLoopOutput],
@@ -1141,43 +1039,21 @@ class AgentLoopWorker:
         validate: bool = False,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        prompt_ids, prompt_attention_mask = _right_pad_prompt_batch(
-            [input.prompt_ids for input in inputs],
-            pad_token_id=0,
-            max_length=self.rollout_config.prompt_length,
-        )
+        # Convert lists back to tensors and stack them to create a batch.
+        prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
         response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
-        response_attention_mask = torch.cat(
-            [input.attention_mask[:, input.prompt_ids.shape[1] :] for input in inputs],
-            dim=0,
-        )
-        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
-        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-        position_ids = self._compute_batched_position_ids(inputs, input_ids, attention_mask)
+        attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
+        input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
+        position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
-            optional_outputs["routed_experts"] = self._pad_full_sequence_optional(
-                [input.routed_experts for input in inputs],
-                inputs,
-                prompt_ids.shape[1],
-                pad_value=0,
-            )
+            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
-            optional_outputs["teacher_logprobs"] = self._pad_full_sequence_optional(
-                [input.teacher_logprobs for input in inputs],
-                inputs,
-                prompt_ids.shape[1],
-                pad_value=0.0,
-            )
-            optional_outputs["teacher_ids"] = self._pad_full_sequence_optional(
-                [input.teacher_ids for input in inputs],
-                inputs,
-                prompt_ids.shape[1],
-                pad_value=self.tokenizer.pad_token_id,
-            )
+            optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+            optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1208,13 +1084,9 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = []
-        for info in reward_extra_infos:
-            for key in info:
-                if key not in reward_extra_keys:
-                    reward_extra_keys.append(key)
+        reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

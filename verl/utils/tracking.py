@@ -19,7 +19,6 @@ import dataclasses
 import json
 import logging
 import os
-import time
 from contextlib import contextmanager
 from enum import Enum
 from functools import partial
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import orjson
+from packaging.version import Version
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,6 @@ class Tracking:
     ]
 
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
-        self._finished = False
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -71,6 +70,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -192,27 +192,32 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def finish(self):
-        """Flush every tracking backend exactly once."""
-        if self._finished:
+    def finish(self, exit_code: int = 0):
+        """Flush and finalize every configured backend exactly once."""
+        if getattr(self, "_finished", False):
             return
         self._finished = True
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
-        if "rl_insight" in self.logger:
-            self.logger["rl_insight"].finish()
+        loggers = getattr(self, "logger", {})
+
+        if "wandb" in loggers:
+            loggers["wandb"].finish(exit_code=exit_code)
+        if "swanlab" in loggers:
+            loggers["swanlab"].finish()
+        if "vemlp_wandb" in loggers:
+            loggers["vemlp_wandb"].finish(exit_code=exit_code)
+        if "tensorboard" in loggers:
+            loggers["tensorboard"].finish()
+        if "clearml" in loggers:
+            loggers["clearml"].finish()
+        if "trackio" in loggers:
+            loggers["trackio"].finish()
+        if "file" in loggers:
+            loggers["file"].finish()
+        if "rl_insight" in loggers:
+            loggers["rl_insight"].finish()
+
+    def __del__(self):
+        self.finish()
 
 
 class RLInsightLogger:
@@ -344,12 +349,6 @@ class RLInsightLogger:
         except Exception:
             logger.exception("[rl-insight] Failed to register metrics endpoint")
 
-    def __del__(self):
-        try:
-            self.finish()
-        except Exception:
-            logger.exception("Failed to finish tracking backends during object cleanup")
-
 
 class ClearMLLogger:
     def __init__(self, project_name: str, experiment_name: str, config):
@@ -430,14 +429,9 @@ class FileLogger:
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
         print(f"Creating file logger at {os.path.abspath(self.filepath)}")
         self.fp = open(self.filepath, "wb", buffering=0)
-        self.started_monotonic = time.monotonic()
 
     def log(self, data, step):
-        data = {
-            "step": step,
-            "elapsed_seconds": time.monotonic() - self.started_monotonic,
-            "data": data,
-        }
+        data = {"step": step, "data": data}
         self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
 
     def finish(self):
@@ -743,3 +737,53 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+
+@dataclasses.dataclass
+class DapoFilteredRewardTableLogger:
+    """Wandb table of DAPO-filtered (no-signal) group counts per reward value.
+
+    Each training step adds one row containing compact ``reward:count`` pairs. Wandb 0.20+
+    uploads rows incrementally; older versions rebuild the full table for compatibility.
+
+    Intentionally wandb-only: this "value distribution over time" view is a table, which other
+    tracking backends do not render usefully. Non-wandb backends are silently skipped.
+    """
+
+    project_name: str = None
+    experiment_name: str = None
+
+    def log(self, loggers, reward_counts: dict, step: int):
+        """reward_counts maps metric value -> count for this step (already merged across mini-batches)."""
+        if "wandb" in loggers:
+            self._log_to_wandb(reward_counts, step)
+
+    def _log_to_wandb(self, reward_counts: dict, step: int):
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        row = {float(value): int(count) for value, count in reward_counts.items()}
+        counts_text = ", ".join(f"{value:g}:{row[value]}" for value in sorted(row))
+        columns = ["step", "reward_counts"]
+
+        if not hasattr(self, "_use_incremental_table"):
+            self._use_incremental_table = Version(wandb.__version__) >= Version("0.20.0")
+            if self._use_incremental_table:
+                self._table = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+            else:
+                self._rows = []
+                logger.warning(
+                    "wandb<0.20.0 does not support incremental tables; "
+                    "the DAPO filtered-reward table will re-upload its full history each step."
+                )
+
+        if self._use_incremental_table:
+            self._table.add_data(step, counts_text)
+            table = self._table
+        else:
+            self._rows.append([step, counts_text])
+            table = wandb.Table(columns=columns, data=list(self._rows))
+
+        wandb.log({"training/filter_groups/filtered_reward_counts": table}, step=step)

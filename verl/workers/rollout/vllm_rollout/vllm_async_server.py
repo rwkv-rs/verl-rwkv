@@ -13,13 +13,11 @@
 # limitations under the License.
 import argparse
 import asyncio
-import importlib.metadata
 import inspect
 import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -31,32 +29,19 @@ from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
+from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
-from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
-from vllm.tokenizers.rwkv_defaults import (
-    apply_rwkv_sampling_stops,
-    ensure_rwkv_prompt_bos_token,
-    is_rwkv_model_config,
-    resolve_rwkv_prompt_template,
-)
+from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
-from verl.trainer.ppo.v1.policy_identity import canonical_digest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
-from verl.utils.ngram_repetition import (
-    ConsecutiveRepetitionDetector,
-    consume_token_stream,
-    consume_until_repetition,
-    repetition_extra_fields,
-    vllm_repetition_detection_config,
-)
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
-from verl.utils.request_budget import resolve_request_max_tokens
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
@@ -75,128 +60,18 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     build_mtp_speculative_config,
-    build_vllm_prefix_cache_reset_kwargs,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
-    reset_vllm_weight_update_caches,
 )
 
-_VLLM_VERSION = version.parse(importlib.metadata.version("vllm"))
-_RESET_PREFIX_CACHE_KWARGS = build_vllm_prefix_cache_reset_kwargs(_VLLM_VERSION)
+_VLLM_VERSION = version.parse(vllm.__version__)
 
-
-def effective_sampling_digest(sampling_params: SamplingParams) -> str:
-    """Digest normalized behavior-policy sampling fields sent to the engine.
-
-    ``max_tokens`` is a deterministic capacity bound derived independently
-    from each request's tokenized prompt. It is not a sampling-policy choice
-    and therefore must not make otherwise identical prompt groups look like
-    mixed behavior policies.
-    """
-
-    fields = getattr(sampling_params, "__struct_fields__", ())
-    if not fields:
-        raise RuntimeError("vLLM SamplingParams does not expose its normalized fields")
-    return canonical_digest({field: getattr(sampling_params, field) for field in fields if field != "max_tokens"})
-
-
-if _VLLM_VERSION > version.parse("0.11.0"):
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-    if _VLLM_VERSION == version.parse("0.12.0"):
-        from vllm.entrypoints.harmony_utils import get_encoding
-
-    elif _VLLM_VERSION >= version.parse("0.13.0"):
-        from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-
-    else:
-        get_encoding = None
-
-    if get_encoding is not None and os.getenv("VERL_USE_GPT_OSS", "0") == "1":
-        get_encoding()
-else:
-    from vllm.utils import FlexibleArgumentParser
+if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
+    get_encoding()
 
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
-
-
-RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
-
-
-def _rollout_output_kind(*, needs_generation_logprobs: bool, needs_prompt_logprobs: bool) -> RequestOutputKind:
-    if needs_generation_logprobs or needs_prompt_logprobs:
-        return RequestOutputKind.CUMULATIVE
-    return RequestOutputKind.DELTA
-
-
-def _apply_rwkv_prompt_template_stops(
-    sampling_params: dict[str, Any],
-    model_config: Any,
-    *,
-    prompt_template: str | None = None,
-) -> None:
-    if not is_rwkv_model_config(model_config):
-        return
-    template_spec = resolve_rwkv_prompt_template(prompt_template=prompt_template)
-    apply_rwkv_sampling_stops(
-        sampling_params,
-        model_config,
-        prompt_template=template_spec,
-    )
-
-
-def _config_get(config: Any, key: str, default: Any = None) -> Any:
-    if hasattr(config, "get"):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-@dataclass
-class _RWKVRolloutModelConfig:
-    local_path: str
-    hf_config: Any
-    trust_remote_code: bool = False
-    tokenizer: Any = None
-    processor: Any = None
-    lora: dict[str, Any] = field(default_factory=dict)
-    lora_rank: int = 0
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
-
-
-def _is_rwkv_native_model_config(model_config: Any) -> bool:
-    return _config_get(model_config, "_target_") == RWKV_NATIVE_MODEL_TARGET
-
-
-def _init_rwkv_rollout_model_config(model_config: Any) -> _RWKVRolloutModelConfig:
-    from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
-
-    from verl.models.rwkv import build_rwkv_tokenizer
-    from verl.utils.fs import copy_to_local
-
-    local_path = copy_to_local(_config_get(model_config, "path"), use_shm=_config_get(model_config, "use_shm", False))
-    hf_config = build_rwkv7_config_from_pth(local_path)
-    if hf_config is None:
-        raise ValueError(
-            "RWKV native vLLM rollout requires a BlinkDL RWKV7 raw .pth checkpoint path "
-            f"that vLLM can parse, got: {local_path}"
-        )
-
-    tokenizer = None
-    if _config_get(model_config, "load_tokenizer", True):
-        tokenizer = build_rwkv_tokenizer(tokenizer_path=_config_get(model_config, "tokenizer_path"), pickleable=True)
-
-    return _RWKVRolloutModelConfig(
-        local_path=local_path,
-        hf_config=hf_config,
-        tokenizer=tokenizer,
-        processor=None,
-        lora=_config_get(model_config, "lora", {}) or {},
-        lora_rank=0,
-    )
 
 
 class vLLMHttpServer:
@@ -277,14 +152,9 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
-        self.cuda_visible_devices = cuda_visible_devices
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
-        self.behavior_policy_identity = None
-        self.weight_update_state = "uninitialized"
-        self.weight_update_failure = None
         self._warned_missing_spec_decode_stats = False
-        self._runtime_capacity: dict[str, Any] | None = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -332,24 +202,6 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
-
-    def get_runtime_metadata(self) -> dict[str, Any]:
-        context = ray.get_runtime_context()
-        return {
-            "replica_rank": self.replica_rank,
-            "node_rank": self.node_rank,
-            "node_id": str(context.get_node_id()),
-            "actor_id": str(context.get_actor_id()),
-            "actor_name": context.get_actor_name(),
-            "pid": os.getpid(),
-            "cuda_visible_devices": self.cuda_visible_devices.split(","),
-            "http_address": self._server_address,
-            "http_port": self._server_port,
-            "master_port": self._master_port,
-            "dp_rpc_port": self._dp_rpc_port,
-            "dp_master_port": self._dp_master_port,
-            "capacity": self._runtime_capacity,
-        }
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -399,8 +251,6 @@ class vLLMHttpServer:
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
-        if self.config.cudagraph_capture_sizes and _VLLM_VERSION <= version.parse("0.11.0"):
-            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
@@ -431,7 +281,7 @@ class vLLMHttpServer:
                 dcp_size,
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
-        if self.config.cudagraph_capture_sizes and _VLLM_VERSION > version.parse("0.11.0"):
+        if self.config.cudagraph_capture_sizes:
             compilation_config["cudagraph_capture_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
@@ -466,9 +316,7 @@ class vLLMHttpServer:
         profiler_args = build_vllm_profiler_args(
             self.profiler_controller.config, self.profiler_controller.tool_config, self.replica_rank
         )
-        if _VLLM_VERSION >= version.parse("0.13.0"):
-            # vLLM >= 0.13.0 supports profiler config via CLI args; env vars still work but will be deprecated
-            args.update(profiler_args)
+        args.update(profiler_args)
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
@@ -550,7 +398,7 @@ class vLLMHttpServer:
             if _VLLM_VERSION < version.parse("0.22.0"):
                 raise RuntimeError(
                     "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
-                    f"(installed: {_VLLM_VERSION}). Upgrade vLLM (e.g. `pip install -U "
+                    f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
             args.update({"enable_return_routed_experts": True})
@@ -588,15 +436,6 @@ class vLLMHttpServer:
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
-        tokenizer_mode = self.config.engine_kwargs.get("vllm", {}).get("tokenizer_mode")
-        self._runtime_capacity = {
-            "capacity_source": "vllm.scheduler_config",
-            "capacity_mode": "recurrent-state-no-kv-cache" if tokenizer_mode == "rwkv" else "kv-cache",
-            "kv_cache_applicable": tokenizer_mode != "rwkv",
-            "max_num_seqs": int(vllm_config.scheduler_config.max_num_seqs),
-            "max_num_batched_tokens": int(vllm_config.scheduler_config.max_num_batched_tokens),
-            "gpu_memory_utilization": float(vllm_config.cache_config.gpu_memory_utilization),
-        }
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -680,18 +519,12 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
-        expected_policy_identity: Optional[dict[str, Any]] = None,
-        expected_sampling_digest: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
-        if self.weight_update_state != "active":
-            raise RuntimeError(
-                f"rollout server cannot generate while weight publication state is {self.weight_update_state!r}"
-            )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -702,57 +535,46 @@ class vLLMHttpServer:
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
-                expected_policy_identity=expected_policy_identity,
-                expected_sampling_digest=expected_sampling_digest,
             )
+
         prompt_ids = normalize_token_ids(prompt_ids)
-        if is_rwkv_model_config(self.model_config):
-            prompt_ids = ensure_rwkv_prompt_bos_token(prompt_ids)
-        requested_sampling_digest = canonical_digest(sampling_params)
-        if expected_sampling_digest is not None and requested_sampling_digest != expected_sampling_digest:
-            raise RuntimeError(
-                "rollout request sampling digest changed before server execution: "
-                f"expected={expected_sampling_digest} actual={requested_sampling_digest}"
+
+        # Calculate the maximum possible new tokens based on available context space
+        # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
+        # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
+        # least one token of headroom to be able to generate at all.
+        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+        if max_possible_tokens < 1:
+            raise ValueError(
+                f"Prompt length ({len(prompt_ids)}) leaves no room to generate within the "
+                f"model's maximum context length ({self.config.max_model_len}); need at least "
+                f"1 token of headroom."
             )
 
-        if expected_policy_identity is not None:
-            if self.behavior_policy_identity is None:
-                raise RuntimeError("rollout server has no published behavior-policy identity")
-            actual = {key: self.behavior_policy_identity.get(key) for key in expected_policy_identity}
-            if actual != expected_policy_identity:
-                raise RuntimeError(
-                    "rollout request behavior-policy identity does not match the loaded server policy: "
-                    f"expected={expected_policy_identity} actual={actual}"
-                )
-
-        # Read an optional caller cap, then compute the real response budget
-        # independently from this request's tokenized prompt.
+        # Determine max_tokens from sampling_params or use configured response_length as default
         if "max_tokens" in sampling_params:
-            requested_max_tokens = sampling_params.pop("max_tokens")
+            max_tokens = sampling_params.pop("max_tokens")
         elif "max_new_tokens" in sampling_params:
             # support sglang-style 'max_new_tokens' param
-            requested_max_tokens = sampling_params.pop("max_new_tokens")
+            max_tokens = sampling_params.pop("max_new_tokens")
         else:
-            requested_max_tokens = None
-        max_tokens = resolve_request_max_tokens(
-            max_model_len=self.config.max_model_len,
-            prompt_length=len(prompt_ids),
-            requested_max_tokens=requested_max_tokens,
+            # Default to a calculation that considers configured lengths
+            # Cap max_tokens by response_length to ensure tensor alignment,
+            # and by remaining budget to prevent OOM in multi-turn rollouts.
+            max_tokens = min(
+                self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
+            )
+
+        # Clamp max_tokens to the valid range [1, max_possible_tokens]. The lower bound
+        # is 1 because vLLM v0.20+ raises VLLMValidationError when max_tokens < 1.
+        max_tokens = max(1, min(max_tokens, max_possible_tokens))
+
+        assert 1 <= max_tokens <= max_possible_tokens, (
+            f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        generation_logprobs_requested = bool(sampling_params.pop("logprobs", False))
-        prompt_logprobs_requested = sampling_params.get("prompt_logprobs", None) is not None
-        sampling_params["logprobs"] = 0 if generation_logprobs_requested else None
+        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
-        request_prompt_template = sampling_params.pop(
-            "rwkv_prompt_template",
-            self.config.get("rwkv_prompt_template"),
-        )
-        _apply_rwkv_prompt_template_stops(
-            sampling_params,
-            self.model_config,
-            prompt_template=request_prompt_template,
-        )
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
@@ -762,18 +584,7 @@ class vLLMHttpServer:
             extra_args["kv_transfer_params"] = kv_transfer_params
             sampling_params["extra_args"] = extra_args
 
-        sampling_params["output_kind"] = _rollout_output_kind(
-            needs_generation_logprobs=generation_logprobs_requested,
-            needs_prompt_logprobs=prompt_logprobs_requested,
-        )
-        sampling_params.setdefault(
-            "repetition_detection",
-            RepetitionDetectionParams(**vllm_repetition_detection_config()),
-        )
-        detect_rollout_repetition = sampling_params.get("repetition_detection") is not None
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        request_sampling_digest = effective_sampling_digest(sampling_params)
-        stream_is_cumulative = sampling_params.output_kind == RequestOutputKind.CUMULATIVE
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -810,35 +621,13 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-            async def abort_current_request() -> dict[str, Any]:
-                return await self.abort_request(request_id, reset_prefix_cache=False)
-
-            repetition_detector = None
-            if detect_rollout_repetition:
-                repetition_detector = ConsecutiveRepetitionDetector()
-                final_res, repetition_truncation_length, observed_token_ids = await consume_until_repetition(
-                    generator,
-                    get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],
-                    abort_request=abort_current_request,
-                    detector=repetition_detector,
-                    cumulative=stream_is_cumulative,
-                )
-            else:
-                final_res, observed_token_ids = await consume_token_stream(
-                    generator,
-                    get_token_ids=lambda output: output.outputs[0].token_ids if output.outputs else [],
-                    cumulative=stream_is_cumulative,
-                )
-                repetition_truncation_length = None
+            # Get final response
+            final_res: Optional[RequestOutput] = None
+            async for output in generator:
+                final_res = output
             assert final_res is not None
 
-        extra_fields = {
-            "global_steps": self.global_steps,
-            "requested_sampling_digest": requested_sampling_digest,
-            "request_sampling_digest": request_sampling_digest,
-        }
-        if self.behavior_policy_identity is not None:
-            extra_fields.update(self.behavior_policy_identity)
+        extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -856,71 +645,21 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
-        finish_reason = final_res.outputs[0].finish_reason
-        stop_reason_raw = final_res.outputs[0].stop_reason
-        extra_fields["finish_reason"] = finish_reason
-        extra_fields["backend_stop_reason"] = stop_reason_raw
-        engine_repetition_truncated = finish_reason == "repetition" or stop_reason_raw == "repetition_detected"
-        original_response_length = (
-            len(observed_token_ids) if observed_token_ids else len(final_res.outputs[0].token_ids)
-        )
-        if repetition_truncation_length is not None:
-            assert repetition_detector is not None
-            token_ids = observed_token_ids[:repetition_truncation_length]
-            logger.info(
-                "Truncated request %s after repetition/anomaly detection: "
-                "reason=%s observed_length=%s truncation_length=%s",
-                request_id,
-                repetition_detector.matched_reason,
-                original_response_length,
-                repetition_truncation_length,
-            )
-            extra_fields.update(
-                repetition_extra_fields(
-                    truncated=True,
-                    truncation_length=repetition_truncation_length,
-                    original_response_length=original_response_length,
-                    matched_rule=repetition_detector.matched_rule,
-                    matched_reason=repetition_detector.matched_reason,
-                    matched_text_stats=repetition_detector.matched_text_stats or repetition_detector.last_text_stats,
-                )
-            )
-        else:
-            token_ids = observed_token_ids or final_res.outputs[0].token_ids
-            truncation_length = len(token_ids) if engine_repetition_truncated else None
-            extra_fields.update(
-                repetition_extra_fields(
-                    truncated=engine_repetition_truncated,
-                    truncation_length=truncation_length,
-                    original_response_length=original_response_length,
-                    matched_reason="engine_repetition" if engine_repetition_truncated else None,
-                    matched_text_stats=(
-                        repetition_detector.last_text_stats if repetition_detector is not None else None
-                    ),
-                )
-            )
+        token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [
-                logprobs[token_ids[i]].logprob
-                for i, logprobs in enumerate(final_res.outputs[0].logprobs[: len(token_ids)])
-            ]
+            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
-            if repetition_truncation_length is not None and routed_experts is not None:
-                routed_experts = routed_experts[: len(prompt_ids) + len(token_ids)]
 
         # Determine stop reason from finish_reason
-        if repetition_truncation_length is not None or engine_repetition_truncated:
-            stop_reason = "repetition_truncated"
-        elif finish_reason == "abort":
+        finish_reason = final_res.outputs[0].finish_reason
+        if finish_reason == "abort":
             stop_reason = "aborted"
-        elif finish_reason == "stop":
+        elif finish_reason in ("stop", "length"):
             stop_reason = "completed"
-        elif finish_reason == "length":
-            stop_reason = "max_length_truncated"
         else:
             stop_reason = finish_reason  # for more stop reason in the future
 
@@ -972,8 +711,6 @@ class vLLMHttpServer:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
-        expected_policy_identity: Optional[dict[str, Any]] = None,
-        expected_sampling_digest: Optional[str] = None,
     ) -> TokenOutput:
         """Run prefill locally, then decode on a selected peer."""
         decode_peer = self._select_decode_peer()
@@ -1002,7 +739,6 @@ class vLLMHttpServer:
             mm_processor_kwargs=mm_processor_kwargs,
             priority=priority,
             kv_transfer_params=prefill_kv_params,
-            expected_policy_identity=expected_policy_identity,
         )
         if is_mooncake:
             # Mooncake does not return decode params from the prefill leg.
@@ -1029,8 +765,6 @@ class vLLMHttpServer:
             mm_processor_kwargs=mm_processor_kwargs,
             priority=priority,
             kv_transfer_params=decode_kv_params,
-            expected_policy_identity=expected_policy_identity,
-            expected_sampling_digest=expected_sampling_digest,
         )
 
     async def wake_up(self, tags: list[str] | None = None):
@@ -1042,17 +776,15 @@ class vLLMHttpServer:
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
-            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+            await self.engine.reset_prefix_cache(reset_connector=True)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            # Preserve the two-phase memory lifecycle: restore the discarded
-            # weight storage first, publish the replacement weights, and only
-            # then restore the request cache.
-            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+            # Directly call engine to wake up without sync weights.
+            await self.engine.wake_up(tags=self._get_wake_up_tags())
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
             # is configured (vLLM scheduler treats it as such).
-            await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
+            await self.engine.reset_prefix_cache(reset_connector=True)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
@@ -1060,35 +792,23 @@ class vLLMHttpServer:
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
-        if self.rollout_mode == RolloutMode.STANDALONE:
+        if self.rollout_mode == RolloutMode.HYBRID:
+            await self._sleep_hybrid()
+        elif self.rollout_mode == RolloutMode.COLOCATED:
+            await self.engine.sleep(level=1)
+        elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
-            return
-
-        if self.weight_update_state in {"updating", "poisoned"}:
-            raise RuntimeError(
-                f"cannot sleep rollout server while weight publication state is {self.weight_update_state!r}"
-            )
-        # vLLM level-2 wake remaps empty weight storage.  Hide the published
-        # identity before sleeping so no request can observe sleeping or empty
-        # tensors before the next complete actor refresh.
-        self.behavior_policy_identity = None
-        self.weight_update_failure = None
-        self.weight_update_state = "sleeping"
-        try:
-            if self.rollout_mode == RolloutMode.HYBRID:
-                await self._sleep_hybrid()
-            elif self.rollout_mode == RolloutMode.COLOCATED:
-                # Full-weight colocated training republishes every actor tensor
-                # before the next rollout. Level 2 can therefore discard the old
-                # inference weights while optimizer state is materialized.
-                await self._sleep_full_weight_sync()
-        except BaseException as exc:
-            await self.poison_weight_update(f"sleep failed: {exc!r}")
-            raise
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
-            await reset_vllm_weight_update_caches(self.engine, _VLLM_VERSION)
+            # reset_connector=True drops any attached external KV store
+            # (e.g. MooncakeStoreConnector) whose entries were computed
+            # against the previous model weights. With no connector it
+            # is a no-op success, so we can pass it unconditionally.
+            await self.engine.reset_prefix_cache(reset_connector=True)
+
+            await self.engine.reset_mm_cache()
+            await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
         """Release only kv_cache GPU memory, keeping model weights intact.
@@ -1126,44 +846,6 @@ class vLLMHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
-    async def stage_behavior_policy_identity(self, policy_identity: dict[str, Any]):
-        """Stage identity after weights finish, but before cache wake completes."""
-        if self.weight_update_state != "updating":
-            raise RuntimeError(
-                f"cannot stage behavior-policy identity while weight update state is {self.weight_update_state!r}"
-            )
-        self.behavior_policy_identity = dict(policy_identity)
-        self.weight_update_failure = None
-        self.weight_update_state = "weights_ready"
-
-    async def begin_weight_update(self):
-        """Hide the old identity before any live tensor can be overwritten."""
-        if self.weight_update_state == "poisoned":
-            raise RuntimeError("rollout server is poisoned by a failed weight update and must reload")
-        if self.weight_update_state == "updating":
-            raise RuntimeError("rollout server weight update is already active")
-        self.behavior_policy_identity = None
-        self.weight_update_failure = None
-        self.weight_update_state = "updating"
-
-    async def finish_weight_update_without_identity(self):
-        """Stage a non-strict update while keeping identity metadata absent."""
-        if self.weight_update_state != "updating":
-            raise RuntimeError(f"cannot finish weight update while state is {self.weight_update_state!r}")
-        self.weight_update_state = "weights_ready"
-
-    async def activate_weight_update(self):
-        """Allow generation only after weights and request cache are both ready."""
-        if self.weight_update_state != "weights_ready":
-            raise RuntimeError(f"cannot activate rollout weights while state is {self.weight_update_state!r}")
-        self.weight_update_state = "active"
-
-    async def poison_weight_update(self, reason: str):
-        """Permanently reject generation after a partial in-place update."""
-        self.behavior_policy_identity = None
-        self.weight_update_failure = str(reason)
-        self.weight_update_state = "poisoned"
-
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
@@ -1183,50 +865,23 @@ class vLLMHttpServer:
                 - request_ids: List of aborted request IDs
         """
         try:
-            if _VLLM_VERSION >= version.parse("0.12.0"):
-                # Snapshot request IDs before pausing for reporting
-                request_ids = list(self.engine.output_processor.request_states.keys())
+            # Snapshot request IDs before pausing for reporting
+            request_ids = list(self.engine.output_processor.request_states.keys())
 
-                # pause_generation with wait_for_inflight_requests=False will:
-                # 1. Set engine to paused state (blocks new generate calls)
-                # 2. Abort all in-flight requests
-                # 3. Wait for requests to drain
-                # 4. Clear prefix and mm caches if clear_cache=True.
-                #    EngineCore._reset_caches defaults reset_connector=True
-                #    on this path, so any attached external KV store (e.g.
-                #    MooncakeStoreConnector) is invalidated along with the
-                #    local prefix cache — RL-correct hard-reset at every
-                #    weight update boundary, no extra kwargs needed.
-                await self.engine.pause_generation(
-                    wait_for_inflight_requests=False,
-                    clear_cache=reset_prefix_cache,
-                )
-            else:
-                # Take an atomic snapshot to avoid race conditions with the vLLM engine thread
-                request_states_snapshot = list(self.engine.output_processor.request_states.items())
-                request_ids = [req_id for req_id, _ in request_states_snapshot]
-
-                if not request_ids:
-                    return {"aborted_count": 0, "request_ids": []}
-
-                # For each request, create an abort output and put it to its queue
-                # This allows the generator to receive the aborted result
-                from vllm.v1.engine import FinishReason
-
-                for _, req_state in request_states_snapshot:
-                    request_output = req_state.make_request_output(
-                        [], pooling_output=None, finish_reason=FinishReason.ABORT, stop_reason=None
-                    )
-                    req_state.queue.put(request_output)
-
-                # Abort requests in the output processor and engine core
-                self.engine.output_processor.abort_requests(request_ids)
-                await self.engine.engine_core.abort_requests_async(request_ids)
-
-                # Try to reset prefix cache to ensure clean state
-                if reset_prefix_cache:
-                    await self.clear_kv_cache()
-                    logger.info("Prefix cache reset after abort")
+            # pause_generation with wait_for_inflight_requests=False will:
+            # 1. Set engine to paused state (blocks new generate calls)
+            # 2. Abort all in-flight requests
+            # 3. Wait for requests to drain
+            # 4. Clear prefix and mm caches if clear_cache=True.
+            #    EngineCore._reset_caches defaults reset_connector=True
+            #    on this path, so any attached external KV store (e.g.
+            #    MooncakeStoreConnector) is invalidated along with the
+            #    local prefix cache — RL-correct hard-reset at every
+            #    weight update boundary, no extra kwargs needed.
+            await self.engine.pause_generation(
+                wait_for_inflight_requests=False,
+                clear_cache=reset_prefix_cache,
+            )
 
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
@@ -1236,15 +891,10 @@ class vLLMHttpServer:
             return {"aborted_count": 0, "request_ids": [], "error": str(e)}
 
     async def resume_generation(self):
-        """Resume generation after abort_all_requests (pause_generation).
-
-        Only effective on vLLM >= 0.12.0 where pause_generation is used.
-        No-op on older versions.
-        """
+        """Resume generation after abort_all_requests (pause_generation)."""
         if self.node_rank != 0:
             return
-        if _VLLM_VERSION >= version.parse("0.12.0"):
-            await self.engine.resume_generation()
+        await self.engine.resume_generation()
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.
@@ -1296,8 +946,6 @@ class vLLMHttpServer:
 
     def _init_model_config(self, model_config):
         """Initialise model_config. Override when a specific dataclass_type is needed."""
-        if _is_rwkv_native_model_config(model_config):
-            return _init_rwkv_rollout_model_config(model_config)
         return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
 
     def _validate_configs(self) -> None:
@@ -1425,8 +1073,8 @@ class vLLMHttpServer:
         """Return the tags passed to engine.wake_up(). Default includes kv_cache."""
         return ["kv_cache", "weights"]
 
-    async def _sleep_full_weight_sync(self):
-        """Sleep before a full actor-weight refresh.
+    async def _sleep_hybrid(self):
+        """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
 
         Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
         that sleep is properly propagated to all data-parallel worker processes.
@@ -1449,13 +1097,7 @@ class vLLMHttpServer:
         else:
             sleep_level = 2
         await self.engine.sleep(level=sleep_level)
-        if _VLLM_VERSION >= version.parse("0.17.0"):
-            await self.engine.reset_encoder_cache()
-
-    async def _sleep_hybrid(self):
-        """Backward-compatible entry point for hybrid full-weight sleep."""
-
-        await self._sleep_full_weight_sync()
+        await self.engine.reset_encoder_cache()
 
 
 class vLLMReplica(RolloutReplica):
@@ -1479,8 +1121,6 @@ class vLLMReplica(RolloutReplica):
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
-
-        self._validate_launch_requirements()
 
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
@@ -1551,7 +1191,6 @@ class vLLMReplica(RolloutReplica):
 
         # get http server address from first server
         server_address, server_port = await self.servers[0].get_server_address.remote()
-        self.runtime_metadata = await asyncio.gather(*[server.get_runtime_metadata.remote() for server in self.servers])
         self._server_handle = self.servers[0]
         self._server_address = (
             f"[{server_address}]:{server_port}"
@@ -1615,15 +1254,6 @@ class vLLMReplica(RolloutReplica):
     # -----------------------------------------------------------------------
     # Hook methods for subclass overrides
     # -----------------------------------------------------------------------
-
-    def _validate_launch_requirements(self) -> None:
-        """Validate requirements before launching. Override in subclasses."""
-        # NOTE: We always use MP Executor backend whether it's single-node or multi-node.
-        # For multi-node without DP (e.g TP=16), need vllm>=0.11.1, https://github.com/vllm-project/vllm/pull/23691
-        if self.config.data_parallel_size == 1 and self.nnodes > 1:
-            assert _VLLM_VERSION >= version.parse("0.11.1"), (
-                "For multi-node MP Executor, either (1) set data_parallel_size > 1 or (2) upgrade vLLM to >= 0.11.1"
-            )
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix (e.g. 'vllm_')."""

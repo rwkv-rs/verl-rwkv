@@ -354,29 +354,6 @@ def test_concat_conflicting_non_metric_keys():
         DataProto.concat([data1, data2])
 
 
-def test_concat_unions_reward_extra_keys_and_pads_missing_columns():
-    obs1 = torch.tensor([1, 2])
-    obs2 = torch.tensor([3])
-
-    data1 = DataProto.from_dict(
-        tensors={"obs": obs1},
-        non_tensors={"score": np.array([1.0, 2.0]), "acc": np.array([0.1, 0.2])},
-        meta_info={"reward_extra_keys": ["score", "acc"]},
-    )
-    data2 = DataProto.from_dict(
-        tensors={"obs": obs2},
-        non_tensors={"acc": np.array([0.3]), "repetition_truncated": np.array([True])},
-        meta_info={"reward_extra_keys": ["acc", "repetition_truncated"]},
-    )
-
-    concat_data = DataProto.concat([data1, data2])
-
-    assert concat_data.meta_info["reward_extra_keys"] == ["score", "acc", "repetition_truncated"]
-    assert concat_data.non_tensor_batch["score"].tolist() == [1.0, 2.0, None]
-    assert concat_data.non_tensor_batch["acc"].tolist() == [0.1, 0.2, 0.3]
-    assert concat_data.non_tensor_batch["repetition_truncated"].tolist() == [None, None, True]
-
-
 def test_pop():
     obs = torch.randn(100, 10)
     act = torch.randn(100, 3)
