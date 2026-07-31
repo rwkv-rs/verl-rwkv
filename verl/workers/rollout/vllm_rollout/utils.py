@@ -28,7 +28,11 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
-from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
+from verl.workers.rollout.vllm_rollout.weight_update_utils import (
+    _LayerwiseReloadSession,
+    apply_buffer_updates,
+    split_buffer_updates,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -237,6 +241,7 @@ class vLLMColocateWorkerExtension:
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
+        fp8_model = is_fp8_model(self.model_runner.vllm_config)
 
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
@@ -255,25 +260,47 @@ class vLLMColocateWorkerExtension:
             # TODO: this is buggy if lora span multiple buckets.
             self.remove_lora(VLLM_LORA_INT_ID)
             logger.info("LoRA adapter sync: remove old lora and prepare new lora")
-        elif is_fp8_model(self.model_runner.vllm_config):
+        elif fp8_model:
             from verl.utils.vllm.vllm_fp8_utils import prepare_quanted_weights_for_loading
 
             quant_reload_states = [
                 (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
             ]
+        reload_session = None
+        if not (self._is_qat_model or self._is_modelopt_qat or (peft_config and base_sync_done) or fp8_model):
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+
+            reload_session = _LayerwiseReloadSession(
+                self._iter_all_models_with_config(),
+                initialize=initialize_layerwise_reload,
+                finalize=finalize_layerwise_reload,
+            )
+
         # =========================== step 2: receive weights and update ===========================
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
             device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._update_weights(
-                weights,
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-            )
-        )
+        try:
+            if reload_session is not None:
+                receiver.receive_weights(on_bucket_received=reload_session.load_bucket)
+                reload_session.finish()
+            else:
+                receiver.receive_weights(
+                    on_bucket_received=lambda weights: self._update_weights(
+                        weights,
+                        peft_config=peft_config,
+                        base_sync_done=base_sync_done,
+                    )
+                )
+        except Exception:
+            if reload_session is not None:
+                reload_session.abort()
+            raise
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:
@@ -290,17 +317,13 @@ class vLLMColocateWorkerExtension:
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif peft_config and base_sync_done:
             logger.info("LoRA adapter sync, no post-process needed")
-        elif is_fp8_model(self.model_runner.vllm_config):
+        elif fp8_model:
             from verl.utils.vllm.vllm_fp8_utils import process_quanted_weights_after_loading
 
             for model, reload_state in quant_reload_states:
                 process_quanted_weights_after_loading(model, reload_state)
-        else:
-            # Some post-load transforms are non-idempotent; run once after all buckets.
-            from vllm.model_executor.model_loader.utils import process_weights_after_loading
-
-            for model, model_config in self._iter_all_models_with_config():
-                process_weights_after_loading(model, model_config, self.device)
+        elif reload_session is not None:
+            logger.info("vLLM layerwise weight reload completed")
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.

@@ -17,6 +17,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -33,6 +34,7 @@ def _load_weight_update_utils():
 
 _weight_update_utils = _load_weight_update_utils()
 apply_buffer_updates = _weight_update_utils.apply_buffer_updates
+_LayerwiseReloadSession = _weight_update_utils._LayerwiseReloadSession
 split_buffer_updates = _weight_update_utils.split_buffer_updates
 
 
@@ -125,8 +127,9 @@ class _ToyModel(torch.nn.Module):
 
 
 class _FakeVllmConfig:
-    def __init__(self, speculative_config=None):
+    def __init__(self, speculative_config=None, quantization=None):
         self.speculative_config = speculative_config
+        self.quantization = quantization
 
 
 class _FakeModelRunner:
@@ -169,6 +172,134 @@ def test_apply_buffer_updates_ignores_non_buffer_weights():
 
     assert loaded == 0
     assert torch.count_nonzero(model.model.layers[0].e_score_correction_bias) == 0
+
+
+def test_layerwise_reload_session_owns_bucket_tensors_and_stages_buffers():
+    model = _ToyModel()
+    retained = {}
+    events = []
+
+    def load_weights(weights):
+        retained.update(weights)
+        return {name for name, _ in weights}
+
+    def finalize(inner_model, model_config):
+        assert inner_model is model
+        assert model_config.quantization is None
+        assert torch.count_nonzero(model.model.layers[0].e_score_correction_bias) == 0
+        events.append("finalize")
+
+    model.load_weights = load_weights
+    session = _LayerwiseReloadSession(
+        [(model, _FakeVllmConfig())],
+        initialize=lambda inner_model: events.append("initialize"),
+        finalize=finalize,
+    )
+    parameter = torch.ones(4, 4)
+    buffer = torch.arange(4, dtype=torch.float32) + 1
+
+    session.load_bucket(
+        [
+            ("model.layers.0.linear.weight", parameter),
+            ("model.layers.0.e_score_correction_bias", buffer),
+        ]
+    )
+    parameter.zero_()
+    buffer.zero_()
+
+    torch.testing.assert_close(
+        retained["model.layers.0.linear.weight"],
+        torch.ones(4, 4),
+    )
+    assert torch.count_nonzero(model.model.layers[0].e_score_correction_bias) == 0
+
+    session.finish()
+
+    assert events == ["initialize", "finalize"]
+    torch.testing.assert_close(
+        model.model.layers[0].e_score_correction_bias,
+        torch.tensor([1, 2, 3, 4], dtype=torch.float32),
+    )
+
+
+def test_layerwise_reload_session_wraps_main_and_mtp_in_one_lifecycle():
+    main_model = _ToyModel()
+    drafter_model = _ToyModel()
+    main_config = _FakeVllmConfig()
+    drafter_config = _FakeVllmConfig()
+    names = {main_model: "main", drafter_model: "drafter"}
+    events = []
+
+    def make_loader(model):
+        def load_weights(weights):
+            events.append(("load", names[model], [name for name, _ in weights]))
+            return {name for name, _ in weights}
+
+        return load_weights
+
+    main_model.load_weights = make_loader(main_model)
+    drafter_model.load_weights = make_loader(drafter_model)
+    session = _LayerwiseReloadSession(
+        [(main_model, main_config), (drafter_model, drafter_config)],
+        initialize=lambda model: events.append(("initialize", names[model])),
+        finalize=lambda model, config: events.append(("finalize", names[model], config)),
+    )
+
+    session.load_bucket([("model.layers.0.linear.weight", torch.ones(4, 4))])
+    session.finish()
+
+    assert events == [
+        ("initialize", "main"),
+        ("initialize", "drafter"),
+        ("load", "main", ["model.layers.0.linear.weight"]),
+        ("load", "drafter", ["model.layers.0.linear.weight"]),
+        ("finalize", "main", main_config),
+        ("finalize", "drafter", drafter_config),
+    ]
+
+
+def test_layerwise_reload_session_abort_finalizes_without_applying_buffers():
+    model = _ToyModel()
+    events = []
+    model.load_weights = lambda weights: {name for name, _ in weights}
+    session = _LayerwiseReloadSession(
+        [(model, _FakeVllmConfig())],
+        initialize=lambda inner_model: events.append("initialize"),
+        finalize=lambda inner_model, config: events.append("finalize"),
+    )
+    session.load_bucket(
+        [
+            (
+                "model.layers.0.e_score_correction_bias",
+                torch.arange(4, dtype=torch.float32) + 1,
+            )
+        ]
+    )
+
+    session.abort()
+
+    assert events == ["initialize", "finalize"]
+    assert torch.count_nonzero(model.model.layers[0].e_score_correction_bias) == 0
+
+
+def test_layerwise_reload_session_finalizes_partial_initialize_failure():
+    model = _ToyModel()
+    events = []
+
+    def initialize(inner_model):
+        inner_model.partial_reload_started = True
+        events.append("initialize")
+        raise ValueError("initialize failed")
+
+    with pytest.raises(ValueError, match="initialize failed"):
+        _LayerwiseReloadSession(
+            [(model, _FakeVllmConfig())],
+            initialize=initialize,
+            finalize=lambda inner_model, config: events.append("finalize"),
+        )
+
+    assert model.partial_reload_started
+    assert events == ["initialize", "finalize"]
 
 
 def test_vllm_update_weights_loads_params_and_buffers():
