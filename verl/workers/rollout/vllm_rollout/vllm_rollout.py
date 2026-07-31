@@ -235,10 +235,6 @@ class ServerAdapter(BaseRollout):
                 bucket_size_mb=bucket_size_mb,
                 use_shm=self.use_shm,
             )
-            if _should_expand_vllm_moe_params() and not (
-                kwargs.get("peft_config") is not None and kwargs.get("base_sync_done", False)
-            ):
-                weights = _iter_vllm_compatible_moe_params(weights)
             await sender.async_send_weights(weights)
 
             if future is not None:
