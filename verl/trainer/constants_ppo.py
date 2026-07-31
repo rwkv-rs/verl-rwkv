@@ -134,4 +134,12 @@ def get_ppo_ray_runtime_env(config=None):
         value = os.environ.get(key)
         if value is not None:
             runtime_env["env_vars"][key] = value
+
+    # Forward PYTHONPATH to Ray workers so packages exposed only via PYTHONPATH (e.g. the
+    # Megatron-LM baked into the CI image at /workspace/Megatron-LM, which is not installed
+    # into site-packages) stay importable. Workers do not inherit the driver's PYTHONPATH when
+    # Ray is started out-of-band (e.g. `ray start --head`), so pass it through explicitly.
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath:
+        runtime_env["env_vars"]["PYTHONPATH"] = pythonpath
     return runtime_env

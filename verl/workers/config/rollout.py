@@ -191,6 +191,7 @@ class RolloutConfig(BaseConfig):
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
+    standalone_gpu_memory_utilization: Optional[float] = None
     ignore_eos: bool = False
     rwkv_prompt_template: Optional[str] = None
     enforce_eager: bool = False

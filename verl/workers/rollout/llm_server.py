@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
 import ray
-import torch
 from cachetools import LRUCache
 from omegaconf import DictConfig
 
@@ -146,8 +146,8 @@ class GlobalRequestLoadBalancer:
         max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
         full_determinism: bool = False,
     ):
-        if not servers:
-            raise ValueError("servers must be non-empty")
+        # Allow empty initial servers: in dynamic-resource-scheduling mode all
+        # replicas are hybrid and will be registered later via add_servers().
 
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
@@ -241,6 +241,30 @@ class GlobalRequestLoadBalancer:
         """Get list of all active server IDs."""
         return list(self._inflight_requests.keys())
 
+    def clear_sticky_cache(self) -> dict:
+        """Clear the sticky-session cache to force request redistribution.
+
+        After clearing, all subsequent ``acquire_server()`` calls will select
+        the least-loaded server (based on ``_inflight_requests``), which
+        naturally balances load across all active replicas — including newly
+        added ones with zero in-flight requests.
+
+        Returns:
+            A dict with ``cleared_entries`` (number of cache entries dropped)
+            and ``server_loads`` (current per-server inflight counts for
+            diagnostics).
+        """
+        cleared = len(self._request_id_to_server)
+        self._request_id_to_server.clear()
+        logger.info(
+            f"[GlobalLoadBalancer] Sticky cache cleared: {cleared} entries dropped. "
+            f"Server loads: {dict(self._inflight_requests)}"
+        )
+        return {
+            "cleared_entries": cleared,
+            "server_loads": dict(self._inflight_requests),
+        }
+
     def get_status(self) -> dict:
         """Return current load balancer state for debugging."""
         return {
@@ -255,6 +279,10 @@ class GlobalRequestLoadBalancer:
 
     def get_peak_status(self) -> dict[str, int]:
         return dict(self._peak_inflight_requests)
+
+    def get_total_inflight(self) -> int:
+        """Return the sum of in-flight requests across all currently registered servers."""
+        return sum(self._inflight_requests.values())
 
 
 class LLMServerClient:
@@ -349,6 +377,54 @@ class FullyAsyncLLMServerClient(LLMServerClient):
     invisible to the AgentLoop.
     """
 
+    def __init__(
+        self,
+        config: DictConfig,
+        load_balancer_handle: ray.actor.ActorHandle = None,
+        only_hybrid: bool = False,
+        **kwargs,
+    ):
+        """Initialize the FullyAsyncLLMServerClient.
+
+        Args:
+            config (DictConfig): whole config for main entrypoint.
+            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor
+                that also holds the server-handle registry.
+            only_hybrid (bool): When ``True``, hybrid replicas are the *only* rollout
+                resource.  If the load balancer is temporarily empty (e.g. during
+                weight synchronisation) :meth:`_acquire_server` will keep retrying
+                every 1 second instead of raising immediately.
+        """
+        super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
+        self._only_hybrid = only_hybrid
+
+    async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+        # Atomic acquire: returns (server_id, handle) in one Ray RPC.
+        # When only_hybrid is True, hybrid replicas are the sole rollout resource and
+        # the LB may be temporarily empty during weight sync / scaling transitions.
+        # In that case keep retrying every 1 s until a server becomes available.
+        # Otherwise raise immediately so callers see the error right away.
+        while True:
+            try:
+                return await super()._acquire_server(request_id)
+            except RuntimeError as e:
+                if "No available servers in load balancer" in str(e) and self._only_hybrid:
+                    await asyncio.sleep(1)
+                else:
+                    raise
+
+    def _configured_response_length(self) -> Optional[int]:
+        """Per-response token budget from the rollout config, or ``None`` when unavailable.
+
+        Tests and lightweight callers may pass a config stub without the rollout section; in that
+        case the resume loop keeps its previous behaviour of deferring to the server default.
+        """
+        rollout_config = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        response_length = getattr(rollout_config, "response_length", None)
+        if isinstance(response_length, int) and response_length > 0:
+            return response_length
+        return None
+
     @rollout_trace_op
     async def generate(
         self,
@@ -385,6 +461,22 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             limit_key = "max_new_tokens"
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
 
+        # The budget below is rewritten on every attempt, and the caller reuses its dict across
+        # turns, so never mutate the caller's copy.
+        sampling_params = dict(sampling_params)
+
+        if original_max_tokens is None:
+            # Without an explicit limit each attempt falls back to the server-side default, which is
+            # derived from len(prompt_ids) and is only correct on the first attempt: a resume passes
+            # prompt + tokens generated so far, so the default charges generated tokens against the
+            # *prompt* budget and re-permits close to a full response_length every time. Pin the
+            # cumulative budget here instead, which also makes the bookkeeping in step 3 effective.
+            response_length = self._configured_response_length()
+            if response_length is not None:
+                limit_key = "max_tokens"
+                original_max_tokens = response_length
+                sampling_params[limit_key] = response_length
+
         final_output = TokenOutput(
             token_ids=[],
             log_probs=[],
@@ -415,9 +507,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 if final_output.routed_experts is None:
                     final_output.routed_experts = output.routed_experts
                 else:
-                    final_output.routed_experts = torch.cat(
-                        [final_output.routed_experts, output.routed_experts[-len(output.token_ids) :]],
-                        dim=0,
+                    final_output.routed_experts = np.concatenate(
+                        [final_output.routed_experts, output.routed_experts[-len(output.token_ids) :]]
                     )
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted

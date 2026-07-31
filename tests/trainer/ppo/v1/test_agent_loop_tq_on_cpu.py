@@ -17,7 +17,7 @@ import asyncio
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
+from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ, _settle_session_tasks
 
 
 class _AsyncRemoteMethod:
@@ -47,3 +47,25 @@ def test_tq_dispatch_awaits_worker_acknowledgements_without_ray_get():
     manager.generate_sequences(prompts)
 
     assert sorted(completions) == [(0, 2), (1, 2)]
+
+
+def test_settle_session_tasks_waits_for_siblings_after_failure():
+    async def run():
+        settled = asyncio.Event()
+
+        async def fail():
+            raise RuntimeError("session failed")
+
+        async def finish_later():
+            await asyncio.sleep(0.01)
+            settled.set()
+
+        tasks = [asyncio.create_task(fail()), asyncio.create_task(finish_later())]
+        errors = await _settle_session_tasks(tasks)
+
+        assert settled.is_set()
+        assert all(task.done() for task in tasks)
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+
+    asyncio.run(run())
