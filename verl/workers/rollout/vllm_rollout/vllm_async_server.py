@@ -323,6 +323,13 @@ class vLLMHttpServer:
 
     def get_runtime_metadata(self) -> dict[str, Any]:
         context = ray.get_runtime_context()
+        http_endpoint = None
+        if self._server_port is not None:
+            http_endpoint = (
+                f"[{self._server_address}]:{self._server_port}"
+                if is_valid_ipv6_address(self._server_address)
+                else f"{self._server_address}:{self._server_port}"
+            )
         return {
             "replica_rank": self.replica_rank,
             "node_rank": self.node_rank,
@@ -333,10 +340,17 @@ class vLLMHttpServer:
             "cuda_visible_devices": self.cuda_visible_devices.split(","),
             "http_address": self._server_address,
             "http_port": self._server_port,
+            "http_endpoint": http_endpoint,
             "master_port": self._master_port,
             "dp_rpc_port": self._dp_rpc_port,
             "dp_master_port": self._dp_master_port,
-            "capacity": self._runtime_capacity,
+            "capacity": dict(self._runtime_capacity) if self._runtime_capacity is not None else None,
+            "behavior_policy_identity": (
+                dict(self.behavior_policy_identity) if self.behavior_policy_identity is not None else None
+            ),
+            "weight_update_state": self.weight_update_state,
+            "wkv_mode": os.environ.get("VLLM_RWKV7_WKV_MODE"),
+            "vllm_version": str(_VLLM_VERSION),
         }
 
     @property
@@ -579,6 +593,7 @@ class vLLMHttpServer:
             "kv_cache_applicable": tokenizer_mode != "rwkv",
             "max_num_seqs": int(vllm_config.scheduler_config.max_num_seqs),
             "max_num_batched_tokens": int(vllm_config.scheduler_config.max_num_batched_tokens),
+            "max_model_len": int(vllm_config.model_config.max_model_len),
             "gpu_memory_utilization": float(vllm_config.cache_config.gpu_memory_utilization),
         }
 

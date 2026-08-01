@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.metadata
+import hashlib
 import json
 import logging
 import math
@@ -1499,16 +1499,14 @@ class PPOTrainer(ABC):
 
         result_path = checkpoint_file.parent / "lighteval_metrics.json"
         result_path.unlink(missing_ok=True)
-        rollout_config = self.config.actor_rollout_ref.rollout
-        max_model_len = rollout_config.get("max_model_len")
-        if not isinstance(max_model_len, int) or isinstance(max_model_len, bool) or max_model_len <= 0:
-            max_model_len = int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length)
-        max_concurrency = rollout_config.get("max_num_seqs")
-        if not isinstance(max_concurrency, int) or isinstance(max_concurrency, bool) or max_concurrency <= 0:
-            raise RuntimeError("external evaluation requires rollout.max_num_seqs")
         wkv_mode = os.environ.get("VLLM_RWKV7_WKV_MODE")
         if wkv_mode not in {"fp16", "fp32io16"}:
             raise RuntimeError("external evaluation requires VLLM_RWKV7_WKV_MODE")
+        policy_round = getattr(self, "policy_round", None)
+        published_identity = getattr(policy_round, "published", None)
+        if published_identity is None:
+            raise RuntimeError("external evaluation requires an authoritative published behavior-policy identity")
+        behavior_policy_identity = published_identity.as_dict()
         addresses = list(self.llm_server_manager.get_addresses())
         if (
             not addresses
@@ -1519,20 +1517,113 @@ class PPOTrainer(ABC):
             or len(set(addresses)) != len(addresses)
         ):
             raise RuntimeError("external evaluation requires unique rollout server addresses")
-        pool_manifest_path = checkpoint_file.parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
-        pool_payload = {
-            "schema_version": 1,
-            "global_step": self.global_steps,
-            "wkv_mode": wkv_mode,
-            "vllm_version": importlib.metadata.version("vllm"),
-            "max_model_len": max_model_len,
-            "replicas": [
+        runtime_snapshot = self.llm_server_manager.get_runtime_metadata_snapshot()
+        if len(runtime_snapshot) != len(addresses):
+            raise RuntimeError("external evaluation requires one runtime metadata snapshot per rollout replica")
+
+        replicas = []
+        vllm_versions: set[str] = set()
+        max_model_lens: set[int] = set()
+        for index, (address, runtime) in enumerate(zip(addresses, runtime_snapshot, strict=True)):
+            if runtime.get("http_endpoint") != address:
+                raise RuntimeError(
+                    "external evaluation runtime endpoint does not match the rollout pool: "
+                    f"replica={index} expected={address!r} actual={runtime.get('http_endpoint')!r}"
+                )
+            if runtime.get("behavior_policy_identity") != behavior_policy_identity:
+                raise RuntimeError(
+                    "external evaluation runtime behavior-policy identity does not match the published policy: "
+                    f"replica={index} expected={behavior_policy_identity} "
+                    f"actual={runtime.get('behavior_policy_identity')}"
+                )
+            if runtime.get("weight_update_state") != "active":
+                raise RuntimeError(
+                    "external evaluation requires active rollout weights: "
+                    f"replica={index} state={runtime.get('weight_update_state')!r}"
+                )
+            if runtime.get("wkv_mode") != wkv_mode:
+                raise RuntimeError(
+                    "external evaluation runtime WKV mode does not match the requested mode: "
+                    f"replica={index} expected={wkv_mode!r} actual={runtime.get('wkv_mode')!r}"
+                )
+            capacity = runtime.get("capacity")
+            required_capacity = ("max_num_seqs", "max_num_batched_tokens", "max_model_len")
+            allowed_capacity = {
+                "capacity_source",
+                "capacity_mode",
+                "kv_cache_applicable",
+                "max_num_seqs",
+                "max_num_batched_tokens",
+                "max_model_len",
+                "gpu_memory_utilization",
+            }
+            if (
+                not isinstance(capacity, dict)
+                or set(capacity) != allowed_capacity
+                or capacity.get("capacity_source") != "vllm.scheduler_config"
+                or any(
+                    not isinstance(capacity.get(name), int)
+                    or isinstance(capacity.get(name), bool)
+                    or capacity[name] <= 0
+                    for name in required_capacity
+                )
+            ):
+                raise RuntimeError(
+                    "external evaluation requires verified vLLM scheduler capacity: "
+                    f"replica={index} capacity={capacity}"
+                )
+            if (
+                not isinstance(capacity.get("capacity_mode"), str)
+                or not capacity["capacity_mode"]
+                or not isinstance(capacity.get("kv_cache_applicable"), bool)
+                or isinstance(capacity.get("gpu_memory_utilization"), bool)
+                or not isinstance(capacity.get("gpu_memory_utilization"), (int, float))
+                or not 0 < float(capacity["gpu_memory_utilization"]) <= 1
+            ):
+                raise RuntimeError(
+                    "external evaluation requires complete vLLM runtime capacity metadata: "
+                    f"replica={index} capacity={capacity}"
+                )
+            vllm_version = runtime.get("vllm_version")
+            if not isinstance(vllm_version, str) or not vllm_version:
+                raise RuntimeError(f"external evaluation replica {index} did not report a vLLM version")
+            vllm_versions.add(vllm_version)
+            max_model_lens.add(capacity["max_model_len"])
+            replicas.append(
                 {
                     "base_url": f"http://{address}",
-                    "max_concurrency": max_concurrency,
+                    "behavior_policy_identity": dict(behavior_policy_identity),
+                    "weight_update_state": "active",
+                    "wkv_mode": wkv_mode,
+                    **dict(capacity),
                 }
-                for address in addresses
-            ],
+            )
+        if len(vllm_versions) != 1:
+            raise RuntimeError(f"external evaluation replicas report different vLLM versions: {sorted(vllm_versions)}")
+        if len(max_model_lens) != 1:
+            raise RuntimeError(
+                "external evaluation replicas report different max_model_len values: "
+                f"{sorted(max_model_lens)}"
+            )
+
+        pool_manifest_path = checkpoint_file.parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
+        with checkpoint_file.open("rb") as stream:
+            checkpoint_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        pool_payload = {
+            "schema_version": 3,
+            "global_step": self.global_steps,
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_display_name": checkpoint_file.name,
+            "policy_checkpoint_path": relative_weight.as_posix(),
+            "behavior_policy_identity": behavior_policy_identity,
+            "wkv_mode": wkv_mode,
+            "vllm_version": next(iter(vllm_versions)),
+            "max_model_len": next(iter(max_model_lens)),
+            "aggregate_scheduler_capacity": {
+                "max_num_seqs": sum(replica["max_num_seqs"] for replica in replicas),
+                "max_num_batched_tokens": sum(replica["max_num_batched_tokens"] for replica in replicas),
+            },
+            "replicas": replicas,
         }
         try:
             descriptor = os.open(

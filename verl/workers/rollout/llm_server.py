@@ -757,6 +757,26 @@ class LLMServerManager:
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""
         return self.server_addresses
 
+    def get_runtime_metadata_snapshot(self) -> list[dict[str, Any]]:
+        """Read current metadata from every live replica head actor."""
+
+        snapshot = ray.get([handle.get_runtime_metadata.remote() for handle in self.server_handles])
+        if not isinstance(snapshot, list) or len(snapshot) != len(self.server_addresses):
+            raise RuntimeError(
+                "rollout runtime metadata must contain exactly one live head per replica: "
+                f"expected={len(self.server_addresses)} actual={len(snapshot) if isinstance(snapshot, list) else None}"
+            )
+        invalid = [index for index, metadata in enumerate(snapshot) if not isinstance(metadata, dict)]
+        if invalid:
+            raise RuntimeError(f"rollout runtime metadata entries must be objects: invalid_indices={invalid}")
+        reported_addresses = [metadata.get("http_endpoint") for metadata in snapshot]
+        if reported_addresses != self.server_addresses:
+            raise RuntimeError(
+                "rollout runtime metadata endpoints do not match the active server pool: "
+                f"expected={self.server_addresses} actual={reported_addresses}"
+            )
+        return [dict(metadata) for metadata in snapshot]
+
     def start_runtime_metrics(self) -> None:
         if self._runtime_metrics_sampler is not None:
             raise RuntimeError("rollout runtime metrics are already active")

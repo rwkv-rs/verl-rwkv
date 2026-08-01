@@ -13,12 +13,19 @@
 # limitations under the License.
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 
-from verl.workers.rollout.llm_server import resolve_rollout_topology, validate_strict_rollout_capacity
+from verl.workers.rollout import llm_server
+from verl.workers.rollout.llm_server import (
+    LLMServerManager,
+    resolve_rollout_topology,
+    validate_strict_rollout_capacity,
+)
 from verl.workers.rollout.utils import run_uvicorn
+from verl.workers.rollout.vllm_rollout import vllm_async_server
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 
@@ -91,6 +98,80 @@ def test_strict_capacity_gate_rejects_unverified_config_input_metadata():
             expected_max_num_seqs=32,
             expected_max_num_batched_tokens=128,
         )
+
+
+def test_vllm_server_runtime_metadata_attests_active_policy_and_capacity(monkeypatch):
+    context = SimpleNamespace(
+        get_node_id=lambda: "node-1",
+        get_actor_id=lambda: "actor-1",
+        get_actor_name=lambda: "vllm-server-1",
+    )
+    monkeypatch.setattr(vllm_async_server.ray, "get_runtime_context", lambda: context)
+    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
+    server = vLLMHttpServer.__new__(vLLMHttpServer)
+    server.replica_rank = 1
+    server.node_rank = 0
+    server.cuda_visible_devices = "1"
+    server._server_address = "10.0.0.2"
+    server._server_port = 18001
+    server._master_port = 19001
+    server._dp_rpc_port = 19002
+    server._dp_master_port = 19003
+    server.behavior_policy_identity = {
+        "policy_version": 7,
+        "weight_digest": "publication-7",
+        "sampling_config_digest": "sampling",
+        "runtime_identity": "runtime",
+    }
+    server.weight_update_state = "active"
+    server._runtime_capacity = {
+        "capacity_source": "vllm.scheduler_config",
+        "capacity_mode": "recurrent-state-no-kv-cache",
+        "kv_cache_applicable": False,
+        "max_num_seqs": 960,
+        "max_num_batched_tokens": 65536,
+        "max_model_len": 10240,
+        "gpu_memory_utilization": 0.8,
+    }
+
+    metadata = server.get_runtime_metadata()
+
+    assert metadata["http_endpoint"] == "10.0.0.2:18001"
+    assert metadata["behavior_policy_identity"] == server.behavior_policy_identity
+    assert metadata["behavior_policy_identity"] is not server.behavior_policy_identity
+    assert metadata["weight_update_state"] == "active"
+    assert metadata["wkv_mode"] == "fp32io16"
+    assert metadata["capacity"] == server._runtime_capacity
+    assert metadata["capacity"] is not server._runtime_capacity
+
+
+def test_server_manager_reads_fresh_actor_metadata_and_checks_endpoints(monkeypatch):
+    metadata = [
+        {"http_endpoint": "10.0.0.1:18000", "weight_update_state": "active"},
+        {"http_endpoint": "10.0.0.2:18001", "weight_update_state": "active"},
+    ]
+
+    class RemoteMethod:
+        def __init__(self, value):
+            self.value = value
+
+        def remote(self):
+            return self.value
+
+    manager = LLMServerManager.__new__(LLMServerManager)
+    manager.server_addresses = ["10.0.0.1:18000", "10.0.0.2:18001"]
+    manager.server_handles = [
+        SimpleNamespace(get_runtime_metadata=RemoteMethod(value)) for value in metadata
+    ]
+    monkeypatch.setattr(llm_server.ray, "get", lambda values: values)
+
+    snapshot = manager.get_runtime_metadata_snapshot()
+
+    assert snapshot == metadata
+    assert snapshot is not metadata
+    metadata[1]["http_endpoint"] = "10.0.0.2:19001"
+    with pytest.raises(RuntimeError, match="endpoints do not match"):
+        manager.get_runtime_metadata_snapshot()
 
 
 @pytest.mark.asyncio
