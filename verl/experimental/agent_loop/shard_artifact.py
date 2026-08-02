@@ -25,8 +25,9 @@ from typing import Any, Mapping, Sequence
 
 from verl.experimental.agent_loop.finish_metadata import ROLLOUT_FINISH_METADATA_KEYS, build_rollout_finish_metadata
 from verl.trainer.ppo.v1.policy_identity import canonical_digest
+from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector
 
-SHARD_ARTIFACT_SCHEMA_VERSION = 1
+SHARD_ARTIFACT_SCHEMA_VERSION = 2
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -59,6 +60,9 @@ class RolloutResponseIdentity:
     sampling: Mapping[str, Any]
     model_revision: str
     policy_lineage: str
+    policy_version: int
+    source_lineage: str
+    runtime_identity: str
 
     def __post_init__(self) -> None:
         _require_nonempty_string("prompt_id", self.prompt_id)
@@ -70,6 +74,10 @@ class RolloutResponseIdentity:
             raise ValueError("sampling must be a non-empty mapping")
         _require_nonempty_string("model_revision", self.model_revision)
         _require_nonempty_string("policy_lineage", self.policy_lineage)
+        if isinstance(self.policy_version, bool) or not isinstance(self.policy_version, int) or self.policy_version < 0:
+            raise ValueError("policy_version must be a non-negative integer")
+        _require_nonempty_string("source_lineage", self.source_lineage)
+        _require_nonempty_string("runtime_identity", self.runtime_identity)
         _canonical_bytes(self.sampling)
 
     def as_dict(self) -> dict[str, Any]:
@@ -81,6 +89,9 @@ class RolloutResponseIdentity:
             "sampling_digest": canonical_digest(self.sampling),
             "model_revision": self.model_revision,
             "policy_lineage": self.policy_lineage,
+            "policy_version": self.policy_version,
+            "source_lineage": self.source_lineage,
+            "runtime_identity": self.runtime_identity,
         }
 
     @property
@@ -164,6 +175,9 @@ class RolloutShardArtifact:
         finish_reason: str | None,
         backend_stop_reason: Any,
         repetition_truncated: bool,
+        response_token_ids: Sequence[int],
+        eos_token_ids: Sequence[int] = (),
+        stop_token_ids: Sequence[int] = (),
     ) -> bool:
         if self.is_promoted:
             raise RuntimeError("promoted shards are read-only")
@@ -171,22 +185,28 @@ class RolloutShardArtifact:
             raise ValueError("response identity is not part of this shard contract")
         if not isinstance(response, str):
             raise TypeError("response must be a string")
+        token_ids = list(response_token_ids)
+        if any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in token_ids):
+            raise TypeError("response_token_ids must contain integers")
+        computed_repetition_length = ConsecutiveRepetitionDetector().observe(token_ids)
+        computed_repetition_truncated = computed_repetition_length is not None
+        if repetition_truncated != computed_repetition_truncated:
+            raise ValueError("repetition_truncated conflicts with response token IDs")
+        finish_source = {
+            "finish_reason": finish_reason,
+            "backend_stop_reason": backend_stop_reason,
+            "repetition_truncated": computed_repetition_truncated,
+            "response_token_ids": token_ids,
+            "eos_token_ids": list(eos_token_ids),
+            "stop_token_ids": list(stop_token_ids),
+        }
         record = {
             "schema_version": SHARD_ARTIFACT_SCHEMA_VERSION,
             "identity": identity.as_dict(),
             "identity_digest": identity.digest,
             "response": response,
-            "finish_source": {
-                "finish_reason": finish_reason,
-                "backend_stop_reason": backend_stop_reason,
-                "repetition_truncated": repetition_truncated,
-            },
-            "finish": build_rollout_finish_metadata(
-                response,
-                finish_reason=finish_reason,
-                backend_stop_reason=backend_stop_reason,
-                repetition_truncated=repetition_truncated,
-            ),
+            "finish_source": finish_source,
+            "finish": build_rollout_finish_metadata(response, **finish_source),
         }
         payload = _canonical_bytes(record)
         record_path = self.partial_path / "records" / f"{identity.digest}.json"
@@ -237,8 +257,15 @@ def _load_record(path: Path) -> tuple[dict[str, Any], bytes]:
     if set(record["finish"]) != set(ROLLOUT_FINISH_METADATA_KEYS):
         raise RuntimeError(f"response record {path.name} has incomplete finish metadata")
     finish_source = record["finish_source"]
-    if set(finish_source) != {"finish_reason", "backend_stop_reason", "repetition_truncated"}:
+    if set(finish_source) != {
+        "finish_reason", "backend_stop_reason", "repetition_truncated", "response_token_ids", "eos_token_ids",
+        "stop_token_ids",
+    }:
         raise RuntimeError(f"response record {path.name} has an invalid finish source")
+    detector = ConsecutiveRepetitionDetector()
+    recomputed_repetition = detector.observe(finish_source["response_token_ids"]) is not None
+    if finish_source["repetition_truncated"] != recomputed_repetition:
+        raise RuntimeError(f"response record {path.name} repetition metadata mismatch")
     expected_finish = build_rollout_finish_metadata(record["response"], **finish_source)
     if record["finish"] != expected_finish:
         raise RuntimeError(f"response record {path.name} finish metadata mismatch")

@@ -45,9 +45,10 @@ def test_parse_strict_cot_decision_table(text: str, valid: bool):
 @pytest.mark.parametrize(
     ("finish_reason", "backend_stop_reason", "repetition_truncated", "expected_category"),
     [
-        ("stop", None, False, "ended_by_eos"),
+        ("stop", None, False, "other_failure"),
         ("stop", 0, False, "ended_by_eos"),
         ("stop", "eos", False, "ended_by_eos"),
+        ("stop", "stop_token", False, "ended_by_stop_token"),
         ("stop", 11, False, "other_failure"),
         ("stop", "\nUser:", False, "other_failure"),
         ("completed", None, False, "other_failure"),
@@ -87,7 +88,33 @@ def test_build_rollout_finish_metadata_keeps_format_and_finish_independent():
         "format_valid": True,
         "format_parser_version": STRICT_COT_FORMAT_VERSION,
         "ended_by_eos": False,
+        "ended_by_stop_token": False,
         "repetition_truncated": False,
         "context_exhausted": True,
         "other_failure": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "finish_reason", "backend_reason", "eos_ids", "stop_ids", "expected"),
+    [
+        ([41, 42], "stop", "stop_token", [0], [42], "ended_by_stop_token"),
+        ([41, 0], "stop", None, [0], [42], "ended_by_eos"),
+        ([41, 42], "length", None, [0], [42], "context_exhausted"),
+        ([41, 42], "abort", None, [0], [42], "other_failure"),
+    ],
+)
+def test_token_terminal_fixture_separates_stop_eos_length_and_failure(
+    token_ids, finish_reason, backend_reason, eos_ids, stop_ids, expected
+):
+    categories = classify_rollout_finish(
+        finish_reason=finish_reason,
+        backend_stop_reason=backend_reason,
+        repetition_truncated=False,
+        response_token_ids=token_ids,
+        eos_token_ids=eos_ids,
+        stop_token_ids=stop_ids,
+    )
+
+    assert categories[expected] is True
+    assert sum(categories.values()) == 1

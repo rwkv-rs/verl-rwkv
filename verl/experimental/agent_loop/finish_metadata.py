@@ -22,6 +22,7 @@ ROLLOUT_FINISH_METADATA_KEYS = (
     "format_valid",
     "format_parser_version",
     "ended_by_eos",
+    "ended_by_stop_token",
     "repetition_truncated",
     "context_exhausted",
     "other_failure",
@@ -32,6 +33,7 @@ _STRICT_COT_PATTERN = re.compile(
     rf"\A<think>(?P<think>{_BLOCK_CONTENT})</think><answer>(?P<answer>{_BLOCK_CONTENT})</answer>\Z"
 )
 _EOS_BACKEND_REASONS = {None, 0, "eos", "eos_token", "eos_token_id"}
+_STOP_BACKEND_REASONS = {"stop", "stop_token", "stop_token_id"}
 _LENGTH_FINISH_REASONS = {"length", "max_length", "max_tokens", "max_length_truncated"}
 
 
@@ -58,6 +60,9 @@ def classify_rollout_finish(
     finish_reason: str | None,
     backend_stop_reason: Any,
     repetition_truncated: bool,
+    response_token_ids: list[int] | None = None,
+    eos_token_ids: list[int] | None = None,
+    stop_token_ids: list[int] | None = None,
 ) -> dict[str, bool]:
     """Return one auditable terminal category for a completed rollout attempt."""
     normalized_finish_reason = finish_reason.lower() if isinstance(finish_reason, str) else finish_reason
@@ -65,15 +70,26 @@ def classify_rollout_finish(
         backend_stop_reason.lower() if isinstance(backend_stop_reason, str) else backend_stop_reason
     )
 
-    ended_by_eos = (
+    final_token_id = response_token_ids[-1] if response_token_ids else None
+    ended_by_eos = not repetition_truncated and (
+        normalized_finish_reason in {"eos", "eos_token"}
+        or normalized_backend_reason in _EOS_BACKEND_REASONS - {None}
+        or (final_token_id is not None and final_token_id in set(eos_token_ids or ()))
+    )
+    ended_by_stop_token = (
         not repetition_truncated
-        and normalized_finish_reason in {"stop", "eos", "eos_token"}
-        and normalized_backend_reason in _EOS_BACKEND_REASONS
+        and not ended_by_eos
+        and normalized_finish_reason == "stop"
+        and (
+            normalized_backend_reason in _STOP_BACKEND_REASONS
+            or (final_token_id is not None and final_token_id in set(stop_token_ids or ()))
+        )
     )
     context_exhausted = not repetition_truncated and normalized_finish_reason in _LENGTH_FINISH_REASONS
-    other_failure = not (repetition_truncated or ended_by_eos or context_exhausted)
+    other_failure = not (repetition_truncated or ended_by_eos or ended_by_stop_token or context_exhausted)
     return {
         "ended_by_eos": ended_by_eos,
+        "ended_by_stop_token": ended_by_stop_token,
         "repetition_truncated": repetition_truncated,
         "context_exhausted": context_exhausted,
         "other_failure": other_failure,
@@ -86,6 +102,9 @@ def build_rollout_finish_metadata(
     finish_reason: str | None,
     backend_stop_reason: Any,
     repetition_truncated: bool,
+    response_token_ids: list[int] | None = None,
+    eos_token_ids: list[int] | None = None,
+    stop_token_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """Build the stable format and terminal metadata stored with a trajectory."""
     parsed = parse_strict_cot(text)
@@ -96,5 +115,8 @@ def build_rollout_finish_metadata(
             finish_reason=finish_reason,
             backend_stop_reason=backend_stop_reason,
             repetition_truncated=repetition_truncated,
+            response_token_ids=response_token_ids,
+            eos_token_ids=eos_token_ids,
+            stop_token_ids=stop_token_ids,
         ),
     }

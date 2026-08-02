@@ -33,6 +33,9 @@ def _identity(sample_index: int = 0, **overrides) -> RolloutResponseIdentity:
         "sampling": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 4096},
         "model_revision": "rwkv7-g1i@sha256:weights",
         "policy_lineage": "policy-0:lineage-digest",
+        "policy_version": 0,
+        "source_lineage": "checkpoint:sha256:source",
+        "runtime_identity": "vllm-rwkv:sha256:runtime",
     }
     values.update(overrides)
     return RolloutResponseIdentity(**values)
@@ -49,6 +52,8 @@ def _write(
         finish_reason="stop",
         backend_stop_reason=0,
         repetition_truncated=False,
+        response_token_ids=[101, 102, 0],
+        eos_token_ids=[0],
     )
 
 
@@ -72,6 +77,9 @@ def _make_tree_writable(path):
         ("sampling", {}, "sampling must be a non-empty mapping"),
         ("model_revision", "", "model_revision must be a non-empty string"),
         ("policy_lineage", "", "policy_lineage must be a non-empty string"),
+        ("policy_version", -1, "policy_version must be a non-negative integer"),
+        ("source_lineage", "", "source_lineage must be a non-empty string"),
+        ("runtime_identity", "", "runtime_identity must be a non-empty string"),
     ],
 )
 def test_response_identity_rejects_missing_or_invalid_contract_fields(field, value, error):
@@ -85,6 +93,49 @@ def test_response_identity_binds_sampling_model_and_lineage():
     assert baseline.digest != _identity(sampling={"temperature": 0.5}).digest
     assert baseline.digest != _identity(model_revision="different-model").digest
     assert baseline.digest != _identity(policy_lineage="policy-1:new-lineage").digest
+    assert baseline.digest != _identity(policy_version=1).digest
+    assert baseline.digest != _identity(source_lineage="checkpoint:sha256:other").digest
+    assert baseline.digest != _identity(runtime_identity="vllm-rwkv:sha256:other").digest
+
+
+def test_finish_metadata_is_recomputed_from_saved_token_ids(tmp_path):
+    identity = _identity()
+    store = RolloutShardArtifact(tmp_path, "shard-000", [identity])
+    token_ids = [1100, 1101, 1102, 1103] * 3
+
+    assert store.write_response(
+        identity,
+        "<think>x</think><answer>1</answer>",
+        finish_reason="stop",
+        backend_stop_reason="tail-repeat",
+        repetition_truncated=True,
+        response_token_ids=token_ids,
+        eos_token_ids=[0],
+        stop_token_ids=[261],
+    )
+    promoted = store.promote()
+    try:
+        record = json.loads((promoted / "records" / f"{identity.digest}.json").read_bytes())
+        assert record["finish"]["repetition_truncated"] is True
+        assert record["finish_source"]["response_token_ids"] == token_ids
+    finally:
+        _make_tree_writable(promoted)
+
+
+def test_response_token_ids_reject_inconsistent_repetition_flag(tmp_path):
+    identity = _identity()
+    store = RolloutShardArtifact(tmp_path, "shard-000", [identity])
+
+    with pytest.raises(ValueError, match="repetition_truncated conflicts"):
+        store.write_response(
+            identity,
+            "<think>x</think><answer>1</answer>",
+            finish_reason="stop",
+            backend_stop_reason=0,
+            repetition_truncated=True,
+            response_token_ids=[101, 102, 103],
+            eos_token_ids=[0],
+        )
 
 
 def test_partial_shard_resumes_without_rewriting_completed_records(tmp_path):
