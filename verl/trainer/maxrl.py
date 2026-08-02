@@ -67,6 +67,12 @@ OPERATIONAL_OVERRIDE_KEYS = frozenset(
         "trainer.save_freq",
     }
 )
+G1I_MODEL_ASSET = {
+    "repository": "BlinkDL/temp-latest-training-models",
+    "revision": "d5db8cdf837726ef65a22724c86fa2b6ca95d3d8",
+    "filename": "rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth",
+    "sha256": "22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586",
+}
 
 
 class MaxRLConfigError(ValueError):
@@ -154,6 +160,22 @@ def context_tokens_from_checkpoint(checkpoint: str) -> int:
     if matches[0] < 2:
         raise MaxRLConfigError("model context must leave room for prompt and response tokens")
     return matches[0]
+
+
+def validate_g1i_model_asset(model: Mapping[str, Any]) -> None:
+    """Bind the formal MaxRL rollout to the root-published g1i asset contract."""
+
+    for key, expected in G1I_MODEL_ASSET.items():
+        actual = _required(model, key, section_name="model")
+        if actual != expected:
+            raise MaxRLConfigError(f"model.{key} must match the published g1i asset: {expected!r}")
+    checkpoint = str(_required(model, "checkpoint", section_name="model"))
+    checkpoint_filename = checkpoint.replace("\\", "/").rsplit("/", 1)[-1]
+    if checkpoint_filename != G1I_MODEL_ASSET["filename"]:
+        raise MaxRLConfigError(
+            "model.checkpoint filename does not match model.filename: "
+            f"expected={G1I_MODEL_ASSET['filename']!r} actual={checkpoint_filename!r}"
+        )
 
 
 def _hydra(value: Any) -> str:
@@ -251,6 +273,10 @@ def _validate_resolved(
         "data.truncation": "error",
         "data.train_batch_size": str(prompts_per_step),
         "actor_rollout_ref.model.path": checkpoint_path,
+        "actor_rollout_ref.model.repository": G1I_MODEL_ASSET["repository"],
+        "actor_rollout_ref.model.revision": G1I_MODEL_ASSET["revision"],
+        "actor_rollout_ref.model.filename": G1I_MODEL_ASSET["filename"],
+        "actor_rollout_ref.model.sha256": G1I_MODEL_ASSET["sha256"],
         "trainer.v1.trainer_mode": "sync",
         "trainer.total_epochs": str(candidate_dataset_passes),
         "actor_rollout_ref.hybrid_engine": "True",
@@ -313,6 +339,7 @@ def build_overrides(
 
     if _required(algorithm, "name", section_name="algorithm") != "maxrl":
         raise MaxRLConfigError("verl.trainer.maxrl requires algorithm.name='maxrl'")
+    validate_g1i_model_asset(model)
     if "optimizer_steps" in experiment:
         raise MaxRLConfigError("MaxRL experiment.optimizer_steps was removed; use candidate_dataset_passes")
     passes = _nonnegative_int(
@@ -396,6 +423,10 @@ def build_overrides(
         f"reward.reward_manager.name={_required(reward, 'manager', section_name='reward')}",
         "model@actor_rollout_ref.model=rwkv_native",
         f"actor_rollout_ref.model.path={checkpoint_path}",
+        f"actor_rollout_ref.model.repository={G1I_MODEL_ASSET['repository']}",
+        f"actor_rollout_ref.model.revision={G1I_MODEL_ASSET['revision']}",
+        f"actor_rollout_ref.model.filename={G1I_MODEL_ASSET['filename']}",
+        f"actor_rollout_ref.model.sha256={G1I_MODEL_ASSET['sha256']}",
         "actor@actor_rollout_ref.actor=rwkv_lm",
         f"actor_rollout_ref.actor.engine.rwkv_lm_path={rwkv_lm_path}",
         f"actor_rollout_ref.actor.optim.lr={_required(optimizer, 'learning_rate', section_name='optimizer')}",
@@ -519,6 +550,10 @@ def build_overrides(
     child_env["RWKV_MODEL_PATH"] = checkpoint_path
     child_env["RWKV_LM_PATH"] = rwkv_lm_path
     child_env["VLLM_RWKV7_WKV_MODE"] = wkv_mode
+    child_env["HELICOPTER_MODEL_REPOSITORY"] = G1I_MODEL_ASSET["repository"]
+    child_env["HELICOPTER_MODEL_REVISION"] = G1I_MODEL_ASSET["revision"]
+    child_env["HELICOPTER_MODEL_FILENAME"] = G1I_MODEL_ASSET["filename"]
+    child_env["HELICOPTER_CHECKPOINT_SHA256"] = G1I_MODEL_ASSET["sha256"]
     return overrides, child_env
 
 

@@ -72,6 +72,12 @@ class PPOTrainerSync(PPOTrainer):
         self._export_contract = {
             "actor_engine": str(self.config.actor_rollout_ref.actor.strategy),
             "checkpoint_origin": checkpoint_origin,
+            "model_repository": self.config.actor_rollout_ref.model.get("repository")
+            or os.getenv("HELICOPTER_MODEL_REPOSITORY", "untracked"),
+            "model_revision": self.config.actor_rollout_ref.model.get("revision")
+            or os.getenv("HELICOPTER_MODEL_REVISION", "untracked"),
+            "model_filename": self.config.actor_rollout_ref.model.get("filename")
+            or os.getenv("HELICOPTER_MODEL_FILENAME", Path(model_path).name),
             "model_path": model_path,
             "rollout_engine": str(self.config.actor_rollout_ref.rollout.name),
             "floating_dtype": "bfloat16",

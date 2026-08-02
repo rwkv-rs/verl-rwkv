@@ -4,6 +4,12 @@ _target_: verl.models.rwkv.RWKVNativeModelConfig
 # Native RWKV checkpoint or model path
 path: ???
 
+# Immutable source identity for strict product profiles
+repository: null
+revision: null
+filename: null
+sha256: null
+
 # Tokenizer path
 tokenizer_path: null
 

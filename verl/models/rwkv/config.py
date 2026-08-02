@@ -34,6 +34,10 @@ class RWKVNativeModelConfig(BaseConfig):
     _mutable_fields = {"model_type", "tokenizer", "processor"}
 
     path: str = MISSING
+    repository: Optional[str] = None
+    revision: Optional[str] = None
+    filename: Optional[str] = None
+    sha256: Optional[str] = None
     tokenizer_path: Optional[str] = None
     model_type: str = "language_model"
     load_tokenizer: bool = True
