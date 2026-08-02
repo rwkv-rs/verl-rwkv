@@ -1,7 +1,7 @@
 # Fixed 1% DAPO-Math rollout campaign for the g1i preview checkpoint.
 defaults:
   - ppo_trainer
-  - override model@actor_rollout_ref.model: rwkv_native
+  - override model@actor_rollout_ref.model: hf_model
   - _self_
 
 rollout_campaign:
@@ -36,11 +36,9 @@ data:
 
 actor_rollout_ref:
   model:
-    path: ${oc.env:WEIGHT_PATH}/rwkv7/pth/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth
-    repository: BlinkDL/temp-latest-training-models
-    revision: d5db8cdf837726ef65a22724c86fa2b6ca95d3d8
-    filename: rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth
-    sha256: 22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586
+    path: ${oc.env:WEIGHT_PATH}/rwkv7/hf/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384
+    use_remove_padding: false
+    enable_gradient_checkpointing: false
 
   rollout:
     name: vllm

@@ -50,7 +50,6 @@ class RWKVNativeModelConfig(BaseConfig):
     head_size: Optional[int] = None
     vocab_size: Optional[int] = None
     lora: dict[str, object] = field(default_factory=dict)
-    weight_mapping: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         assert self.rwkv_version in ["v7"], f"rwkv_version {self.rwkv_version} not supported"

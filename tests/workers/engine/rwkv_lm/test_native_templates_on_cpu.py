@@ -228,7 +228,7 @@ def test_rwkv_engine_weight_generator_accepts_common_update_kwargs():
 
     class FakeModel:
         def state_dict(self):
-            return {"_forward_module.emb.weight": "emb"}
+            return {"model.embeddings.weight": "emb"}
 
     engine = RWKVLMEngine(
         model_config=None,
@@ -240,7 +240,7 @@ def test_rwkv_engine_weight_generator_accepts_common_update_kwargs():
 
     weights, peft_config = engine.get_per_tensor_param(layered_summon=False, base_sync_done=True)
 
-    assert list(weights) == [("emb.weight", "emb")]
+    assert list(weights) == [("model.embeddings.weight", "emb")]
     assert peft_config is None
 
 

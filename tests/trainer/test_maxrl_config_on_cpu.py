@@ -32,7 +32,6 @@ ROOT = Path(__file__).resolve().parents[2]
 ENV = {
     "WEIGHT_PATH": "/weights",
     "DATASETS_PATH": "/datasets",
-    "RWKV_LM_PATH": "/src/rwkv-lm",
 }
 CONFIG_TOML = """
 [experiment]
@@ -47,7 +46,8 @@ repository = "BlinkDL/temp-latest-training-models"
 revision = "d5db8cdf837726ef65a22724c86fa2b6ca95d3d8"
 filename = "rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
 sha256 = "22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586"
-checkpoint = "/weights/rwkv7/pth/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
+legacy_checkpoint = "/weights/rwkv7/pth/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
+checkpoint = "/weights/rwkv7/hf/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384"
 prompt_mode = "open_think"
 prompt_template = "\\nBot✿"
 
@@ -138,10 +138,12 @@ def test_compiles_strict_maxrl_contract() -> None:
     assert values["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"] == "1"
     assert values["actor_rollout_ref.rollout.n"] == "16"
     assert values["actor_rollout_ref.rollout.max_model_len"] == "16384"
-    assert values["actor_rollout_ref.model.repository"] == G1I_MODEL_ASSET["repository"]
-    assert values["actor_rollout_ref.model.revision"] == G1I_MODEL_ASSET["revision"]
-    assert values["actor_rollout_ref.model.filename"] == G1I_MODEL_ASSET["filename"]
-    assert values["actor_rollout_ref.model.sha256"] == G1I_MODEL_ASSET["sha256"]
+    assert values["model@actor_rollout_ref.model"] == "hf_model"
+    assert values["actor@actor_rollout_ref.actor"] == "dp_actor"
+    assert values["ref@actor_rollout_ref.ref"] == "dp_ref"
+    assert values["actor_rollout_ref.model.use_remove_padding"] == "False"
+    assert values["actor_rollout_ref.model.enable_gradient_checkpointing"] == "False"
+    assert values["actor_rollout_ref.actor.checkpoint.save_contents"] == "[model,optimizer,extra,hf_model]"
     assert values["actor_rollout_ref.rollout.ignore_eos"] == "False"
     assert values["actor_rollout_ref.rollout.top_p"] == "0.95"
     assert values["data.val_files"] == "null"
@@ -181,11 +183,19 @@ def test_model_asset_identity_rejects_mixed_catalog_fields(field: str, value: st
         build_overrides(modified, env=ENV)
 
 
-def test_model_asset_identity_rejects_checkpoint_filename_mismatch() -> None:
+def test_model_asset_identity_rejects_legacy_checkpoint_filename_mismatch() -> None:
     modified = deepcopy(config())
-    modified["model"]["checkpoint"] = "/weights/rwkv7/pth/rwkv7-g1h-7.2b-20260710-ctx10240.pth"
+    modified["model"]["legacy_checkpoint"] = "/weights/rwkv7/pth/rwkv7-g1h-7.2b-20260710-ctx10240.pth"
 
-    with pytest.raises(MaxRLConfigError, match="checkpoint filename does not match"):
+    with pytest.raises(MaxRLConfigError, match="legacy_checkpoint filename does not match"):
+        build_overrides(modified, env=ENV)
+
+
+def test_runtime_rejects_raw_checkpoint_and_names_one_time_converter() -> None:
+    modified = deepcopy(config())
+    modified["model"]["checkpoint"] = modified["model"]["legacy_checkpoint"]
+
+    with pytest.raises(MaxRLConfigError, match="convert_rwkv7_checkpoint_to_hf"):
         build_overrides(modified, env=ENV)
 
 
@@ -292,10 +302,18 @@ def test_compiler_output_composes_with_real_hydra_schema() -> None:
     assert composed.actor_rollout_ref.rollout.disable_log_stats is False
     assert composed.actor_rollout_ref.rollout.max_model_len == 16384
     assert composed.actor_rollout_ref.rollout.response_length == 16384
-    assert composed.actor_rollout_ref.model.repository == G1I_MODEL_ASSET["repository"]
-    assert composed.actor_rollout_ref.model.revision == G1I_MODEL_ASSET["revision"]
-    assert composed.actor_rollout_ref.model.filename == G1I_MODEL_ASSET["filename"]
-    assert composed.actor_rollout_ref.model.sha256 == G1I_MODEL_ASSET["sha256"]
+    assert composed.actor_rollout_ref.model._target_ == "verl.workers.config.HFModelConfig"
+    assert composed.actor_rollout_ref.actor._target_ == "verl.workers.config.FSDPActorConfig"
+    assert composed.actor_rollout_ref.ref._target_ == "verl.workers.config.FSDPActorConfig"
+    assert composed.actor_rollout_ref.model.path.endswith("rwkv7-g1i_preview5445-1.5b-20260729-ctx16384")
+    assert composed.actor_rollout_ref.model.use_remove_padding is False
+    assert composed.actor_rollout_ref.model.enable_gradient_checkpointing is False
+    assert list(composed.actor_rollout_ref.actor.checkpoint.save_contents) == [
+        "model",
+        "optimizer",
+        "extra",
+        "hf_model",
+    ]
     assert composed.data.val_files is None
     assert composed.trainer.val_before_train is True
     assert composed.trainer.test_freq == 50

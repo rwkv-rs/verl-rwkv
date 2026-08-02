@@ -19,7 +19,6 @@ __all__ = [
     "RWKVNativeModelConfig",
     "build_rwkv_tokenizer",
     "import_rwkv_lm",
-    "map_verl_to_rwkv_lm",
     "resolve_rwkv_lm_paths",
 ]
 
@@ -43,8 +42,4 @@ def __getattr__(name: str) -> Any:
         from .tokenizer import build_rwkv_tokenizer
 
         return build_rwkv_tokenizer
-    if name == "map_verl_to_rwkv_lm":
-        from .weight_mapping import map_verl_to_rwkv_lm
-
-        return map_verl_to_rwkv_lm
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

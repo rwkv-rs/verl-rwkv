@@ -13,23 +13,8 @@
 # limitations under the License.
 
 import importlib.util
-import sys
-import types
-from pathlib import Path
 
 import torch
-
-
-def _install_weight_mapping_module():
-    for name in ("verl", "verl.models", "verl.models.rwkv"):
-        module = types.ModuleType(name)
-        module.__path__ = []
-        sys.modules[name] = module
-    path = Path("verl/models/rwkv/weight_mapping.py")
-    spec = importlib.util.spec_from_file_location("verl.models.rwkv.weight_mapping", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["verl.models.rwkv.weight_mapping"] = module
-    spec.loader.exec_module(module)
 
 
 def _load_module(name: str, path: str):
@@ -42,25 +27,25 @@ def _load_module(name: str, path: str):
 class FakeModel:
     def state_dict(self):
         return {
-            "_forward_module.emb.weight": "emb",
+            "model.embeddings.weight": "emb",
             "head.weight": "head",
         }
 
 
-def test_rwkv_lm_weight_bridge_exports_state_dict_items_with_native_key_mapping():
-    _install_weight_mapping_module()
+def test_rwkv_lm_weight_bridge_preserves_standard_hf_state_dict_keys():
     bridge = _load_module("rwkv_lm_weight_bridge_test", "verl/workers/engine/rwkv_lm/weight_bridge.py")
 
     assert list(bridge.iter_rwkv_lm_state_dict_weights(FakeModel())) == [
-        ("emb.weight", "emb"),
+        ("model.embeddings.weight", "emb"),
         ("head.weight", "head"),
     ]
 
 
 def test_rwkv_lm_weight_bridge_exports_floating_tensors_as_bf16():
-    _install_weight_mapping_module()
     bridge = _load_module("rwkv_lm_weight_bridge_dtype_test", "verl/workers/engine/rwkv_lm/weight_bridge.py")
 
-    weights = dict(bridge.export_rwkv_lm_weights([("emb.weight", torch.ones(2, dtype=torch.float32))]))
+    weights = dict(
+        bridge.export_rwkv_lm_weights([("model.embeddings.weight", torch.ones(2, dtype=torch.float32))])
+    )
 
-    assert weights["emb.weight"].dtype is torch.bfloat16
+    assert weights["model.embeddings.weight"].dtype is torch.bfloat16

@@ -28,8 +28,5 @@ head_size: null
 # Vocabulary size
 vocab_size: null
 
-# Optional explicit weight-name mapping
-weight_mapping: {}
-
 # Optional PEFT runtime. Antidoom is enabled only with adapter=antidoom_rwkv.
 lora: {}

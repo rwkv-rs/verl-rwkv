@@ -27,11 +27,9 @@ def _to_rollout_weight_dtype(weight: Any) -> Any:
 
 
 def export_rwkv_lm_weights(weights: Iterable[tuple[str, Any]]) -> Generator[tuple[str, Any], None, None]:
-    """Export native rwkv-lm weights for rollout synchronization."""
+    """Export standard Transformers state-dict weights for rollout synchronization."""
 
-    from verl.models.rwkv.weight_mapping import map_verl_to_rwkv_lm
-
-    for name, weight in map_verl_to_rwkv_lm(weights):
+    for name, weight in weights:
         yield name, _to_rollout_weight_dtype(weight)
 
 
