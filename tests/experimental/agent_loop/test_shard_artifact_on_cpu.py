@@ -18,6 +18,7 @@ import stat
 
 import pytest
 
+from verl.experimental.agent_loop.campaign_fields import deterministic_campaign_seed
 from verl.experimental.agent_loop.shard_artifact import (
     RolloutCampaignArtifact,
     RolloutResponseIdentity,
@@ -34,7 +35,16 @@ def _campaign(root, *, rollouts_per_problem=4):
         rollouts_per_problem=rollouts_per_problem,
         dataset_fingerprint="sha256:dapo-17k",
         source_revision="verl-rwkv@abc123",
-        parameters={"temperature": 1.0, "rollouts_per_problem": rollouts_per_problem},
+        parameters={
+            "base_seed": 20260801,
+            "sampling": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 4096},
+            "model_revision": "rwkv7-g1i@sha256:weights",
+            "policy_lineage": "policy-0:lineage-digest",
+            "policy_version": 0,
+            "source_lineage": "checkpoint:sha256:source",
+            "runtime_identity": "vllm-rwkv:sha256:runtime",
+            "rollouts_per_problem": rollouts_per_problem,
+        },
     )
 
 
@@ -69,15 +79,20 @@ def _write_campaign_completion(store, problem_id, rollout_index, *, response=Non
         },
     }[category]
     return store.write_completion(
-        problem_id,
-        rollout_index,
+        _identity(
+            rollout_index,
+            prompt_id=problem_id,
+            seed=deterministic_campaign_seed(
+                "dapo-campaign",
+                problem_id,
+                rollout_index,
+                20260801,
+            ),
+        ),
         response
         if response is not None
-        else (
-            "invalid"
-            if category == 3
-            else "<think>work</think><answer>42</answer>"
-        ),
+        else ("invalid" if category == 3 else "<think>work</think><answer>42</answer>"),
+        reward=float(rollout_index % 2),
         **values,
     )
 
@@ -149,20 +164,34 @@ def test_campaign_tiny_3x4_resumes_out_of_order_and_finalizes_deterministically(
     assert result["contract"]["parameters"]["rollouts_per_problem"] == 4
     assert result["counts"] == {
         "total": 12,
-        "strict_cot_format": 9,
+        "format_valid": 9,
         "ended_by_eos": 3,
-        "length_truncated": 3,
+        "ended_by_stop_token": 3,
         "repetition_truncated": 3,
+        "context_exhausted": 3,
+        "other_failure": 0,
     }
     assert result["rates"] == {
-        "strict_cot_format": 0.75,
+        "format_valid": 0.75,
         "ended_by_eos": 0.25,
-        "length_truncated": 0.25,
+        "ended_by_stop_token": 0.25,
         "repetition_truncated": 0.25,
+        "context_exhausted": 0.25,
+        "other_failure": 0.0,
     }
+    assert resumed.pending_pairs() == ()
+    assert not resumed.partial_path.exists()
+    first_record = json.loads(next((resumed.promoted_path / "records").glob("*/*.json")).read_bytes())
+    assert first_record["identity"]["seed"] >= 20260801
+    assert first_record["identity"]["model_revision"] == "rwkv7-g1i@sha256:weights"
+    assert isinstance(first_record["reward"], float)
+    assert len(result["records_sha256"]) == 64
+    for path in [resumed.promoted_path, resumed.promoted_path / "records", resumed.final_path]:
+        assert path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) == 0
     assert resumed.finalize() == result
     assert resumed.final_path.read_bytes() == payload
     assert _campaign(tmp_path).finalize() == result
+    _make_tree_writable(resumed.promoted_path)
 
 
 def test_campaign_rejects_duplicate_conflict_and_invalid_pair(tmp_path):
@@ -180,6 +209,41 @@ def test_campaign_rejects_duplicate_conflict_and_invalid_pair(tmp_path):
         _write_campaign_completion(store, "problem-a", 4)
     with pytest.raises(ValueError, match="not part of this campaign"):
         _write_campaign_completion(store, "unknown", 0)
+
+
+def test_campaign_rejects_response_identity_outside_frozen_contract(tmp_path):
+    store = _campaign(tmp_path)
+    identity = _identity(
+        0,
+        prompt_id="problem-a",
+        seed=deterministic_campaign_seed("dapo-campaign", "problem-a", 0, 20260801),
+        policy_lineage="policy-0:different-lineage",
+    )
+
+    with pytest.raises(ValueError, match="conflicts with campaign fields: policy_lineage"):
+        store.write_completion(
+            identity,
+            "<think>work</think><answer>42</answer>",
+            reward=1.0,
+            finish_reason="stop",
+            backend_stop_reason=0,
+            repetition_truncated=False,
+            response_token_ids=[101, 0],
+            eos_token_ids=[0],
+        )
+
+
+def test_campaign_requires_complete_frozen_identity_parameters(tmp_path):
+    with pytest.raises(ValueError, match="missing identity fields"):
+        RolloutCampaignArtifact(
+            tmp_path,
+            "incomplete-campaign",
+            ["problem-a"],
+            rollouts_per_problem=1,
+            dataset_fingerprint="sha256:dapo-17k",
+            source_revision="verl-rwkv@abc123",
+            parameters={"base_seed": 1},
+        )
 
 
 def test_campaign_finalize_rejects_any_missing_pair(tmp_path):

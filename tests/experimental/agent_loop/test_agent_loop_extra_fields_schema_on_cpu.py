@@ -22,6 +22,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+import verl.experimental.agent_loop.agent_loop as agent_loop_module
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     AgentLoopOutput,
@@ -29,7 +30,9 @@ from verl.experimental.agent_loop.agent_loop import (
     DictConfigWrap,
     _InternalAgentLoopOutput,
 )
+from verl.experimental.agent_loop.campaign_fields import CAMPAIGN_SAMPLING_SEED_FIELD
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.protocol import DataProto
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
 
@@ -416,3 +419,53 @@ async def test_agent_loop_pad_token_ids_empty_with_non_zero_pad_id():
     # attention_mask should be all zeros
     expected_attention_mask = torch.zeros((1, 8), dtype=torch.long)
     torch.testing.assert_close(result["attention_mask"], expected_attention_mask)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_worker_applies_campaign_seed_per_sample(monkeypatch):
+    observed = []
+
+    async def fake_trajectory_info(step, sample_indices, validate):
+        del step, validate
+        return [{"sample_index": value} for value in sample_indices]
+
+    class _DummyWorker:
+        rollout_config = OmegaConf.create(
+            {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": -1,
+                "calculate_log_probs": False,
+                "agent": {"default_agent_loop": "single_turn_agent"},
+            }
+        )
+
+        async def _run_agent_loop(self, sampling_params, trajectory, *, trace, **kwargs):
+            del self, trajectory, trace
+            observed.append((sampling_params, kwargs))
+            return object()
+
+        def _postprocess(self, outputs, *, input_non_tensor_batch, validate):
+            del self, outputs, input_non_tensor_batch, validate
+            return DataProto.from_dict(non_tensors={"ok": np.asarray([True, True])})
+
+    monkeypatch.setattr(agent_loop_module, "get_trajectory_info", fake_trajectory_info)
+    monkeypatch.setattr(
+        agent_loop_module.RolloutTraceConfig.get_instance(),
+        "max_samples_per_step_per_worker",
+        None,
+    )
+    batch = DataProto.from_dict(
+        non_tensors={
+            "index": np.asarray(["problem-a", "problem-b"], dtype=object),
+            CAMPAIGN_SAMPLING_SEED_FIELD: np.asarray([101, 202], dtype=np.int64),
+            "raw_prompt": np.asarray(["A", "B"], dtype=object),
+        }
+    )
+
+    result = await AgentLoopWorker.generate_sequences(_DummyWorker(), batch)
+
+    assert len(result) == 2
+    assert [params["seed"] for params, _ in observed] == [101, 202]
+    assert all(CAMPAIGN_SAMPLING_SEED_FIELD not in kwargs for _, kwargs in observed)
+    assert [kwargs["raw_prompt"] for _, kwargs in observed] == ["A", "B"]

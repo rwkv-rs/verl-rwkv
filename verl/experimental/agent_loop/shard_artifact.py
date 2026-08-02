@@ -16,19 +16,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from verl.experimental.agent_loop.campaign_fields import deterministic_campaign_seed
 from verl.experimental.agent_loop.finish_metadata import ROLLOUT_FINISH_METADATA_KEYS, build_rollout_finish_metadata
 from verl.trainer.ppo.v1.policy_identity import canonical_digest
 from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector
 
 SHARD_ARTIFACT_SCHEMA_VERSION = 2
-ROLLOUT_CAMPAIGN_SCHEMA_VERSION = 1
+ROLLOUT_CAMPAIGN_SCHEMA_VERSION = 2
+ROLLOUT_CAMPAIGN_PARAMETER_KEYS = (
+    "base_seed",
+    "sampling",
+    "model_revision",
+    "policy_lineage",
+    "policy_version",
+    "source_lineage",
+    "runtime_identity",
+)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -51,6 +63,28 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _validate_campaign_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(parameters, Mapping):
+        raise ValueError("campaign parameters must be a mapping")
+    missing = [key for key in ROLLOUT_CAMPAIGN_PARAMETER_KEYS if key not in parameters]
+    if missing:
+        raise ValueError(f"campaign parameters are missing identity fields: {', '.join(missing)}")
+    if isinstance(parameters["base_seed"], bool) or not isinstance(parameters["base_seed"], int):
+        raise ValueError("campaign base_seed must be an integer")
+    if not isinstance(parameters["sampling"], Mapping) or not parameters["sampling"]:
+        raise ValueError("campaign sampling must be a non-empty mapping")
+    if (
+        isinstance(parameters["policy_version"], bool)
+        or not isinstance(parameters["policy_version"], int)
+        or parameters["policy_version"] < 0
+    ):
+        raise ValueError("campaign policy_version must be a non-negative integer")
+    for key in ("model_revision", "policy_lineage", "source_lineage", "runtime_identity"):
+        _require_nonempty_string(f"campaign {key}", parameters[key])
+    canonical = json.loads(_canonical_bytes(parameters))
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -94,6 +128,27 @@ class RolloutResponseIdentity:
             "source_lineage": self.source_lineage,
             "runtime_identity": self.runtime_identity,
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> RolloutResponseIdentity:
+        required = {
+            "prompt_id",
+            "sample_index",
+            "seed",
+            "sampling",
+            "sampling_digest",
+            "model_revision",
+            "policy_lineage",
+            "policy_version",
+            "source_lineage",
+            "runtime_identity",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ValueError("response identity has an invalid schema")
+        identity = cls(**{key: value[key] for key in required if key != "sampling_digest"})
+        if value["sampling_digest"] != canonical_digest(identity.sampling):
+            raise ValueError("response identity sampling digest mismatch")
+        return identity
 
     @property
     def digest(self) -> str:
@@ -265,49 +320,41 @@ class RolloutCampaignArtifact:
             or rollouts_per_problem <= 0
         ):
             raise ValueError("rollouts_per_problem must be a positive integer")
-        if not isinstance(parameters, Mapping) or not parameters:
-            raise ValueError("parameters must be a non-empty mapping")
-        _canonical_bytes(parameters)
+        canonical_parameters = _validate_campaign_parameters(parameters)
         self.problem_ids = problems
+        self.problem_id_set = frozenset(problems)
         self.rollouts_per_problem = rollouts_per_problem
-        self.expected_pairs = {
-            self._pair_digest(problem_id, rollout_index): (problem_id, rollout_index)
-            for problem_id in problems
-            for rollout_index in range(rollouts_per_problem)
-        }
+        self.expected_pair_count = len(problems) * rollouts_per_problem
         self.partial_path = self.root / f".{self.campaign_id}.campaign"
-        self.final_path = self.root / f"{self.campaign_id}.completion.json"
+        self.promoted_path = self.root / self.campaign_id
+        self.final_path = self.promoted_path / "manifest.json"
         self.contract = {
             "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
             "campaign_id": self.campaign_id,
             "problem_ids": list(problems),
             "rollouts_per_problem": rollouts_per_problem,
-            "dataset_fingerprint": _require_nonempty_string(
-                "dataset_fingerprint", dataset_fingerprint
-            ),
-            "source_revision": _require_nonempty_string(
-                "source_revision", source_revision
-            ),
-            "parameters": dict(parameters),
-            "expected_pair_count": len(self.expected_pairs),
+            "dataset_fingerprint": _require_nonempty_string("dataset_fingerprint", dataset_fingerprint),
+            "source_revision": _require_nonempty_string("source_revision", source_revision),
+            "parameters": canonical_parameters,
+            "expected_pair_count": self.expected_pair_count,
         }
         self._open_or_create()
 
+    @property
+    def is_promoted(self) -> bool:
+        return self.promoted_path.is_dir()
+
     @staticmethod
     def _pair_digest(problem_id: str, rollout_index: int) -> str:
-        return _sha256(
-            _canonical_bytes(
-                {"problem_id": problem_id, "rollout_index": rollout_index}
-            )
-        )
+        return _sha256(_canonical_bytes({"problem_id": problem_id, "rollout_index": rollout_index}))
 
     def _open_or_create(self) -> None:
         payload = _canonical_bytes(self.contract)
-        if self.final_path.is_file():
-            final = json.loads(self.final_path.read_bytes())
-            if final.get("contract") != self.contract:
-                raise RuntimeError("finalized campaign contract conflicts with the request")
+        if self.is_promoted:
+            _validate_promoted_campaign(self.promoted_path, self.contract)
             return
+        if self.promoted_path.exists():
+            raise RuntimeError("promoted campaign path exists but is not a directory")
         self.partial_path.mkdir(parents=True, exist_ok=True)
         try:
             _atomic_write_new(self.partial_path / "contract.json", payload)
@@ -315,12 +362,84 @@ class RolloutCampaignArtifact:
             if (self.partial_path / "contract.json").read_bytes() != payload:
                 raise RuntimeError("partial campaign contract conflicts with the request") from None
 
-    def write_completion(
+    def completed_pairs(self) -> frozenset[tuple[str, int]]:
+        """Return a validated snapshot of completed pairs for small-campaign inspection."""
+
+        if self.is_promoted:
+            _validate_promoted_campaign(self.promoted_path, self.contract)
+            return frozenset(
+                (problem_id, rollout_index)
+                for problem_id in self.problem_ids
+                for rollout_index in range(self.rollouts_per_problem)
+            )
+        paths = _campaign_record_paths(self.partial_path)
+        completed: set[tuple[str, int]] = set()
+        for path in paths:
+            record, _ = _load_campaign_record(path)
+            identity = record["identity"]
+            pair = (identity["prompt_id"], identity["sample_index"])
+            digest = self._pair_digest(*pair)
+            if digest != path.stem or not self.contains_pair(*pair):
+                raise RuntimeError(f"campaign record {path.name} has an invalid pair")
+            completed.add(pair)
+        return frozenset(completed)
+
+    def pending_pairs(self) -> tuple[tuple[str, int], ...]:
+        """Return missing pairs in stable dataset then rollout-index order."""
+
+        completed = self.completed_pairs()
+        return tuple(
+            (problem_id, rollout_index)
+            for problem_id in self.problem_ids
+            for rollout_index in range(self.rollouts_per_problem)
+            if (problem_id, rollout_index) not in completed
+        )
+
+    def contains_pair(self, problem_id: str, rollout_index: int) -> bool:
+        return problem_id in self.problem_id_set and 0 <= rollout_index < self.rollouts_per_problem
+
+    def has_completion(
         self,
         problem_id: str,
         rollout_index: int,
+        *,
+        expected_identity: RolloutResponseIdentity | None = None,
+    ) -> bool:
+        if not self.contains_pair(problem_id, rollout_index):
+            raise ValueError("problem-rollout pair is outside the campaign contract")
+        if self.is_promoted:
+            return True
+        path = _campaign_record_path(
+            self.partial_path,
+            self._pair_digest(problem_id, rollout_index),
+        )
+        if not path.is_file():
+            return False
+        record, _ = _load_campaign_record(path)
+        identity = RolloutResponseIdentity.from_dict(record["identity"])
+        if (identity.prompt_id, identity.sample_index) != (problem_id, rollout_index):
+            raise RuntimeError(f"campaign record {path.name} has an invalid pair")
+        if expected_identity is not None and identity.digest != expected_identity.digest:
+            raise RuntimeError(f"campaign record {path.name} conflicts with the resumed policy identity")
+        return True
+
+    def remaining_count(self) -> int:
+        if self.is_promoted:
+            return 0
+        completed = sum(1 for _ in _campaign_record_paths(self.partial_path))
+        if completed > self.expected_pair_count:
+            raise RuntimeError(
+                "campaign contains more records than its contract: "
+                f"expected={self.expected_pair_count}, actual={completed}"
+            )
+        return self.expected_pair_count - completed
+
+    def write_completion(
+        self,
+        identity: RolloutResponseIdentity,
         response: str,
         *,
+        reward: float,
         finish_reason: str | None,
         backend_stop_reason: Any,
         repetition_truncated: bool,
@@ -328,8 +447,10 @@ class RolloutCampaignArtifact:
         eos_token_ids: Sequence[int] = (),
         stop_token_ids: Sequence[int] = (),
     ) -> bool:
-        if self.final_path.is_file():
+        if self.is_promoted:
             raise RuntimeError("finalized campaigns are read-only")
+        problem_id = identity.prompt_id
+        rollout_index = identity.sample_index
         if problem_id not in self.problem_ids:
             raise ValueError("problem_id is not part of this campaign")
         if (
@@ -338,8 +459,11 @@ class RolloutCampaignArtifact:
             or not 0 <= rollout_index < self.rollouts_per_problem
         ):
             raise ValueError("rollout_index is outside the campaign range")
+        _validate_campaign_identity(identity, self.contract)
         if not isinstance(response, str):
             raise TypeError("response must be a string")
+        if isinstance(reward, bool) or not isinstance(reward, int | float) or not math.isfinite(reward):
+            raise TypeError("reward must be a finite number")
         token_ids = list(response_token_ids)
         if any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in token_ids):
             raise TypeError("response_token_ids must contain only integers")
@@ -354,76 +478,41 @@ class RolloutCampaignArtifact:
             "eos_token_ids": list(eos_token_ids),
             "stop_token_ids": list(stop_token_ids),
         }
-        pair = {"problem_id": problem_id, "rollout_index": rollout_index}
         record = {
             "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
-            "pair": pair,
             "pair_digest": self._pair_digest(problem_id, rollout_index),
+            "identity": identity.as_dict(),
+            "identity_digest": identity.digest,
             "response": response,
+            "reward": float(reward),
             "finish_source": finish_source,
             "finish": build_rollout_finish_metadata(response, **finish_source),
         }
         payload = _canonical_bytes(record)
-        record_path = self.partial_path / "records" / f"{record['pair_digest']}.json"
+        record_path = _campaign_record_path(self.partial_path, record["pair_digest"])
         try:
             _atomic_write_new(record_path, payload)
         except FileExistsError:
             if record_path.read_bytes() == payload:
                 return False
-            raise RuntimeError(
-                f"conflicting completion for pair ({problem_id!r}, {rollout_index})"
-            ) from None
+            raise RuntimeError(f"conflicting completion for pair ({problem_id!r}, {rollout_index})") from None
         return True
 
     def finalize(self) -> dict[str, Any]:
-        if self.final_path.is_file():
-            payload = self.final_path.read_bytes()
-            result = json.loads(payload)
-            if _canonical_bytes(result) != payload or result.get("contract") != self.contract:
-                raise RuntimeError("finalized campaign artifact is invalid")
-            return result
-        records_dir = self.partial_path / "records"
-        paths = sorted(records_dir.glob("*.json")) if records_dir.is_dir() else []
-        actual = {path.stem for path in paths}
-        expected = set(self.expected_pairs)
-        if actual != expected:
-            missing = [self.expected_pairs[digest] for digest in sorted(expected - actual)]
-            unexpected = sorted(actual - expected)
-            raise RuntimeError(
-                f"campaign is incomplete: missing={missing}, unexpected={unexpected}"
-            )
-        counts = {
-            "strict_cot_format": 0,
-            "ended_by_eos": 0,
-            "length_truncated": 0,
-            "repetition_truncated": 0,
-        }
-        record_sha256 = {}
-        for path in paths:
-            record, payload = _load_campaign_record(path)
-            pair = record["pair"]
-            digest = self._pair_digest(pair["problem_id"], pair["rollout_index"])
-            if digest != path.stem or self.expected_pairs.get(digest) != (
-                pair["problem_id"],
-                pair["rollout_index"],
-            ):
-                raise RuntimeError(f"campaign record {path.name} has an invalid pair")
-            finish = record["finish"]
-            counts["strict_cot_format"] += int(finish["format_valid"])
-            counts["ended_by_eos"] += int(finish["ended_by_eos"])
-            counts["length_truncated"] += int(finish["context_exhausted"])
-            counts["repetition_truncated"] += int(finish["repetition_truncated"])
-            record_sha256[path.stem] = _sha256(payload)
-        total = len(paths)
-        result = {
-            "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
-            "contract": self.contract,
-            "counts": {"total": total, **counts},
-            "rates": {name: count / total for name, count in counts.items()},
-            "record_sha256": record_sha256,
-        }
-        _atomic_write_new(self.final_path, _canonical_bytes(result))
-        return result
+        if self.is_promoted:
+            return _validate_promoted_campaign(self.promoted_path, self.contract)
+        result = _build_campaign_manifest(self.partial_path, self.contract)
+        manifest_path = self.partial_path / "manifest.json"
+        manifest_payload = _canonical_bytes(result)
+        if manifest_path.is_file():
+            if manifest_path.read_bytes() != manifest_payload:
+                raise RuntimeError("partial campaign manifest conflicts with its records")
+        else:
+            _atomic_replace(manifest_path, manifest_payload)
+        _make_campaign_read_only(self.partial_path)
+        os.replace(self.partial_path, self.promoted_path)
+        _fsync_directory(self.root)
+        return _validate_promoted_campaign(self.promoted_path, self.contract)
 
 
 def _load_campaign_record(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -436,9 +525,11 @@ def _load_campaign_record(path: Path) -> tuple[dict[str, Any], bytes]:
         raise RuntimeError(f"campaign record {path.name} is not canonical")
     required = {
         "schema_version",
-        "pair",
         "pair_digest",
+        "identity",
+        "identity_digest",
         "response",
+        "reward",
         "finish_source",
         "finish",
     }
@@ -446,6 +537,21 @@ def _load_campaign_record(path: Path) -> tuple[dict[str, Any], bytes]:
         raise RuntimeError(f"campaign record {path.name} has an invalid schema")
     if not isinstance(record["response"], str):
         raise RuntimeError(f"campaign record {path.name} has an invalid response")
+    try:
+        identity = RolloutResponseIdentity.from_dict(record["identity"])
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"campaign record {path.name} has an invalid identity") from error
+    if identity.digest != record["identity_digest"]:
+        raise RuntimeError(f"campaign record {path.name} identity digest mismatch")
+    pair_digest = RolloutCampaignArtifact._pair_digest(identity.prompt_id, identity.sample_index)
+    if record["pair_digest"] != pair_digest or path.stem != pair_digest or path.parent.name != pair_digest[:2]:
+        raise RuntimeError(f"campaign record {path.name} pair digest mismatch")
+    if (
+        isinstance(record["reward"], bool)
+        or not isinstance(record["reward"], int | float)
+        or not math.isfinite(record["reward"])
+    ):
+        raise RuntimeError(f"campaign record {path.name} has an invalid reward")
     finish_source = record["finish_source"]
     if not isinstance(finish_source, dict) or set(finish_source) != {
         "finish_reason",
@@ -467,7 +573,173 @@ def _load_campaign_record(path: Path) -> tuple[dict[str, Any], bytes]:
     expected_finish = build_rollout_finish_metadata(record["response"], **finish_source)
     if record["finish"] != expected_finish:
         raise RuntimeError(f"campaign record {path.name} finish metadata mismatch")
+    if set(record["finish"]) != set(ROLLOUT_FINISH_METADATA_KEYS):
+        raise RuntimeError(f"campaign record {path.name} has incomplete finish metadata")
+    categories = [record["finish"][key] for key in ROLLOUT_FINISH_METADATA_KEYS[2:]]
+    if any(not isinstance(value, bool) for value in categories) or sum(categories) != 1:
+        raise RuntimeError(f"campaign record {path.name} has invalid finish categories")
     return record, payload
+
+
+def _campaign_record_path(campaign_path: Path, pair_digest: str) -> Path:
+    return campaign_path / "records" / pair_digest[:2] / f"{pair_digest}.json"
+
+
+def _campaign_record_paths(campaign_path: Path) -> Iterator[Path]:
+    records_dir = campaign_path / "records"
+    if not records_dir.is_dir():
+        return
+    for shard_path in sorted(records_dir.iterdir()):
+        if (
+            shard_path.is_symlink()
+            or not shard_path.is_dir()
+            or len(shard_path.name) != 2
+            or any(character not in "0123456789abcdef" for character in shard_path.name)
+        ):
+            raise RuntimeError(f"campaign records contain an unexpected entry: {shard_path.name}")
+        for record_path in sorted(shard_path.iterdir()):
+            if record_path.is_symlink() or not record_path.is_file() or record_path.suffix != ".json":
+                raise RuntimeError(
+                    f"campaign record shard {shard_path.name} contains an unexpected entry: {record_path.name}"
+                )
+            yield record_path
+
+
+def _validate_campaign_identity(
+    identity: RolloutResponseIdentity,
+    contract: Mapping[str, Any],
+) -> None:
+    parameters = contract["parameters"]
+    expected = {
+        "sampling": parameters["sampling"],
+        "model_revision": parameters["model_revision"],
+        "policy_lineage": parameters["policy_lineage"],
+        "policy_version": parameters["policy_version"],
+        "source_lineage": parameters["source_lineage"],
+        "runtime_identity": parameters["runtime_identity"],
+        "seed": deterministic_campaign_seed(
+            contract["campaign_id"],
+            identity.prompt_id,
+            identity.sample_index,
+            parameters["base_seed"],
+        ),
+    }
+    actual = {
+        "sampling": dict(identity.sampling),
+        "model_revision": identity.model_revision,
+        "policy_lineage": identity.policy_lineage,
+        "policy_version": identity.policy_version,
+        "source_lineage": identity.source_lineage,
+        "runtime_identity": identity.runtime_identity,
+        "seed": identity.seed,
+    }
+    mismatched = [key for key, value in expected.items() if actual[key] != value]
+    if mismatched:
+        raise ValueError(f"response identity conflicts with campaign fields: {', '.join(mismatched)}")
+
+
+def _build_campaign_manifest(
+    path: Path,
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    contract_path = path / "contract.json"
+    if not contract_path.is_file() or contract_path.read_bytes() != _canonical_bytes(contract):
+        raise RuntimeError("campaign contract is missing or non-canonical")
+    expected_count = contract["expected_pair_count"]
+    problem_ids = frozenset(contract["problem_ids"])
+    rollouts_per_problem = contract["rollouts_per_problem"]
+
+    count_keys = (
+        "format_valid",
+        "ended_by_eos",
+        "ended_by_stop_token",
+        "repetition_truncated",
+        "context_exhausted",
+        "other_failure",
+    )
+    counts = dict.fromkeys(count_keys, 0)
+    records_digest = hashlib.sha256()
+    total = 0
+    for record_path in _campaign_record_paths(path):
+        total += 1
+        record, payload = _load_campaign_record(record_path)
+        identity = RolloutResponseIdentity.from_dict(record["identity"])
+        try:
+            _validate_campaign_identity(identity, contract)
+        except ValueError as error:
+            raise RuntimeError(f"campaign record {record_path.name} conflicts with its contract") from error
+        pair = (identity.prompt_id, identity.sample_index)
+        digest = RolloutCampaignArtifact._pair_digest(*pair)
+        if digest != record_path.stem or pair[0] not in problem_ids or not 0 <= pair[1] < rollouts_per_problem:
+            raise RuntimeError(f"campaign record {record_path.name} has an invalid pair")
+        finish = record["finish"]
+        for key in count_keys:
+            counts[key] += int(finish[key])
+        records_digest.update(record_path.stem.encode("ascii"))
+        records_digest.update(b":")
+        records_digest.update(payload)
+    if total != expected_count:
+        missing_preview = []
+        for problem_id in contract["problem_ids"]:
+            for rollout_index in range(rollouts_per_problem):
+                digest = RolloutCampaignArtifact._pair_digest(problem_id, rollout_index)
+                if not _campaign_record_path(path, digest).is_file():
+                    missing_preview.append((problem_id, rollout_index))
+                    if len(missing_preview) == 8:
+                        break
+            if len(missing_preview) == 8:
+                break
+        raise RuntimeError(
+            f"campaign is incomplete: expected={expected_count}, actual={total}, missing_preview={missing_preview}"
+        )
+    return {
+        "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
+        "contract": dict(contract),
+        "counts": {"total": total, **counts},
+        "rates": {name: count / total for name, count in counts.items()},
+        "records_sha256": records_digest.hexdigest(),
+    }
+
+
+def _make_campaign_read_only(path: Path) -> None:
+    file_mode = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+    directory_mode = stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+    records_path = path / "records"
+    for file_path in _campaign_record_paths(path):
+        file_path.chmod(file_mode)
+    (path / "contract.json").chmod(file_mode)
+    (path / "manifest.json").chmod(file_mode)
+    for shard_path in records_path.iterdir():
+        if shard_path.is_dir():
+            shard_path.chmod(directory_mode)
+    records_path.chmod(directory_mode)
+    path.chmod(directory_mode)
+
+
+def _validate_promoted_campaign(path: Path, contract: Mapping[str, Any]) -> dict[str, Any]:
+    manifest_path = path / "manifest.json"
+    if not path.is_dir() or not manifest_path.is_file():
+        raise RuntimeError("promoted campaign is missing its manifest")
+    payload = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("promoted campaign manifest is invalid") from error
+    if _canonical_bytes(manifest) != payload or manifest.get("contract") != contract:
+        raise RuntimeError("promoted campaign manifest is non-canonical or conflicts with the contract")
+    if _build_campaign_manifest(path, contract) != manifest:
+        raise RuntimeError("promoted campaign digest mismatch")
+    readonly_paths = [
+        path,
+        path / "records",
+        path / "contract.json",
+        manifest_path,
+        *((path / "records").glob("*")),
+        *_campaign_record_paths(path),
+    ]
+    if any(item.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) for item in readonly_paths):
+        raise RuntimeError("promoted campaign must be read-only")
+    return manifest
 
 
 def _load_record(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -489,7 +761,11 @@ def _load_record(path: Path) -> tuple[dict[str, Any], bytes]:
         raise RuntimeError(f"response record {path.name} has incomplete finish metadata")
     finish_source = record["finish_source"]
     if set(finish_source) != {
-        "finish_reason", "backend_stop_reason", "repetition_truncated", "response_token_ids", "eos_token_ids",
+        "finish_reason",
+        "backend_stop_reason",
+        "repetition_truncated",
+        "response_token_ids",
+        "eos_token_ids",
         "stop_token_ids",
     }:
         raise RuntimeError(f"response record {path.name} has an invalid finish source")
