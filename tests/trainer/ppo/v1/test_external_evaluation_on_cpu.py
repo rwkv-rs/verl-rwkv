@@ -21,8 +21,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from verl.trainer.ppo.v1.trainer_base import PPOTrainer
-
+from verl.trainer.ppo.v1.trainer_base import PPOTrainer, _hf_model_artifact_digest
 
 BEHAVIOR_POLICY_IDENTITY = {
     "policy_version": 7,
@@ -30,6 +29,19 @@ BEHAVIOR_POLICY_IDENTITY = {
     "sampling_config_digest": "sampling",
     "runtime_identity": "runtime",
 }
+
+
+def _checkpoint_dir(checkpoint_root: Path) -> Path:
+    return checkpoint_root / "global_step_7" / "actor" / "huggingface"
+
+
+def _write_hf_checkpoint(checkpoint_dir: Path) -> None:
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"architectures": ["Rwkv7ForCausalLM"], "model_type": "rwkv7"}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
 
 
 def _runtime_metadata(
@@ -88,22 +100,20 @@ def _result_payload(
 def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkeypatch):
     weight_root = tmp_path / "weights"
     checkpoint_root = weight_root / "maxrl" / "run"
-    checkpoint_file = checkpoint_root / "global_step_7" / "actor" / "rwkv_lm.pth"
+    checkpoint_dir = _checkpoint_dir(checkpoint_root)
     events = []
 
     def save_checkpoint():
-        checkpoint_file.parent.mkdir(parents=True)
-        checkpoint_file.write_bytes(b"weights")
-        (checkpoint_file.parent / "config.json").write_text("{}", encoding="utf-8")
+        _write_hf_checkpoint(checkpoint_dir)
         events.append("save")
 
     def run(command, *, cwd, env, check):
         assert command == ["helicopter", "eval", "--config", "maxrl.toml"]
         assert cwd == "/product/helicopter"
         assert check is True
-        assert env["MAXRL_EVAL_WEIGHT"] == "maxrl/run/global_step_7/actor/rwkv_lm.pth"
+        assert env["MAXRL_EVAL_WEIGHT"] == "maxrl/run/global_step_7/actor/huggingface"
         assert env["MAXRL_EVAL_STEP"] == "7"
-        result_path = checkpoint_file.parent / "lighteval_metrics.json"
+        result_path = checkpoint_dir.parent / "lighteval_metrics.json"
         assert env["MAXRL_EVAL_RESULT_PATH"] == str(result_path)
         pool_path = Path(env["HELICOPTER_VLLM_POOL_MANIFEST"])
         assert pool_path.is_file()
@@ -112,11 +122,9 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
         assert pool_payload == {
             "schema_version": 3,
             "global_step": 7,
-            "checkpoint_sha256": hashlib.sha256(b"weights").hexdigest(),
-            "checkpoint_display_name": "rwkv_lm.pth",
-            "policy_checkpoint_path": (
-                "maxrl/run/global_step_7/actor/rwkv_lm.pth"
-            ),
+            "checkpoint_sha256": _hf_model_artifact_digest(checkpoint_dir),
+            "checkpoint_display_name": "huggingface",
+            "policy_checkpoint_path": "maxrl/run/global_step_7/actor/huggingface",
             "behavior_policy_identity": BEHAVIOR_POLICY_IDENTITY,
             "wkv_mode": "fp32io16",
             "vllm_version": "0.23.1.dev0",
@@ -223,16 +231,14 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
         "val-core/math_500/pass@1": 0.25,
     }
     assert events == ["save", "command"]
-    assert not list(checkpoint_file.parent.glob(".vllm-eval-pool-*.json"))
+    assert not list(checkpoint_dir.parent.glob(".vllm-eval-pool-*.json"))
 
 
 def test_external_evaluation_rejects_stale_replica_policy_before_command(tmp_path, monkeypatch):
     weight_root = tmp_path / "weights"
     checkpoint_root = weight_root / "maxrl" / "run"
-    checkpoint_file = checkpoint_root / "global_step_7" / "actor" / "rwkv_lm.pth"
-    checkpoint_file.parent.mkdir(parents=True)
-    checkpoint_file.write_bytes(b"weights")
-    (checkpoint_file.parent / "config.json").write_text("{}", encoding="utf-8")
+    checkpoint_dir = _checkpoint_dir(checkpoint_root)
+    _write_hf_checkpoint(checkpoint_dir)
     stale = _runtime_metadata(
         "10.0.0.1",
         18000,
@@ -274,10 +280,8 @@ def test_external_evaluation_rejects_stale_replica_policy_before_command(tmp_pat
 def test_external_evaluation_rejects_missing_published_policy_with_contract_error(tmp_path, monkeypatch):
     weight_root = tmp_path / "weights"
     checkpoint_root = weight_root / "maxrl" / "run"
-    checkpoint_file = checkpoint_root / "global_step_7" / "actor" / "rwkv_lm.pth"
-    checkpoint_file.parent.mkdir(parents=True)
-    checkpoint_file.write_bytes(b"weights")
-    (checkpoint_file.parent / "config.json").write_text("{}", encoding="utf-8")
+    checkpoint_dir = _checkpoint_dir(checkpoint_root)
+    _write_hf_checkpoint(checkpoint_dir)
     monkeypatch.setenv("WEIGHT_PATH", str(weight_root))
     monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
     trainer = SimpleNamespace(
@@ -320,12 +324,8 @@ def test_external_evaluation_rejects_result_lineage_mismatch_before_metrics(
 ):
     weight_root = tmp_path / "weights"
     checkpoint_root = weight_root / "maxrl" / "run"
-    checkpoint_file = (
-        checkpoint_root / "global_step_7" / "actor" / "rwkv_lm.pth"
-    )
-    checkpoint_file.parent.mkdir(parents=True)
-    checkpoint_file.write_bytes(b"weights")
-    (checkpoint_file.parent / "config.json").write_text("{}", encoding="utf-8")
+    checkpoint_dir = _checkpoint_dir(checkpoint_root)
+    _write_hf_checkpoint(checkpoint_dir)
     runtime_metadata = _runtime_metadata(
         "10.0.0.1",
         18000,

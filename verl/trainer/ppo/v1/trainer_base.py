@@ -45,6 +45,7 @@ from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
+from verl.model_merger.output_validation import validate_hf_model_output
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -108,6 +109,22 @@ from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, T
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
 from verl.workers.utils.padding import response_from_nested, response_to_nested
+
+
+def _hf_model_artifact_digest(checkpoint_dir: Path) -> str:
+    """Hash one complete HF artifact by relative path and file content."""
+
+    validate_hf_model_output(checkpoint_dir)
+    digest = hashlib.sha256()
+    files = sorted(path for path in checkpoint_dir.rglob("*") if path.is_file())
+    for path in files:
+        relative_path = path.relative_to(checkpoint_dir).as_posix().encode("utf-8")
+        digest.update(len(relative_path).to_bytes(8, "big"))
+        digest.update(relative_path)
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -1479,25 +1496,27 @@ class PPOTrainer(ABC):
             raise RuntimeError("trainer.external_evaluation.command must contain command arguments")
 
         checkpoint_root = Path(self.config.trainer.default_local_dir).resolve()
-        checkpoint_file = checkpoint_root / f"global_step_{self.global_steps}" / "actor" / "rwkv_lm.pth"
-        checkpoint_config = checkpoint_file.parent / "config.json"
-        if not checkpoint_file.is_file() or not checkpoint_config.is_file():
+        checkpoint_parent = checkpoint_root / f"global_step_{self.global_steps}" / "actor"
+        checkpoint_dir = checkpoint_parent / "huggingface"
+        try:
+            validate_hf_model_output(checkpoint_dir)
+        except RuntimeError:
             self._save_checkpoint()
-        missing_checkpoint_files = [path for path in (checkpoint_file, checkpoint_config) if not path.is_file()]
-        if missing_checkpoint_files:
-            missing_paths = ", ".join(str(path) for path in missing_checkpoint_files)
-            raise RuntimeError(f"external evaluation checkpoint is incomplete: {missing_paths}")
+        try:
+            checkpoint_sha256 = _hf_model_artifact_digest(checkpoint_dir)
+        except RuntimeError as error:
+            raise RuntimeError(f"external evaluation checkpoint is incomplete: {checkpoint_dir}") from error
 
         weight_root_raw = os.environ.get("WEIGHT_PATH")
         if not weight_root_raw:
             raise RuntimeError("external evaluation requires WEIGHT_PATH")
         weight_root = Path(weight_root_raw).resolve()
         try:
-            relative_weight = checkpoint_file.relative_to(weight_root)
+            relative_weight = checkpoint_dir.relative_to(weight_root)
         except ValueError as error:
             raise RuntimeError("external evaluation checkpoint must be below WEIGHT_PATH") from error
 
-        result_path = checkpoint_file.parent / "lighteval_metrics.json"
+        result_path = checkpoint_parent / "lighteval_metrics.json"
         result_path.unlink(missing_ok=True)
         wkv_mode = os.environ.get("VLLM_RWKV7_WKV_MODE")
         if wkv_mode not in {"fp16", "fp32io16"}:
@@ -1606,14 +1625,12 @@ class PPOTrainer(ABC):
                 f"{sorted(max_model_lens)}"
             )
 
-        pool_manifest_path = checkpoint_file.parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
-        with checkpoint_file.open("rb") as stream:
-            checkpoint_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        pool_manifest_path = checkpoint_parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
         pool_payload = {
             "schema_version": 3,
             "global_step": self.global_steps,
             "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint_display_name": checkpoint_file.name,
+            "checkpoint_display_name": checkpoint_dir.name,
             "policy_checkpoint_path": relative_weight.as_posix(),
             "behavior_policy_identity": behavior_policy_identity,
             "wkv_mode": wkv_mode,
