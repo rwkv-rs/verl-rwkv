@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -64,6 +65,17 @@ def _requirements(path: Path) -> dict[str, Requirement]:
     }
 
 
+def _setup_requirements(path: Path) -> dict[str, Requirement]:
+    module = ast.parse(path.read_text(encoding="utf-8"))
+    assignment = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "install_requires" for target in node.targets)
+    )
+    return {requirement.name: requirement for requirement in map(Requirement, ast.literal_eval(assignment.value))}
+
+
 def _model_config(*, model_type: str = "rwkv7", backend: str = "flash_rwkv"):
     config_type = type(
         "Rwkv7Config",
@@ -81,13 +93,16 @@ def _model_config(*, model_type: str = "rwkv7", backend: str = "flash_rwkv"):
 def test_rwkv_install_profile_pins_the_self_owned_chain_without_changing_generic_transformers() -> None:
     generic = _requirements(ROOT / "requirements.txt")
     rwkv = _requirements(ROOT / "requirements-rwkv.txt")
+    package = _setup_requirements(ROOT / "setup.py")
 
     assert "-r requirements-common.txt" in (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "-r requirements-common.txt" in (ROOT / "requirements-rwkv.txt").read_text(encoding="utf-8")
-    assert generic["transformers"] == Requirement("transformers>=5.5.3,!=5.6.0,<5.11")
+    expected_transformers = Requirement("transformers>=5.5.3,!=5.6.0,<5.16")
+    assert generic["transformers"] == expected_transformers
+    assert package["transformers"] == expected_transformers
     assert rwkv["vllm"].url == ("git+https://github.com/rwkv-rs/vllm-rwkv.git@c97557ccb1c884a1068edb018dca74ffcde6ec81")
     assert rwkv["transformers"].url == (
-        "git+https://github.com/rwkv-rs/transformers-rwkv.git@2696927df9363b5fa175076bb827ba4da2c4e581"
+        "git+https://github.com/rwkv-rs/transformers-rwkv.git@3f4c053021cc34fcced398c51d3836ca96343fa7"
     )
     assert rwkv["flash-linear-attention"].extras == {"flash-rwkv"}
     assert rwkv["flash-linear-attention"].url == (

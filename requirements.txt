@@ -2,4 +2,4 @@
 -r requirements-common.txt
 # 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for sink-less
 # models like Qwen2/Llama); fixed in 5.6.1. See huggingface/transformers#45588.
-transformers>=5.5.3,!=5.6.0,<5.11
+transformers>=5.5.3,!=5.6.0,<5.16
