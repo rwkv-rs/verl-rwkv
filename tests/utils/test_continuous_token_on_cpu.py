@@ -258,6 +258,7 @@ def test_builtin_family_surface():
 )
 def test_builtin_family_class_mapping(family, builder_cls):
     assert get_continuous_token_builder_class(family) is builder_cls
+    assert str(family) == family.value
 
 
 @pytest.mark.parametrize(

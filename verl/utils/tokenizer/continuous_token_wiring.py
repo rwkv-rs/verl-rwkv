@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 from .continuous_token import (
@@ -32,7 +32,9 @@ from .continuous_token import (
 logger = logging.getLogger(__name__)
 
 
-class ContinuousTokenModelFamily(StrEnum):
+class ContinuousTokenModelFamily(str, Enum):
+    __str__ = str.__str__
+
     AUTO = "auto"
     DEFAULT = "default"
     QWEN = "qwen"
