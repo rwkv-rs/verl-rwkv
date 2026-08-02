@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -46,7 +45,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
-from verl.trainer.ppo.v1.policy_identity import canonical_digest
+from verl.trainer.ppo.v1.policy_identity import BehaviorPolicyIdentity, canonical_digest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -110,9 +109,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
-RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
-
-
 def _rollout_output_kind(*, needs_generation_logprobs: bool, needs_prompt_logprobs: bool) -> RequestOutputKind:
     if needs_generation_logprobs or needs_prompt_logprobs:
         return RequestOutputKind.CUMULATIVE
@@ -132,58 +128,6 @@ def _apply_rwkv_prompt_template_stops(
         sampling_params,
         model_config,
         prompt_template=template_spec,
-    )
-
-
-def _config_get(config: Any, key: str, default: Any = None) -> Any:
-    if hasattr(config, "get"):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-@dataclass
-class _RWKVRolloutModelConfig:
-    local_path: str
-    hf_config: Any
-    trust_remote_code: bool = False
-    tokenizer: Any = None
-    processor: Any = None
-    lora: dict[str, Any] = field(default_factory=dict)
-    lora_rank: int = 0
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
-
-
-def _is_rwkv_native_model_config(model_config: Any) -> bool:
-    return _config_get(model_config, "_target_") == RWKV_NATIVE_MODEL_TARGET
-
-
-def _init_rwkv_rollout_model_config(model_config: Any) -> _RWKVRolloutModelConfig:
-    from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
-
-    from verl.models.rwkv import build_rwkv_tokenizer
-    from verl.utils.fs import copy_to_local
-
-    local_path = copy_to_local(_config_get(model_config, "path"), use_shm=_config_get(model_config, "use_shm", False))
-    hf_config = build_rwkv7_config_from_pth(local_path)
-    if hf_config is None:
-        raise ValueError(
-            "RWKV native vLLM rollout requires a BlinkDL RWKV7 raw .pth checkpoint path "
-            f"that vLLM can parse, got: {local_path}"
-        )
-
-    tokenizer = None
-    if _config_get(model_config, "load_tokenizer", True):
-        tokenizer = build_rwkv_tokenizer(tokenizer_path=_config_get(model_config, "tokenizer_path"), pickleable=True)
-
-    return _RWKVRolloutModelConfig(
-        local_path=local_path,
-        hf_config=hf_config,
-        tokenizer=tokenizer,
-        processor=None,
-        lora=_config_get(model_config, "lora", {}) or {},
-        lora_rank=0,
     )
 
 
@@ -1135,6 +1079,43 @@ class vLLMHttpServer:
         self.weight_update_failure = None
         self.weight_update_state = "weights_ready"
 
+    async def publish_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> dict[str, Any]:
+        """Expose an immutable checkpoint loaded by a standalone vLLM server."""
+
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            raise RuntimeError("startup policy publication is only valid for standalone rollout servers")
+        normalized = BehaviorPolicyIdentity.from_dict(policy_identity).as_dict()
+        if self.weight_update_state == "active" and self.behavior_policy_identity == normalized:
+            return {
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+                "policy_identity": normalized,
+            }
+        if self.weight_update_state != "uninitialized" or self.behavior_policy_identity is not None:
+            raise RuntimeError(
+                "standalone checkpoint identity cannot replace an already visible policy: "
+                f"state={self.weight_update_state!r}"
+            )
+        self.behavior_policy_identity = normalized
+        self.weight_update_failure = None
+        self.weight_update_state = "active"
+        return {
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "policy_identity": normalized,
+        }
+
+    async def rollback_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> None:
+        """Rollback only the matching pre-generation standalone publication."""
+
+        normalized = BehaviorPolicyIdentity.from_dict(policy_identity).as_dict()
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            return
+        if self.behavior_policy_identity == normalized:
+            self.behavior_policy_identity = None
+            self.weight_update_failure = None
+            self.weight_update_state = "uninitialized"
+
     async def begin_weight_update(self):
         """Hide the old identity before any live tensor can be overwritten."""
         if self.weight_update_state == "poisoned":
@@ -1263,8 +1244,6 @@ class vLLMHttpServer:
 
     def _init_model_config(self, model_config):
         """Initialise model_config. Override when a specific dataclass_type is needed."""
-        if _is_rwkv_native_model_config(model_config):
-            return _init_rwkv_rollout_model_config(model_config)
         return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
 
     def _validate_configs(self) -> None:

@@ -21,7 +21,6 @@ from uuid import uuid4
 
 import torch
 from PIL import Image
-from vllm.tokenizers.rwkv_defaults import resolve_rwkv_prompt_template
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
@@ -216,6 +215,8 @@ class ToolAgentLoop(AgentLoopBase):
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         configured_prompt_template = self.rollout_config.get("rwkv_prompt_template")
         if configured_prompt_template is not None:
+            from vllm.tokenizers.rwkv_defaults import resolve_rwkv_prompt_template
+
             agent_data.rwkv_prompt_template = resolve_rwkv_prompt_template(
                 prompt_template=configured_prompt_template,
                 messages=agent_data.messages,

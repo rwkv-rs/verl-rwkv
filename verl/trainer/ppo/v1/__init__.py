@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQ
-from .trainer_base import PPOTrainer, get_trainer_cls, register_trainer
-from .trainer_colocate_async import PPOTrainerColocateAsync
-from .trainer_separate_async import PPOTrainerSeparateAsync
-from .trainer_sync import PPOTrainerSync
-
 __all__ = [
     "PPOTrainer",
     "register_trainer",
@@ -28,3 +22,24 @@ __all__ = [
     "AgentLoopWorkerTQ",
     "AgentLoopManagerTQ",
 ]
+
+_EXPORT_MODULES = {
+    "PPOTrainer": ".trainer_base",
+    "register_trainer": ".trainer_base",
+    "get_trainer_cls": ".trainer_base",
+    "PPOTrainerSync": ".trainer_sync",
+    "PPOTrainerColocateAsync": ".trainer_colocate_async",
+    "PPOTrainerSeparateAsync": ".trainer_separate_async",
+    "AgentLoopWorkerTQ": ".agent_loop_tq",
+    "AgentLoopManagerTQ": ".agent_loop_tq",
+}
+
+
+def __getattr__(name: str):
+    if name not in _EXPORT_MODULES:
+        raise AttributeError(name)
+    from importlib import import_module
+
+    value = getattr(import_module(_EXPORT_MODULES[name], __name__), name)
+    globals()[name] = value
+    return value

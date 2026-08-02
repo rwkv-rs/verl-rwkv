@@ -25,9 +25,11 @@ with open(os.path.join(version_folder, "verl/version/version")) as f:
 
 install_requires = [
     "accelerate",
+    "cachetools",
     "codetiming",
     "datasets",
     "dill",
+    "einops",
     "hydra-core",
     "numpy>=2.0.0",
     "pandas",
@@ -40,7 +42,7 @@ install_requires = [
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
     # 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for
     # sink-less models); fixed in 5.6.1. See huggingface/transformers#45588.
-    "transformers>=5.5.3,!=5.6.0,<5.11",
+    "transformers>=5.5.3,!=5.6.0,<5.16",
     "wandb",
     "packaging>=20.0",
     "tensorboard",

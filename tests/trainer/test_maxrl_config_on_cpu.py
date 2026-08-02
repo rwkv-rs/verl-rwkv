@@ -21,7 +21,9 @@ import pytest
 import tomllib
 from hydra import compose, initialize_config_dir
 
+import verl.trainer.maxrl as maxrl
 from verl.trainer.maxrl import (
+    G1I_MODEL_ASSET,
     MaxRLConfigError,
     build_overrides,
     context_tokens_from_checkpoint,
@@ -31,7 +33,6 @@ ROOT = Path(__file__).resolve().parents[2]
 ENV = {
     "WEIGHT_PATH": "/weights",
     "DATASETS_PATH": "/datasets",
-    "RWKV_LM_PATH": "/src/rwkv-lm",
 }
 CONFIG_TOML = """
 [experiment]
@@ -41,8 +42,13 @@ seed = 42
 candidate_dataset_passes = 10
 
 [model]
-name = "g1h-7.2b"
-checkpoint = "/weights/rwkv7/pth/rwkv7-g1h-7.2b-20260710-ctx10240.pth"
+name = "g1i-1.5b"
+repository = "BlinkDL/temp-latest-training-models"
+revision = "d5db8cdf837726ef65a22724c86fa2b6ca95d3d8"
+filename = "rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
+sha256 = "22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586"
+legacy_checkpoint = "/weights/rwkv7/pth/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
+checkpoint = "/weights/rwkv7/hf/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384"
 prompt_mode = "open_think"
 prompt_template = "\\nBot✿"
 
@@ -132,7 +138,13 @@ def test_compiles_strict_maxrl_contract() -> None:
     assert values["actor_rollout_ref.actor.ppo_mini_batch_size"] == "32"
     assert values["actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"] == "1"
     assert values["actor_rollout_ref.rollout.n"] == "16"
-    assert values["actor_rollout_ref.rollout.max_model_len"] == "10240"
+    assert values["actor_rollout_ref.rollout.max_model_len"] == "16384"
+    assert values["model@actor_rollout_ref.model"] == "hf_model"
+    assert values["actor@actor_rollout_ref.actor"] == "dp_actor"
+    assert values["ref@actor_rollout_ref.ref"] == "dp_ref"
+    assert values["actor_rollout_ref.model.use_remove_padding"] == "False"
+    assert values["actor_rollout_ref.model.enable_gradient_checkpointing"] == "False"
+    assert values["actor_rollout_ref.actor.checkpoint.save_contents"] == "[model,optimizer,extra,hf_model]"
     assert values["actor_rollout_ref.rollout.ignore_eos"] == "False"
     assert values["actor_rollout_ref.rollout.top_p"] == "0.95"
     assert values["data.val_files"] == "null"
@@ -149,6 +161,51 @@ def test_compiles_strict_maxrl_contract() -> None:
     assert values["data.train_prompt_key"] == "source_prompt"
     assert "data.model_context_length" not in values
     assert child_env["VLLM_RWKV7_WKV_MODE"] == "fp32io16"
+    assert child_env["HELICOPTER_MODEL_REPOSITORY"] == G1I_MODEL_ASSET["repository"]
+    assert child_env["HELICOPTER_MODEL_REVISION"] == G1I_MODEL_ASSET["revision"]
+    assert child_env["HELICOPTER_MODEL_FILENAME"] == G1I_MODEL_ASSET["filename"]
+    assert child_env["HELICOPTER_CHECKPOINT_SHA256"] == G1I_MODEL_ASSET["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "BlinkDL/other-models"),
+        ("revision", "0" * 40),
+        ("filename", "rwkv7-g1h-7.2b-20260710-ctx10240.pth"),
+        ("sha256", "0" * 64),
+    ],
+)
+def test_model_asset_identity_rejects_mixed_catalog_fields(field: str, value: str) -> None:
+    modified = deepcopy(config())
+    modified["model"][field] = value
+
+    with pytest.raises(MaxRLConfigError, match=rf"model\.{field} must match the published g1i asset"):
+        build_overrides(modified, env=ENV)
+
+
+def test_model_asset_identity_rejects_legacy_checkpoint_filename_mismatch() -> None:
+    modified = deepcopy(config())
+    modified["model"]["legacy_checkpoint"] = "/weights/rwkv7/pth/rwkv7-g1h-7.2b-20260710-ctx10240.pth"
+
+    with pytest.raises(MaxRLConfigError, match="legacy_checkpoint filename does not match"):
+        build_overrides(modified, env=ENV)
+
+
+def test_runtime_rejects_raw_checkpoint_and_names_one_time_converter() -> None:
+    modified = deepcopy(config())
+    modified["model"]["checkpoint"] = modified["model"]["legacy_checkpoint"]
+
+    with pytest.raises(MaxRLConfigError, match="convert_rwkv7_checkpoint_to_hf"):
+        build_overrides(modified, env=ENV)
+
+
+def test_model_asset_identity_rejects_missing_lineage_field() -> None:
+    modified = deepcopy(config())
+    del modified["model"]["revision"]
+
+    with pytest.raises(MaxRLConfigError, match="requires model.revision"):
+        build_overrides(modified, env=ENV)
 
 
 def test_user_override_cannot_disable_strict_eos_or_sync_mode() -> None:
@@ -201,6 +258,60 @@ def test_user_override_accepts_documented_operational_fields() -> None:
     assert values["trainer.save_freq"] == "10"
 
 
+def test_experiment_can_bound_a_two_optimizer_step_acceptance_run() -> None:
+    modified = deepcopy(config())
+    modified["experiment"]["max_optimizer_steps"] = 2
+
+    overrides, _ = build_overrides(modified, env=ENV)
+
+    assert resolved(overrides)["trainer.total_training_steps"] == "2"
+
+
+def test_product_entry_validates_rwkv_runtime_before_exec(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "maxrl.toml"
+    config_path.write_text(CONFIG_TOML, encoding="utf-8")
+    calls = []
+
+    def validate(checkpoint: str) -> None:
+        calls.append(("validate", checkpoint))
+
+    def execute(_file: str, _args: list[str], _env: dict[str, str]) -> None:
+        calls.append(("exec", _env["RWKV_MODEL_PATH"]))
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(maxrl, "validate_rwkv_runtime", validate)
+    monkeypatch.setattr(maxrl.os, "execvpe", execute)
+
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        maxrl.main(["--config", str(config_path)])
+
+    checkpoint = config()["model"]["checkpoint"]
+    assert calls == [("validate", checkpoint), ("exec", checkpoint)]
+
+
+def test_product_entry_fails_closed_before_exec(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "maxrl.toml"
+    config_path.write_text(CONFIG_TOML, encoding="utf-8")
+
+    def reject(_checkpoint: str) -> None:
+        raise maxrl.RwkvRuntimeError("runtime provenance rejected")
+
+    monkeypatch.setattr(maxrl, "validate_rwkv_runtime", reject)
+    monkeypatch.setattr(maxrl.os, "execvpe", lambda *_args: pytest.fail("must not exec"))
+
+    with pytest.raises(SystemExit, match="runtime provenance rejected"):
+        maxrl.main(["--config", str(config_path)])
+
+
+@pytest.mark.parametrize("value", [0, -1, "invalid"])
+def test_max_optimizer_steps_must_be_positive(value) -> None:
+    modified = deepcopy(config())
+    modified["experiment"]["max_optimizer_steps"] = value
+
+    with pytest.raises(MaxRLConfigError, match="experiment.max_optimizer_steps"):
+        build_overrides(modified, env=ENV)
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -226,8 +337,20 @@ def test_compiler_output_composes_with_real_hydra_schema() -> None:
     assert composed.actor_rollout_ref.rollout.max_num_seqs == 64
     assert composed.actor_rollout_ref.rollout.max_num_batched_tokens == 8192
     assert composed.actor_rollout_ref.rollout.disable_log_stats is False
-    assert composed.actor_rollout_ref.rollout.max_model_len == 10240
-    assert composed.actor_rollout_ref.rollout.response_length == 10240
+    assert composed.actor_rollout_ref.rollout.max_model_len == 16384
+    assert composed.actor_rollout_ref.rollout.response_length == 16384
+    assert composed.actor_rollout_ref.model._target_ == "verl.workers.config.HFModelConfig"
+    assert composed.actor_rollout_ref.actor._target_ == "verl.workers.config.FSDPActorConfig"
+    assert composed.actor_rollout_ref.ref._target_ == "verl.workers.config.FSDPActorConfig"
+    assert composed.actor_rollout_ref.model.path.endswith("rwkv7-g1i_preview5445-1.5b-20260729-ctx16384")
+    assert composed.actor_rollout_ref.model.use_remove_padding is False
+    assert composed.actor_rollout_ref.model.enable_gradient_checkpointing is False
+    assert list(composed.actor_rollout_ref.actor.checkpoint.save_contents) == [
+        "model",
+        "optimizer",
+        "extra",
+        "hf_model",
+    ]
     assert composed.data.val_files is None
     assert composed.trainer.val_before_train is True
     assert composed.trainer.test_freq == 50

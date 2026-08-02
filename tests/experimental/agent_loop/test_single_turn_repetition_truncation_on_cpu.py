@@ -67,6 +67,10 @@ class _FakeTokenizer:
         self.applied_kwargs.append(dict(kwargs))
         return [101, 102]
 
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> str:
+        del skip_special_tokens
+        return "".join(chr(token_id) for token_id in token_ids)
+
 
 def _make_loop(
     token_ids: list[int],

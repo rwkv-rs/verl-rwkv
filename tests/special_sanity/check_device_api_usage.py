@@ -45,7 +45,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/workers/engine/base.py",  # appear in default device_name
     "verl/workers/engine/utils.py",  # appear in enable_full_determinism
     "verl/workers/engine/fsdp/transformer_impl.py",  # appear in default device_name
-    "verl/workers/engine/rwkv_lm/transformer_impl.py",  # EngineRegistry declares static CUDA capability
     "verl/workers/engine/veomni/transformer_impl.py",  # appear in default device_name
     "verl/workers/engine/torchtitan/transformer_impl.py",  # appear in default device_name
     "verl/workers/engine/torchtitan/utils.py",  # appear in torch.cuda.empty_cache()

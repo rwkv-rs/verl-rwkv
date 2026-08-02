@@ -1,0 +1,92 @@
+# Fixed 1% DAPO-Math rollout campaign for the g1i preview checkpoint.
+defaults:
+  - ppo_trainer
+  - override model@actor_rollout_ref.model: hf_model
+  - _self_
+
+rollout_campaign:
+  enabled: true
+  dry_run: false
+  campaign_id: dapo-math-17k-g1i-preview-1pct
+  source_repository: open-r1/DAPO-Math-17k-Processed
+  source_revision: 31dd309567e3da778038cc87d868b6097a3ccf68
+  dataset_filename: dapo-math-17k-processed.parquet
+  dataset_sha256: 94ee2f742411118f8fe79fbcb4cdec661f7ac7bbd83808a55c6437623fbfed3a
+  dataset_rows: 17398
+  dataset_path: ${oc.env:DATASETS_PATH}/DAPO/dapo-math-17k-processed.parquet
+  pilot_problem_count: 174
+  pilot_problem_ids_sha256: 901dcbea975ea4c5d6d59bff6c0862e0ed5e766ba6116d41875904d7b46a27fa
+  rollouts_per_problem: 256
+  base_seed: 20260801
+  batch_size: 512
+  artifact_root: ${oc.env:ROLLOUT_CAMPAIGN_ARTIFACT_ROOT,artifacts/rollout_campaigns}
+
+data:
+  train_files:
+    - ${rollout_campaign.dataset_path}
+  train_prompt_key: source_prompt
+  prompt_key: source_prompt
+  max_prompt_length: 16384
+  max_response_length: 16384
+  filter_overlong_prompts: false
+  truncation: error
+  apply_chat_template_kwargs:
+    rwkv_generation_prompt: open_think
+    rwkv_prompt_template: "\nBot✿"
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:WEIGHT_PATH}/rwkv7/hf/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384
+    repository: BlinkDL/temp-latest-training-models
+    revision: d5db8cdf837726ef65a22724c86fa2b6ca95d3d8
+    filename: rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth
+    sha256: 22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586
+    use_remove_padding: false
+    enable_gradient_checkpointing: false
+
+  rollout:
+    name: vllm
+    mode: async
+    nnodes: 1
+    n_gpus_per_node: 8
+    load_format: auto
+    dtype: float16
+    prompt_length: 16384
+    response_length: 16384
+    max_model_len: 16384
+    tensor_model_parallel_size: 1
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    max_num_seqs: 64
+    max_num_batched_tokens: 8192
+    n: 1
+    seed: 20260801
+    temperature: 1.0
+    top_k: -1
+    top_p: 0.95
+    ignore_eos: false
+    enable_prefix_caching: false
+    calculate_log_probs: false
+    rwkv_prompt_template: "\nBot✿"
+    engine_kwargs:
+      vllm:
+        tokenizer_mode: rwkv
+        distributed_executor_backend: uni
+
+reward:
+  num_workers: 8
+  custom_reward_function:
+    path: examples/rwkv_trainer/math_verify_reward.py
+    name: compute_score
+  reward_manager:
+    name: dapo
+  reward_model:
+    enable: false
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 8
+  logger:
+    - console
+  project_name: helicopter-math
+  experiment_name: dapo-math-17k-g1i-preview-1pct

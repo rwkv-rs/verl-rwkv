@@ -28,6 +28,8 @@ from typing import Any, Mapping
 import tomllib
 from hydra.core.override_parser.types import Quote, QuotedString
 
+from verl.models.transformers.rwkv_runtime import RwkvRuntimeError, validate_rwkv_runtime
+
 CONTEXT_SUFFIX_RE = re.compile(r"(?:^|[-_.])ctx(?P<tokens>[1-9]\d*)(?=[-_.]|$)")
 ENV_REFERENCE_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
 REQUIRED_SECTIONS = {
@@ -67,6 +69,12 @@ OPERATIONAL_OVERRIDE_KEYS = frozenset(
         "trainer.save_freq",
     }
 )
+G1I_MODEL_ASSET = {
+    "repository": "BlinkDL/temp-latest-training-models",
+    "revision": "d5db8cdf837726ef65a22724c86fa2b6ca95d3d8",
+    "filename": "rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth",
+    "sha256": "22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586",
+}
 
 
 class MaxRLConfigError(ValueError):
@@ -156,6 +164,28 @@ def context_tokens_from_checkpoint(checkpoint: str) -> int:
     return matches[0]
 
 
+def validate_g1i_model_asset(model: Mapping[str, Any]) -> None:
+    """Bind the formal MaxRL rollout to the root-published g1i asset contract."""
+
+    for key, expected in G1I_MODEL_ASSET.items():
+        actual = _required(model, key, section_name="model")
+        if actual != expected:
+            raise MaxRLConfigError(f"model.{key} must match the published g1i asset: {expected!r}")
+    legacy_checkpoint = str(_required(model, "legacy_checkpoint", section_name="model"))
+    legacy_filename = legacy_checkpoint.replace("\\", "/").rsplit("/", 1)[-1]
+    if legacy_filename != G1I_MODEL_ASSET["filename"]:
+        raise MaxRLConfigError(
+            "model.legacy_checkpoint filename does not match model.filename: "
+            f"expected={G1I_MODEL_ASSET['filename']!r} actual={legacy_filename!r}"
+        )
+    checkpoint = str(_required(model, "checkpoint", section_name="model"))
+    if checkpoint.lower().endswith(".pth"):
+        raise MaxRLConfigError(
+            "model.checkpoint must be a converted Hugging Face artifact directory; convert model.legacy_checkpoint "
+            "once with `python -m transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf`"
+        )
+
+
 def _hydra(value: Any) -> str:
     if isinstance(value, bool):
         return "True" if value else "False"
@@ -238,6 +268,7 @@ def _validate_resolved(
     prompts_per_step: int,
     responses_per_prompt: int,
     candidate_dataset_passes: int,
+    max_optimizer_steps: int | None,
     validation_before_training: bool,
     validation_interval: int,
 ) -> None:
@@ -251,6 +282,8 @@ def _validate_resolved(
         "data.truncation": "error",
         "data.train_batch_size": str(prompts_per_step),
         "actor_rollout_ref.model.path": checkpoint_path,
+        "actor_rollout_ref.model.use_remove_padding": "False",
+        "actor_rollout_ref.model.enable_gradient_checkpointing": "False",
         "trainer.v1.trainer_mode": "sync",
         "trainer.total_epochs": str(candidate_dataset_passes),
         "actor_rollout_ref.hybrid_engine": "True",
@@ -258,12 +291,11 @@ def _validate_resolved(
         "actor_rollout_ref.actor.ppo_mini_batch_size": str(prompts_per_step),
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": "1",
         "actor_rollout_ref.actor.use_dynamic_bsz": "False",
-        "actor_rollout_ref.actor.engine.ctx_len": str(context_tokens),
-        "actor_rollout_ref.actor.engine.infctx": "True",
+        "actor_rollout_ref.actor.use_torch_compile": "False",
+        "actor_rollout_ref.actor.checkpoint.save_contents": "[model,optimizer,extra,hf_model]",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu": "1",
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz": "False",
-        "actor_rollout_ref.ref.engine.ctx_len": str(context_tokens),
-        "actor_rollout_ref.ref.engine.infctx": "True",
+        "actor_rollout_ref.ref.use_torch_compile": "False",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": "1",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz": "False",
         "actor_rollout_ref.rollout.prompt_length": str(context_tokens),
@@ -284,6 +316,8 @@ def _validate_resolved(
     for key, expected in required.items():
         if resolved.get(key) != expected:
             raise MaxRLConfigError(f"strict MaxRL requires {key}={expected}")
+    if max_optimizer_steps is not None and resolved.get("trainer.total_training_steps") != str(max_optimizer_steps):
+        raise MaxRLConfigError(f"strict MaxRL requires trainer.total_training_steps={max_optimizer_steps}")
     if resolved.get("data.train_batch_size") != resolved.get("actor_rollout_ref.actor.ppo_mini_batch_size"):
         raise MaxRLConfigError("strict MaxRL requires one global mini-batch per optimizer step")
 
@@ -313,14 +347,22 @@ def build_overrides(
 
     if _required(algorithm, "name", section_name="algorithm") != "maxrl":
         raise MaxRLConfigError("verl.trainer.maxrl requires algorithm.name='maxrl'")
+    validate_g1i_model_asset(model)
     if "optimizer_steps" in experiment:
         raise MaxRLConfigError("MaxRL experiment.optimizer_steps was removed; use candidate_dataset_passes")
     passes = _nonnegative_int(
         _required(experiment, "candidate_dataset_passes", section_name="experiment"),
         name="experiment.candidate_dataset_passes",
     )
+    max_optimizer_steps = experiment.get("max_optimizer_steps")
+    if max_optimizer_steps is not None:
+        max_optimizer_steps = _positive_int(
+            max_optimizer_steps,
+            name="experiment.max_optimizer_steps",
+        )
     checkpoint_path = str(_required(model, "checkpoint", section_name="model"))
-    context_tokens = context_tokens_from_checkpoint(checkpoint_path)
+    legacy_checkpoint_path = str(_required(model, "legacy_checkpoint", section_name="model"))
+    context_tokens = context_tokens_from_checkpoint(legacy_checkpoint_path)
     prompts_per_step = _positive_int(
         _required(algorithm, "prompts_per_step", section_name="algorithm"),
         name="algorithm.prompts_per_step",
@@ -351,9 +393,6 @@ def build_overrides(
     if _required(execution, "context_mode", section_name="execution") != "state_passing":
         raise MaxRLConfigError("strict MaxRL requires execution.context_mode='state_passing'")
 
-    rwkv_lm_path = environment.get("RWKV_LM_PATH")
-    if not rwkv_lm_path:
-        raise MaxRLConfigError("RWKV_LM_PATH is required")
     verl_root = Path(__file__).resolve().parents[2]
     train_prompt_key = str(train.get("prompt_field", "prompt")).strip()
     scorer = str(_required(reward, "scorer", section_name="reward"))
@@ -394,10 +433,14 @@ def build_overrides(
         f"reward.custom_reward_function.path={_reward_path(scorer, verl_root)}",
         "reward.custom_reward_function.name=compute_score",
         f"reward.reward_manager.name={_required(reward, 'manager', section_name='reward')}",
-        "model@actor_rollout_ref.model=rwkv_native",
+        "model@actor_rollout_ref.model=hf_model",
         f"actor_rollout_ref.model.path={checkpoint_path}",
-        "actor@actor_rollout_ref.actor=rwkv_lm",
-        f"actor_rollout_ref.actor.engine.rwkv_lm_path={rwkv_lm_path}",
+        "actor_rollout_ref.model.use_remove_padding=False",
+        "actor_rollout_ref.model.enable_gradient_checkpointing=False",
+        "actor@actor_rollout_ref.actor=dp_actor",
+        "actor_rollout_ref.actor.use_torch_compile=False",
+        "actor_rollout_ref.actor.fsdp_config.use_torch_compile=False",
+        "actor_rollout_ref.actor.checkpoint.save_contents=[model,optimizer,extra,hf_model]",
         f"actor_rollout_ref.actor.optim.lr={_required(optimizer, 'learning_rate', section_name='optimizer')}",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={prompts_per_step}",
         "actor_rollout_ref.actor.ppo_epochs=1",
@@ -414,8 +457,9 @@ def build_overrides(
         f"actor_rollout_ref.actor.clip_ratio_low={_required(algorithm, 'ppo_clip', section_name='algorithm')}",
         f"actor_rollout_ref.actor.clip_ratio_high={_required(algorithm, 'ppo_clip', section_name='algorithm')}",
         f"actor_rollout_ref.actor.clip_ratio_c={algorithm.get('dual_clip', 3.0)}",
-        "ref@actor_rollout_ref.ref=rwkv_lm",
-        f"actor_rollout_ref.ref.engine.rwkv_lm_path={rwkv_lm_path}",
+        "ref@actor_rollout_ref.ref=dp_ref",
+        "actor_rollout_ref.ref.use_torch_compile=False",
+        "actor_rollout_ref.ref.fsdp_config.use_torch_compile=False",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=False",
         "actor_rollout_ref.rollout.name=vllm",
@@ -474,12 +518,6 @@ def build_overrides(
         raise MaxRLConfigError("state_chunk_tokens must be divisible by 16 and smaller than context")
     overrides.extend(
         [
-            f"actor_rollout_ref.actor.engine.ctx_len={context_tokens}",
-            f"actor_rollout_ref.ref.engine.ctx_len={context_tokens}",
-            "actor_rollout_ref.actor.engine.infctx=True",
-            "actor_rollout_ref.ref.engine.infctx=True",
-            f"actor_rollout_ref.actor.engine.chunk_ctx={chunk_tokens}",
-            f"actor_rollout_ref.ref.engine.chunk_ctx={chunk_tokens}",
             "actor_rollout_ref.rollout.max_num_seqs="
             f"{_required(rollout, 'max_concurrent_sequences_per_replica', section_name='execution.rollout')}",
             "actor_rollout_ref.rollout.max_num_batched_tokens="
@@ -501,6 +539,8 @@ def build_overrides(
             f"trainer.total_epochs={passes}",
         ]
     )
+    if max_optimizer_steps is not None:
+        overrides.append(f"trainer.total_training_steps={max_optimizer_steps}")
     if extra_overrides:
         _validate_extra_overrides(extra_overrides)
         overrides.extend(extra_overrides)
@@ -511,14 +551,18 @@ def build_overrides(
         prompts_per_step=prompts_per_step,
         responses_per_prompt=responses_per_prompt,
         candidate_dataset_passes=passes,
+        max_optimizer_steps=max_optimizer_steps,
         validation_before_training=validation_before_training,
         validation_interval=validation_interval,
     )
 
     child_env = environment.copy()
     child_env["RWKV_MODEL_PATH"] = checkpoint_path
-    child_env["RWKV_LM_PATH"] = rwkv_lm_path
     child_env["VLLM_RWKV7_WKV_MODE"] = wkv_mode
+    child_env["HELICOPTER_MODEL_REPOSITORY"] = G1I_MODEL_ASSET["repository"]
+    child_env["HELICOPTER_MODEL_REVISION"] = G1I_MODEL_ASSET["revision"]
+    child_env["HELICOPTER_MODEL_FILENAME"] = G1I_MODEL_ASSET["filename"]
+    child_env["HELICOPTER_CHECKPOINT_SHA256"] = G1I_MODEL_ASSET["sha256"]
     return overrides, child_env
 
 
@@ -546,6 +590,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(shlex.join(command))
         return 0
+    try:
+        validate_rwkv_runtime(child_env["RWKV_MODEL_PATH"])
+    except RwkvRuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     os.execvpe(command[0], command, child_env)
     return 0
 

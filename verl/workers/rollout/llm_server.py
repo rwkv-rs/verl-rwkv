@@ -813,6 +813,46 @@ class LLMServerManager:
         return self.rollout_replicas
 
     @auto_await
+    async def publish_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> list[dict[str, Any]]:
+        """Atomically publish one startup checkpoint identity on every replica.
+
+        Standalone campaign servers load their immutable checkpoint during
+        process startup rather than through ``CheckpointEngineManager``. They
+        still use the same strict request identity: generation becomes visible
+        only after every replica acknowledges the exact identity. A partial
+        acknowledgement is rolled back before this method raises.
+        """
+
+        results = await asyncio.gather(
+            *[replica.publish_loaded_policy_identity(policy_identity) for replica in self.rollout_replicas],
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            await asyncio.gather(
+                *[replica.rollback_loaded_policy_identity(policy_identity) for replica in self.rollout_replicas],
+                return_exceptions=True,
+            )
+            raise RuntimeError(
+                "standalone policy publication failed; all replica identities were rolled back: "
+                + "; ".join(repr(failure) for failure in failures)
+            )
+        acknowledgements = [ack for replica_acks in results for ack in replica_acks]
+        expected_servers = sum(len(replica.servers) for replica in self.rollout_replicas)
+        if len(acknowledgements) != expected_servers or any(
+            acknowledgement.get("policy_identity") != policy_identity for acknowledgement in acknowledgements
+        ):
+            await asyncio.gather(
+                *[replica.rollback_loaded_policy_identity(policy_identity) for replica in self.rollout_replicas],
+                return_exceptions=True,
+            )
+            raise RuntimeError(
+                "standalone policy publication did not receive an exact acknowledgement from every server: "
+                f"expected={expected_servers} actual={len(acknowledgements)}"
+            )
+        return acknowledgements
+
+    @auto_await
     async def start_profile(self, **kwargs):
         """Start profiling on all rollout replicas."""
         await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])

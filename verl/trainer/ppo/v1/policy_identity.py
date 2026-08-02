@@ -27,7 +27,7 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
 IDENTITY_TAG_KEYS = (
     "policy_version",
@@ -35,6 +35,7 @@ IDENTITY_TAG_KEYS = (
     "sampling_config_digest",
     "runtime_identity",
 )
+COMMITTED_POLICY_STATE_SCHEMA_VERSION = 1
 
 
 class PolicyIdentityError(RuntimeError):
@@ -139,6 +140,22 @@ class RoundPhase(str, Enum):
     FAILED = "failed"
 
 
+@dataclass
+class PolicyPublicationTransaction:
+    """One atomic publication from a named source to one replica-wide target."""
+
+    source_policy_version: int
+    source_policy_lineage: str
+    target: BehaviorPolicyIdentity
+    acknowledgements: dict[int, BehaviorPolicyIdentity]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_policy_version, int) or self.source_policy_version < 0:
+            raise PolicyIdentityError(f"invalid publication source policy version: {self.source_policy_version!r}")
+        if not isinstance(self.source_policy_lineage, str) or not self.source_policy_lineage:
+            raise PolicyIdentityError("publication source policy lineage must be a non-empty string")
+
+
 class StrictOnPolicyRound:
     """Fail-closed controller for one-policy-per-round call ordering."""
 
@@ -146,41 +163,78 @@ class StrictOnPolicyRound:
         self.phase = RoundPhase.UNINITIALIZED
         self.published: BehaviorPolicyIdentity | None = None
         self.training_identity: BehaviorPolicyIdentity | None = None
+        self.publication: PolicyPublicationTransaction | None = None
+        self.publication_failure: str | None = None
         self.expected_replica_ids = frozenset(expected_replica_ids)
         if not self.expected_replica_ids:
             raise PolicyIdentityError("strict publication requires at least one rollout replica")
 
-    def _validate_acknowledgements(
-        self, identity: BehaviorPolicyIdentity, acknowledgements: Iterable[Mapping[str, Any]]
+    def publish_initial(
+        self,
+        identity: BehaviorPolicyIdentity,
+        acknowledgements: Iterable[Mapping[str, Any]],
+        *,
+        source_policy_version: int,
+        source_policy_lineage: str,
     ) -> None:
-        acknowledgements = list(acknowledgements)
-        if not acknowledgements:
-            raise PolicyIdentityError("weight publication returned no replica acknowledgements")
-        replica_ids = [acknowledgement.get("replica_id") for acknowledgement in acknowledgements]
-        if len(replica_ids) != len(set(replica_ids)):
-            raise PolicyIdentityError(f"weight publication returned duplicate replica ids: {replica_ids}")
-        if set(replica_ids) != self.expected_replica_ids:
-            raise PolicyIdentityError(
-                "weight publication did not cover the expected replica set: "
-                f"expected={sorted(self.expected_replica_ids)} actual={sorted(replica_ids, key=str)}"
-            )
-        for index, acknowledgement in enumerate(acknowledgements):
-            try:
-                acknowledged = BehaviorPolicyIdentity.from_dict(acknowledgement)
-            except (PolicyIdentityError, TypeError) as exc:
-                raise PolicyIdentityError(f"invalid rollout replica acknowledgement {index}: {exc}") from exc
-            if acknowledged != identity:
-                raise PolicyIdentityError(
-                    f"rollout replica acknowledgement {index} does not match publication: "
-                    f"expected={identity.as_dict()} actual={acknowledged.as_dict()}"
-                )
-
-    def publish_initial(self, identity: BehaviorPolicyIdentity, acknowledgements: Iterable[Mapping[str, Any]]) -> None:
         if self.phase is not RoundPhase.UNINITIALIZED:
             raise PolicyIdentityError(f"initial publication is invalid in phase {self.phase.value}")
-        self._validate_acknowledgements(identity, acknowledgements)
-        self.published = identity
-        self.phase = RoundPhase.PUBLISHED
+        self.publication = PolicyPublicationTransaction(
+            source_policy_version=source_policy_version,
+            source_policy_lineage=source_policy_lineage,
+            target=identity,
+            acknowledgements={},
+        )
+        self.publication_failure = None
+        self.phase = RoundPhase.PUBLISHING
+        self.commit_publication(identity, acknowledgements)
+
+    def committed_state_dict(self) -> dict[str, Any]:
+        """Serialize only the last all-replica committed publication.
+
+        In-flight acknowledgements are intentionally excluded.  A crash during
+        transfer therefore resumes from the last atomically visible policy and
+        can never make a partially updated target durable.
+        """
+
+        if self.phase is not RoundPhase.PUBLISHED or self.published is None:
+            raise PolicyIdentityError(f"committed policy state is unavailable in phase {self.phase.value}")
+        if self.training_identity is not None or self.publication is not None:
+            raise PolicyIdentityError("committed policy state contains an in-flight round")
+        return {
+            "schema_version": COMMITTED_POLICY_STATE_SCHEMA_VERSION,
+            "expected_replica_ids": sorted(self.expected_replica_ids),
+            "published": self.published.as_dict(),
+        }
+
+    @classmethod
+    def from_committed_state_dict(cls, value: Mapping[str, Any]) -> StrictOnPolicyRound:
+        """Restore the last committed identity without advancing its version."""
+
+        required = {"schema_version", "expected_replica_ids", "published"}
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise PolicyIdentityError("committed policy state has an invalid schema")
+        if value["schema_version"] != COMMITTED_POLICY_STATE_SCHEMA_VERSION:
+            raise PolicyIdentityError(f"unsupported committed policy state schema: {value['schema_version']!r}")
+        replica_ids = value["expected_replica_ids"]
+        if (
+            not isinstance(replica_ids, list)
+            or not replica_ids
+            or any(
+                isinstance(replica_id, bool) or not isinstance(replica_id, int) or replica_id < 0
+                for replica_id in replica_ids
+            )
+            or len(set(replica_ids)) != len(replica_ids)
+        ):
+            raise PolicyIdentityError("committed policy state has invalid rollout replica ids")
+        try:
+            published = BehaviorPolicyIdentity.from_dict(value["published"])
+        except (PolicyIdentityError, TypeError) as exc:
+            raise PolicyIdentityError(f"committed policy state has an invalid identity: {exc}") from exc
+        state = cls(replica_ids)
+        state.published = published
+        state.phase = RoundPhase.PUBLISHED
+        return state
 
     def begin_rollout(self, expected_policy_version: int) -> BehaviorPolicyIdentity:
         if self.phase is not RoundPhase.PUBLISHED or self.published is None:
@@ -204,7 +258,22 @@ class StrictOnPolicyRound:
             raise PolicyIdentityError(f"training is invalid in phase {self.phase.value}")
         self.phase = RoundPhase.TRAINING
 
-    def begin_publication(self, next_identity: BehaviorPolicyIdentity) -> None:
+    def begin_publication(
+        self,
+        next_identity: BehaviorPolicyIdentity,
+        *,
+        source_policy_version: int,
+        source_policy_lineage: str,
+    ) -> bool:
+        if self.phase is RoundPhase.PUBLISHING and self.publication is not None:
+            same_transaction = (
+                self.publication.target == next_identity
+                and self.publication.source_policy_version == source_policy_version
+                and self.publication.source_policy_lineage == source_policy_lineage
+            )
+            if same_transaction:
+                return False
+            self._rollback_and_raise("conflicting weight publication update while another target is pending")
         if self.phase is not RoundPhase.TRAINING or self.training_identity is None:
             raise PolicyIdentityError(f"publication is invalid in phase {self.phase.value}")
         expected = self.training_identity.policy_version + 1
@@ -213,7 +282,46 @@ class StrictOnPolicyRound:
                 f"publication must advance exactly once from {self.training_identity.policy_version} to {expected}, "
                 f"got {next_identity.policy_version}"
             )
+        if source_policy_version != self.training_identity.policy_version:
+            raise PolicyIdentityError(
+                "publication source version must be "
+                f"{self.training_identity.policy_version}, got {source_policy_version}"
+            )
+        if source_policy_lineage != self.training_identity.weight_digest:
+            raise PolicyIdentityError("publication source lineage does not match the active training policy")
+        self.publication = PolicyPublicationTransaction(
+            source_policy_version=source_policy_version,
+            source_policy_lineage=source_policy_lineage,
+            target=next_identity,
+            acknowledgements={},
+        )
+        self.publication_failure = None
         self.phase = RoundPhase.PUBLISHING
+        return True
+
+    def acknowledge_publication(self, acknowledgement: Mapping[str, Any]) -> bool:
+        """Record one replica ack; exact retries are idempotent, conflicts fail closed."""
+
+        if self.phase is not RoundPhase.PUBLISHING or self.publication is None:
+            raise PolicyIdentityError(f"publication acknowledgement is invalid in phase {self.phase.value}")
+        replica_id = acknowledgement.get("replica_id")
+        if replica_id not in self.expected_replica_ids:
+            self._rollback_and_raise(f"unexpected rollout replica acknowledgement: {replica_id!r}")
+        try:
+            acknowledged = BehaviorPolicyIdentity.from_dict(acknowledgement)
+        except (PolicyIdentityError, TypeError) as exc:
+            self._rollback_and_raise(f"invalid rollout replica acknowledgement {replica_id!r}: {exc}")
+        if acknowledged != self.publication.target:
+            self._rollback_and_raise(
+                f"rollout replica acknowledgement {replica_id!r} does not match publication target"
+            )
+        previous = self.publication.acknowledgements.get(replica_id)
+        if previous is not None:
+            if previous == acknowledged:
+                return False
+            self._rollback_and_raise(f"conflicting rollout replica acknowledgement: {replica_id!r}")
+        self.publication.acknowledgements[replica_id] = acknowledged
+        return True
 
     def commit_publication(
         self,
@@ -222,13 +330,37 @@ class StrictOnPolicyRound:
     ) -> None:
         if self.phase is not RoundPhase.PUBLISHING:
             raise PolicyIdentityError(f"publication commit is invalid in phase {self.phase.value}")
+        if self.publication is None or identity != self.publication.target:
+            self._rollback_and_raise("publication commit does not match the pending target")
         try:
-            self._validate_acknowledgements(identity, acknowledgements)
+            for acknowledgement in acknowledgements:
+                self.acknowledge_publication(acknowledgement)
+            actual_replica_ids = set(self.publication.acknowledgements)
+            if actual_replica_ids != self.expected_replica_ids:
+                raise PolicyIdentityError(
+                    "weight publication did not cover the expected replica set: "
+                    f"expected={sorted(self.expected_replica_ids)} actual={sorted(actual_replica_ids, key=str)}"
+                )
         except PolicyIdentityError as exc:
-            self.fail(str(exc))
+            if self.phase is RoundPhase.PUBLISHING:
+                self.rollback_publication(str(exc))
+            raise
         self.published = identity
         self.training_identity = None
+        self.publication = None
         self.phase = RoundPhase.PUBLISHED
+
+    def rollback_publication(self, reason: str) -> None:
+        """Discard an incomplete transaction while retaining the last committed policy."""
+
+        self.publication = None
+        self.training_identity = None
+        self.publication_failure = str(reason)
+        self.phase = RoundPhase.PUBLISHED if self.published is not None else RoundPhase.UNINITIALIZED
+
+    def _rollback_and_raise(self, reason: str) -> NoReturn:
+        self.rollback_publication(reason)
+        raise PolicyIdentityError(reason)
 
     def fail(self, reason: str) -> None:
         self.phase = RoundPhase.FAILED

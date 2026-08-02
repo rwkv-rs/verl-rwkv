@@ -1,0 +1,79 @@
+[experiment]
+name = "maxrl-dapo-math-17k-two-steps"
+project = "helicopter-math"
+seed = 42
+candidate_dataset_passes = 1
+max_optimizer_steps = 2
+
+[model]
+name = "g1i-preview-1.5b"
+repository = "BlinkDL/temp-latest-training-models"
+revision = "d5db8cdf837726ef65a22724c86fa2b6ca95d3d8"
+filename = "rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
+sha256 = "22fe129988f6e98480b344075597259a13ae4201c1d8dedf987246772e613586"
+legacy_checkpoint = "${WEIGHT_PATH}/rwkv7/pth/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384.pth"
+checkpoint = "${WEIGHT_PATH}/rwkv7/hf/rwkv7-g1i_preview5445-1.5b-20260729-ctx16384"
+prompt_mode = "open_think"
+prompt_template = "\nBot✿"
+
+[data.train]
+files = ["${DATASETS_PATH}/DAPO/dapo-math-17k-processed.parquet"]
+prompt_field = "prompt"
+
+[algorithm]
+name = "maxrl"
+prompts_per_step = 32
+responses_per_prompt = 16
+ppo_clip = 0.2
+dual_clip = 3.0
+entropy_coefficient = 0.0
+kl_coefficient = 0.0
+
+[reward]
+manager = "dapo"
+scorer = "math_verify"
+
+[optimizer]
+learning_rate = 1e-6
+warmup_steps = 0
+weight_decay = 0.01
+gradient_norm_limit = 0.3
+
+[generation.train]
+temperature = 1.0
+top_k = -1
+top_p = 0.95
+
+[execution]
+nodes = 1
+gpus_per_node = 8
+wkv_mode = "fp32io16"
+context_mode = "state_passing"
+state_chunk_tokens = 2048
+
+[execution.rollout]
+replicas = 8
+tensor_parallel_size_per_replica = 1
+pipeline_parallel_size_per_replica = 1
+max_concurrent_sequences_per_replica = 64
+generation_token_budget_per_replica = 8192
+weight_update_bucket_mib = 64
+
+[evaluation]
+before_training = false
+every_optimizer_steps = 2
+command = [
+  "helicopter",
+  "eval",
+  "--config",
+  "configs/eval/maxrl_math.toml",
+  "--env-file",
+  ".env.remote",
+]
+
+[checkpoint]
+every_optimizer_steps = 1
+directory = "${WEIGHT_PATH}/maxrl/maxrl-dapo-math-17k-two-steps"
+
+[logging]
+backends = ["console", "file"]

@@ -71,6 +71,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+from verl.workers.config.model import resolve_antidoom_rwkv_lora
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -315,6 +316,7 @@ class FSDPEngine(BaseEngine):
 
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
+        antidoom_lora = resolve_antidoom_rwkv_lora(self.model_config)
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
         if lora_adapter_path is not None:
@@ -337,6 +339,7 @@ class FSDPEngine(BaseEngine):
                 "task_type": TaskType.CAUSAL_LM,
                 "r": self.model_config.lora_rank,
                 "lora_alpha": self.model_config.lora_alpha,
+                "lora_dropout": antidoom_lora["dropout"] if antidoom_lora is not None else 0.0,
                 "target_modules": convert_to_regular_types(self.model_config.target_modules),
                 "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
@@ -1263,7 +1266,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
-
         model_output = {}
 
         input_ids = micro_batch["input_ids"]

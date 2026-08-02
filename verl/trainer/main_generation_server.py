@@ -16,8 +16,8 @@ Generate responses given a dataset of prompts
 """
 
 import os
+import sys
 
-import aiohttp
 import hydra
 import numpy as np
 import ray
@@ -31,8 +31,13 @@ from pprint import pprint
 
 import pandas as pd
 from omegaconf import OmegaConf
-from openai.types.chat import ChatCompletion
 
+from verl.trainer.rollout_campaign import (
+    load_dapo_math_pilot_plan,
+    prepare_dapo_math_pilot_batch,
+    print_campaign_plan,
+    run_dapo_math_pilot,
+)
 from verl.utils.hdfs_io import makedirs
 from verl.workers.rollout.replica import get_rollout_replica_class
 
@@ -64,6 +69,9 @@ async def start_server(config):
 
 
 async def submit_request(server_address, **chat_complete_request):
+    import aiohttp
+    from openai.types.chat import ChatCompletion
+
     try:
         extra_headers = chat_complete_request.pop("extra_headers", {})
         timeout = aiohttp.ClientTimeout(total=None)
@@ -121,10 +129,31 @@ async def generate(
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
+    OmegaConf.resolve(config)
+
+    campaign_config = config.get("rollout_campaign")
+    if campaign_config is not None and campaign_config.get("enabled", False):
+        plan = load_dapo_math_pilot_plan(config)
+        if campaign_config.get("dry_run", False):
+            prepare_dapo_math_pilot_batch(plan)
+            print_campaign_plan(plan)
+            return
+        print_campaign_plan(plan)
+        ray.init(
+            runtime_env={
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "VLLM_USE_V1": "1",
+                }
+            }
+        )
+        manifest_path = asyncio.run(run_dapo_math_pilot(config, plan))
+        print(f"Promoted rollout campaign manifest: {manifest_path}")
+        return
 
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
-    OmegaConf.resolve(config)
+    ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
 
     n_samples = config.actor_rollout_ref.rollout.n
 
@@ -190,4 +219,7 @@ def main(config):
 
 
 if __name__ == "__main__":
+    if "--dry-run" in sys.argv:
+        sys.argv.remove("--dry-run")
+        sys.argv.append("rollout_campaign.dry_run=true")
     main()

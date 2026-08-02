@@ -282,6 +282,21 @@ class RolloutReplica(ABC):
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
 
+    async def publish_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> list[dict[str, Any]]:
+        """Publish an identity for an immutable checkpoint loaded at server startup."""
+
+        return await asyncio.gather(
+            *[server.publish_loaded_policy_identity.remote(policy_identity) for server in self.servers]
+        )
+
+    async def rollback_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> None:
+        """Hide a startup identity after a replica-wide publication failure."""
+
+        await asyncio.gather(
+            *[server.rollback_loaded_policy_identity.remote(policy_identity) for server in self.servers],
+            return_exceptions=True,
+        )
+
     async def release_kv_cache(self):
         """Release only the kv_cache GPU memory, keeping model weights in place."""
         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])

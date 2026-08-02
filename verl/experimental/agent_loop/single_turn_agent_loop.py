@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.finish_metadata import build_rollout_finish_metadata
 from verl.trainer.ppo.v1.policy_identity import IDENTITY_TAG_KEYS, canonical_digest
 from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector, repetition_extra_fields
 from verl.utils.profiler import simple_timer
@@ -143,6 +144,28 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         extra_fields["stop_reason"] = token_output.stop_reason
         extra_fields["response_token_count"] = min(len(response_ids), self.response_length)
+        stored_response_ids = response_ids[: self.response_length]
+        response_text = self.tokenizer.decode(stored_response_ids, skip_special_tokens=True)
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        eos_token_ids = list(eos_token_id) if isinstance(eos_token_id, list | tuple) else [eos_token_id]
+        eos_token_ids = [token_id for token_id in eos_token_ids if isinstance(token_id, int)]
+        backend_stop_reason = extra_fields.get("backend_stop_reason")
+        stop_token_ids = (
+            [backend_stop_reason]
+            if isinstance(backend_stop_reason, int) and backend_stop_reason not in eos_token_ids
+            else []
+        )
+        extra_fields.update(
+            build_rollout_finish_metadata(
+                response_text,
+                finish_reason=extra_fields.get("finish_reason") or token_output.stop_reason,
+                backend_stop_reason=backend_stop_reason,
+                repetition_truncated=bool(extra_fields["repetition_truncated"]),
+                response_token_ids=stored_response_ids,
+                eos_token_ids=eos_token_ids,
+                stop_token_ids=stop_token_ids,
+            )
+        )
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -23,7 +24,39 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
+__all__ = ["HFModelConfig", "MtpConfig", "resolve_antidoom_rwkv_lora"]
+
+ANTIDOOM_RWKV_ADAPTER = "antidoom_rwkv"
+ANTIDOOM_RWKV_TARGET_MODULES = ("receptance", "key", "value", "output")
+
+
+def resolve_antidoom_rwkv_lora(model_config: Any) -> dict[str, Any] | None:
+    """Validate and normalize an explicitly selected Antidoom PEFT config."""
+
+    value = model_config.get("lora", None) if hasattr(model_config, "get") else getattr(model_config, "lora", None)
+    if not isinstance(value, Mapping) or value.get("adapter") != ANTIDOOM_RWKV_ADAPTER:
+        return None
+    rank = int(value.get("rank", value.get("r", 128)))
+    alpha = int(value.get("alpha", value.get("lora_alpha", 128)))
+    dropout = float(value.get("dropout", value.get("lora_dropout", 0.0)))
+    target_modules = value.get("target_modules", ANTIDOOM_RWKV_TARGET_MODULES)
+    if isinstance(target_modules, str):
+        target_modules = [item.strip() for item in target_modules.split(",") if item.strip()]
+    else:
+        target_modules = [str(item) for item in target_modules]
+    if rank <= 0 or alpha <= 0:
+        raise ValueError("Antidoom RWKV LoRA rank and alpha must be positive")
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError("Antidoom RWKV LoRA dropout must be in [0, 1)")
+    if not target_modules or any(not name for name in target_modules):
+        raise ValueError("Antidoom RWKV LoRA target_modules must be non-empty names")
+    return {
+        "rank": rank,
+        "alpha": alpha,
+        "dropout": dropout,
+        "target_modules": target_modules,
+        "adapter_path": value.get("adapter_path") or value.get("path"),
+    }
 
 
 @dataclass
@@ -86,6 +119,10 @@ class HFModelConfig(BaseConfig):
     }
 
     path: str = MISSING
+    repository: Optional[str] = None
+    revision: Optional[str] = None
+    filename: Optional[str] = None
+    sha256: Optional[str] = None
     local_path: Optional[str] = None
     hf_config_path: Optional[str] = None
     local_hf_config_path: Optional[str] = None
@@ -146,6 +183,17 @@ class HFModelConfig(BaseConfig):
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
+        antidoom_lora = resolve_antidoom_rwkv_lora(self)
+        if antidoom_lora is not None:
+            if self.lora_rank not in (0, antidoom_lora["rank"]):
+                raise ValueError("model.lora_rank conflicts with Antidoom RWKV lora.rank")
+            object.__setattr__(self, "lora_rank", antidoom_lora["rank"])
+            object.__setattr__(self, "lora_alpha", antidoom_lora["alpha"])
+            object.__setattr__(self, "target_modules", antidoom_lora["target_modules"])
+            if antidoom_lora["adapter_path"] is not None:
+                if self.lora_adapter_path not in (None, antidoom_lora["adapter_path"]):
+                    raise ValueError("model.lora_adapter_path conflicts with Antidoom RWKV lora.adapter_path")
+                object.__setattr__(self, "lora_adapter_path", antidoom_lora["adapter_path"])
         import_external_libs(self.external_lib)
 
         if self.hf_config_path is None:

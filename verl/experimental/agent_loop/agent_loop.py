@@ -44,8 +44,8 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
-from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
 
+from verl.experimental.agent_loop.campaign_fields import CAMPAIGN_SAMPLING_SEED_FIELD
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -688,16 +688,26 @@ class AgentLoopWorker:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
-        # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
-        # Do not forward it to concrete agent loops, which may reject unknown kwargs.
+        # These are internal per-sample sampling overrides. Do not forward them
+        # to concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
+        per_sample_seed = batch.non_tensor_batch.get(CAMPAIGN_SAMPLING_SEED_FIELD)
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            kwargs = {
+                key: values[i]
+                for key, values in batch.non_tensor_batch.items()
+                if key not in {"__do_sample__", CAMPAIGN_SAMPLING_SEED_FIELD}
+            }
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
+            if per_sample_seed is not None:
+                seed = per_sample_seed[i]
+                if isinstance(seed, bool) or not isinstance(seed, int | np.integer):
+                    raise ValueError("per-sample campaign seed must be an integer")
+                sample_sampling_params["seed"] = int(seed)
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -805,6 +815,8 @@ class AgentLoopWorker:
 
         prompt_token_ids = list(output.prompt_ids)
         if self.rollout_config.get("rwkv_prompt_template") is not None:
+            from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
+
             prompt_token_ids = ensure_rwkv_prompt_bos_token(
                 prompt_token_ids,
                 max_length=self.rollout_config.prompt_length,

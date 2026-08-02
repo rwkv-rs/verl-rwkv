@@ -160,9 +160,7 @@ def test_server_manager_reads_fresh_actor_metadata_and_checks_endpoints(monkeypa
 
     manager = LLMServerManager.__new__(LLMServerManager)
     manager.server_addresses = ["10.0.0.1:18000", "10.0.0.2:18001"]
-    manager.server_handles = [
-        SimpleNamespace(get_runtime_metadata=RemoteMethod(value)) for value in metadata
-    ]
+    manager.server_handles = [SimpleNamespace(get_runtime_metadata=RemoteMethod(value)) for value in metadata]
     monkeypatch.setattr(llm_server.ray, "get", lambda values: values)
 
     snapshot = manager.get_runtime_metadata_snapshot()
