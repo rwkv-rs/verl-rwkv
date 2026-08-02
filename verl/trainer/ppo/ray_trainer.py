@@ -34,6 +34,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.agent_loop.finish_metadata import ROLLOUT_FINISH_METADATA_KEYS
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -724,6 +725,7 @@ class RayPPOTrainer:
                 "stop_reason",
                 "finish_reason",
                 "backend_stop_reason",
+                *ROLLOUT_FINISH_METADATA_KEYS,
                 *REPETITION_EXTRA_FIELD_KEYS,
             ):
                 if key in test_batch.non_tensor_batch:

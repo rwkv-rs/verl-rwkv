@@ -29,7 +29,12 @@ def test_write_generations_preserves_validation_diagnostics_on_cpu(tmp_path):
             "uid": ["sample-0"],
             "stop_reason": ["completed"],
             "response_token_count": [7],
-            "repetition_truncated": [True],
+            "format_valid": [True],
+            "format_parser_version": ["strict-cot-v1"],
+            "ended_by_eos": [True],
+            "repetition_truncated": [False],
+            "context_exhausted": [False],
+            "other_failure": [False],
             "repetition_matched_reason": ["zstd_low_ratio"],
             "sampling_params": [{"top_k": 40, "top_p": 0.35, "temperature": 0.25}],
         },
@@ -42,7 +47,12 @@ def test_write_generations_preserves_validation_diagnostics_on_cpu(tmp_path):
     assert row["uid"] == "sample-0"
     assert row["stop_reason"] == "completed"
     assert row["response_token_count"] == 7
-    assert row["repetition_truncated"] is True
+    assert row["format_valid"] is True
+    assert row["format_parser_version"] == "strict-cot-v1"
+    assert row["ended_by_eos"] is True
+    assert row["repetition_truncated"] is False
+    assert row["context_exhausted"] is False
+    assert row["other_failure"] is False
     assert row["repetition_matched_reason"] == "zstd_low_ratio"
     assert row["sampling_params"] == {"top_k": 40, "top_p": 0.35, "temperature": 0.25}
 

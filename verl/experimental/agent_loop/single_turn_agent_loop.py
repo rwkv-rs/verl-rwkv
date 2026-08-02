@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.finish_metadata import build_rollout_finish_metadata
 from verl.trainer.ppo.v1.policy_identity import IDENTITY_TAG_KEYS, canonical_digest
 from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector, repetition_extra_fields
 from verl.utils.profiler import simple_timer
@@ -143,6 +144,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         extra_fields["stop_reason"] = token_output.stop_reason
         extra_fields["response_token_count"] = min(len(response_ids), self.response_length)
+        response_text = self.tokenizer.decode(response_ids[: self.response_length], skip_special_tokens=True)
+        extra_fields.update(
+            build_rollout_finish_metadata(
+                response_text,
+                finish_reason=extra_fields.get("finish_reason") or token_output.stop_reason,
+                backend_stop_reason=extra_fields.get("backend_stop_reason"),
+                repetition_truncated=bool(extra_fields["repetition_truncated"]),
+            )
+        )
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
