@@ -260,6 +260,7 @@ def _validate_resolved(
     prompts_per_step: int,
     responses_per_prompt: int,
     candidate_dataset_passes: int,
+    max_optimizer_steps: int | None,
     validation_before_training: bool,
     validation_interval: int,
 ) -> None:
@@ -310,6 +311,8 @@ def _validate_resolved(
     for key, expected in required.items():
         if resolved.get(key) != expected:
             raise MaxRLConfigError(f"strict MaxRL requires {key}={expected}")
+    if max_optimizer_steps is not None and resolved.get("trainer.total_training_steps") != str(max_optimizer_steps):
+        raise MaxRLConfigError(f"strict MaxRL requires trainer.total_training_steps={max_optimizer_steps}")
     if resolved.get("data.train_batch_size") != resolved.get("actor_rollout_ref.actor.ppo_mini_batch_size"):
         raise MaxRLConfigError("strict MaxRL requires one global mini-batch per optimizer step")
 
@@ -346,6 +349,12 @@ def build_overrides(
         _required(experiment, "candidate_dataset_passes", section_name="experiment"),
         name="experiment.candidate_dataset_passes",
     )
+    max_optimizer_steps = experiment.get("max_optimizer_steps")
+    if max_optimizer_steps is not None:
+        max_optimizer_steps = _positive_int(
+            max_optimizer_steps,
+            name="experiment.max_optimizer_steps",
+        )
     checkpoint_path = str(_required(model, "checkpoint", section_name="model"))
     context_tokens = context_tokens_from_checkpoint(checkpoint_path)
     prompts_per_step = _positive_int(
@@ -532,6 +541,8 @@ def build_overrides(
             f"trainer.total_epochs={passes}",
         ]
     )
+    if max_optimizer_steps is not None:
+        overrides.append(f"trainer.total_training_steps={max_optimizer_steps}")
     if extra_overrides:
         _validate_extra_overrides(extra_overrides)
         overrides.extend(extra_overrides)
@@ -542,6 +553,7 @@ def build_overrides(
         prompts_per_step=prompts_per_step,
         responses_per_prompt=responses_per_prompt,
         candidate_dataset_passes=passes,
+        max_optimizer_steps=max_optimizer_steps,
         validation_before_training=validation_before_training,
         validation_interval=validation_interval,
     )

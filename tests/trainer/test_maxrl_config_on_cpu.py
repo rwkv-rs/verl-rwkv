@@ -247,6 +247,24 @@ def test_user_override_accepts_documented_operational_fields() -> None:
     assert values["trainer.save_freq"] == "10"
 
 
+def test_experiment_can_bound_a_two_optimizer_step_acceptance_run() -> None:
+    modified = deepcopy(config())
+    modified["experiment"]["max_optimizer_steps"] = 2
+
+    overrides, _ = build_overrides(modified, env=ENV)
+
+    assert resolved(overrides)["trainer.total_training_steps"] == "2"
+
+
+@pytest.mark.parametrize("value", [0, -1, "invalid"])
+def test_max_optimizer_steps_must_be_positive(value) -> None:
+    modified = deepcopy(config())
+    modified["experiment"]["max_optimizer_steps"] = value
+
+    with pytest.raises(MaxRLConfigError, match="experiment.max_optimizer_steps"):
+        build_overrides(modified, env=ENV)
+
+
 @pytest.mark.parametrize(
     "override",
     [
