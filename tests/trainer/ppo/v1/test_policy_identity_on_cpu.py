@@ -61,6 +61,25 @@ def _acks(identity: BehaviorPolicyIdentity):
     return [{**identity.as_dict(), "replica_id": replica_id} for replica_id in range(8)]
 
 
+def _publish_initial(state: StrictOnPolicyRound, identity: BehaviorPolicyIdentity, acknowledgements=None):
+    state.publish_initial(
+        identity,
+        _acks(identity) if acknowledgements is None else acknowledgements,
+        source_policy_version=identity.policy_version,
+        source_policy_lineage=f"checkpoint:{identity.weight_digest}",
+    )
+
+
+def _begin_publication(state: StrictOnPolicyRound, target: BehaviorPolicyIdentity):
+    source = state.training_identity
+    assert source is not None
+    return state.begin_publication(
+        target,
+        source_policy_version=source.policy_version,
+        source_policy_lineage=source.weight_digest,
+    )
+
+
 def test_global_step_adapter_preserves_fresh_and_restored_lineage():
     assert checkpoint_policy_version(0) == 0
     assert checkpoint_policy_version(17) == 17
@@ -142,14 +161,14 @@ def test_batch_gate_rejects_missing_stale_mixed_cross_identity_and_incomplete_gr
 def test_round_state_machine_bootstrap_train_publish_two_consecutive_rounds():
     state = StrictOnPolicyRound()
     identity0 = _identity(0)
-    state.publish_initial(identity0, _acks(identity0))
+    _publish_initial(state, identity0)
 
     for version in (0, 1):
         current = state.begin_rollout(version)
         state.prepare(_tags(current))
         state.begin_training()
         next_identity = _identity(version + 1, previous=current.weight_digest)
-        state.begin_publication(next_identity)
+        _begin_publication(state, next_identity)
         state.commit_publication(next_identity, _acks(next_identity))
 
     assert state.phase is RoundPhase.PUBLISHED
@@ -159,26 +178,143 @@ def test_round_state_machine_bootstrap_train_publish_two_consecutive_rounds():
 def test_restore_does_not_increment_or_reset_policy_lineage():
     restored = _identity(23)
     state = StrictOnPolicyRound()
-    state.publish_initial(restored, _acks(restored))
+    _publish_initial(state, restored)
     assert state.begin_rollout(23) == restored
+
+
+@pytest.mark.parametrize(
+    ("source_version", "source_lineage", "message"),
+    [(-1, "checkpoint", "source policy version"), (0, "", "source policy lineage")],
+)
+def test_initial_publication_requires_explicit_valid_source_lineage(source_version, source_lineage, message):
+    identity = _identity(0)
+    state = StrictOnPolicyRound()
+
+    with pytest.raises(PolicyIdentityError, match=message):
+        state.publish_initial(
+            identity,
+            _acks(identity),
+            source_policy_version=source_version,
+            source_policy_lineage=source_lineage,
+        )
+
+
+def test_publication_acknowledgements_are_incremental_idempotent_and_atomic():
+    current = _identity(5)
+    target = _identity(6, previous=current.weight_digest)
+    state = StrictOnPolicyRound(expected_replica_ids=range(2))
+    _publish_initial(state, current, _acks(current)[:2])
+    state.begin_rollout(5)
+    state.prepare(_tags(current))
+    state.begin_training()
+    assert _begin_publication(state, target) is True
+    assert (
+        state.begin_publication(
+            target,
+            source_policy_version=current.policy_version,
+            source_policy_lineage=current.weight_digest,
+        )
+        is False
+    )
+
+    assert state.acknowledge_publication(_acks(target)[0]) is True
+    assert state.acknowledge_publication(_acks(target)[0]) is False
+    assert state.published == current
+    state.commit_publication(target, [_acks(target)[1]])
+
+    assert state.published == target
+    assert state.begin_rollout(6) == target
+
+
+@pytest.mark.parametrize("failure", ["stale", "conflicting"])
+def test_stale_or_conflicting_ack_rolls_back_without_partial_visibility(failure):
+    current = _identity(5)
+    target = _identity(6, previous=current.weight_digest)
+    state = StrictOnPolicyRound(expected_replica_ids=range(2))
+    _publish_initial(state, current, _acks(current)[:2])
+    state.begin_rollout(5)
+    state.prepare(_tags(current))
+    state.begin_training()
+    _begin_publication(state, target)
+    state.acknowledge_publication(_acks(target)[0])
+    bad = {**(_identity(5) if failure == "stale" else _identity(7)).as_dict(), "replica_id": 1}
+
+    with pytest.raises(PolicyIdentityError, match="does not match"):
+        state.acknowledge_publication(bad)
+
+    assert state.phase is RoundPhase.PUBLISHED
+    assert state.published == current
+    assert state.publication is None
+
+
+def test_publication_is_refused_while_rollout_is_active():
+    current = _identity(2)
+    state = StrictOnPolicyRound()
+    _publish_initial(state, current)
+    state.begin_rollout(2)
+
+    with pytest.raises(PolicyIdentityError, match="publication is invalid in phase rollout"):
+        state.begin_publication(
+            _identity(3, previous=current.weight_digest),
+            source_policy_version=2,
+            source_policy_lineage=current.weight_digest,
+        )
+
+    assert state.published == current
+
+
+def test_publication_source_must_match_active_committed_lineage():
+    current = _identity(2)
+    state = StrictOnPolicyRound()
+    _publish_initial(state, current)
+    state.begin_rollout(2)
+    state.prepare(_tags(current))
+    state.begin_training()
+
+    with pytest.raises(PolicyIdentityError, match="source lineage"):
+        state.begin_publication(
+            _identity(3, previous=current.weight_digest),
+            source_policy_version=2,
+            source_policy_lineage="different-lineage",
+        )
+
+
+def test_conflicting_repeated_publication_update_rolls_back():
+    current = _identity(2)
+    state = StrictOnPolicyRound()
+    _publish_initial(state, current)
+    state.begin_rollout(2)
+    state.prepare(_tags(current))
+    state.begin_training()
+    _begin_publication(state, _identity(3, previous=current.weight_digest))
+
+    with pytest.raises(PolicyIdentityError, match="conflicting weight publication update"):
+        state.begin_publication(
+            _identity(4, previous=current.weight_digest),
+            source_policy_version=2,
+            source_policy_lineage=current.weight_digest,
+        )
+
+    assert state.phase is RoundPhase.PUBLISHED
+    assert state.published == current
 
 
 def test_failed_or_mixed_replica_ack_never_commits_publication():
     current = _identity(3)
     state = StrictOnPolicyRound()
-    state.publish_initial(current, _acks(current))
+    _publish_initial(state, current)
     state.begin_rollout(3)
     state.prepare(_tags(current))
     state.begin_training()
     candidate = _identity(4, previous=current.weight_digest)
-    state.begin_publication(candidate)
+    _begin_publication(state, candidate)
 
     bad_ack = deepcopy(candidate.as_dict())
     bad_ack["weight_digest"] = "partial-update"
     with pytest.raises(PolicyIdentityError, match="does not match"):
         state.commit_publication(candidate, _acks(candidate)[:-1] + [{**bad_ack, "replica_id": 7}])
 
-    assert state.phase is RoundPhase.FAILED
+    assert state.phase is RoundPhase.PUBLISHED
     assert state.published == current
 
 
@@ -193,13 +329,13 @@ def test_publication_rejects_missing_or_duplicate_replica_acknowledgements(acks)
     identity = _identity(0)
     state = StrictOnPolicyRound()
     with pytest.raises(PolicyIdentityError, match="replica"):
-        state.publish_initial(identity, acks(identity))
+        _publish_initial(state, identity, acks(identity))
 
 
 def test_optimizer_failure_path_cannot_publish_or_advance_version():
     current = _identity(8)
     state = StrictOnPolicyRound()
-    state.publish_initial(current, _acks(current))
+    _publish_initial(state, current)
     state.begin_rollout(8)
     state.prepare(_tags(current))
     state.begin_training()
@@ -215,7 +351,7 @@ def test_optimizer_failure_path_cannot_publish_or_advance_version():
 def test_next_round_cannot_roll_out_before_publication_commits():
     current = _identity(1)
     state = StrictOnPolicyRound()
-    state.publish_initial(current, _acks(current))
+    _publish_initial(state, current)
     state.begin_rollout(1)
     state.prepare(_tags(current))
     state.begin_training()
@@ -263,7 +399,7 @@ def _training_sync(checkpoint_manager):
     trainer._export_contract = {"engine": "rwkv_lm", "dtype": "bfloat16"}
     current = _identity(0)
     trainer.policy_round = StrictOnPolicyRound()
-    trainer.policy_round.publish_initial(current, _acks(current))
+    _publish_initial(trainer.policy_round, current)
     trainer.policy_round.begin_rollout(0)
     trainer.policy_round.prepare(_tags(current))
     trainer.policy_round.begin_training()
@@ -293,5 +429,5 @@ def test_sync_lifecycle_update_failure_or_timeout_never_commits(error):
     with pytest.raises(type(error), match=str(error)):
         trainer.on_step_end()
 
-    assert trainer.policy_round.phase is RoundPhase.PUBLISHING
+    assert trainer.policy_round.phase is RoundPhase.PUBLISHED
     assert trainer.policy_round.published == previous

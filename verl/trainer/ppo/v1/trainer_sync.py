@@ -89,7 +89,12 @@ class PPOTrainerSync(PPOTrainer):
             self.global_steps,
             policy_identity=initial_identity.as_dict(),
         )
-        self.policy_round.publish_initial(initial_identity, acknowledgements)
+        self.policy_round.publish_initial(
+            initial_identity,
+            acknowledgements,
+            source_policy_version=initial_version,
+            source_policy_lineage=f"checkpoint:{checkpoint_origin}:{initial_version}",
+        )
         record_policy_identity("publish_initial", self.global_steps, initial_identity)
 
     def on_step_begin(self):
@@ -129,11 +134,19 @@ class PPOTrainerSync(PPOTrainer):
                 sampling_config=self._sampling_config,
                 runtime_identity=self._runtime_identity,
             )
-            self.policy_round.begin_publication(next_identity)
-            acknowledgements = self.checkpoint_manager.update_weights(
-                self.global_steps,
-                policy_identity=next_identity.as_dict(),
+            self.policy_round.begin_publication(
+                next_identity,
+                source_policy_version=current_identity.policy_version,
+                source_policy_lineage=current_identity.weight_digest,
             )
+            try:
+                acknowledgements = self.checkpoint_manager.update_weights(
+                    self.global_steps,
+                    policy_identity=next_identity.as_dict(),
+                )
+            except BaseException as exc:
+                self.policy_round.rollback_publication(f"weight publication failed: {exc}")
+                raise
             for stage in ("rollout_weights_resume", "weight_transfer", "rollout_kv_wake"):
                 stage_values = [
                     acknowledgement.get("publication_timing", {}).get(stage)
