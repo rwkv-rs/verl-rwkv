@@ -1,0 +1,9 @@
+# VLLM_BUILD_PROFILE=rwkv uv pip install -r requirements-rwkv.txt
+# uv pip install --no-deps -e .
+# The second command keeps setup.py's intentionally generic Transformers range
+# separate from this mutually exclusive self-owned runtime.
+-r requirements-common.txt
+flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@a4a8aa98df6ec5322f194a80ec57363dd045adfc
+flash-rwkv @ git+https://github.com/rwkv-rs/FlashRWKV.git@866aafd2eed146b0eda1ce03444009ae030f89e3
+transformers @ git+https://github.com/rwkv-rs/transformers-rwkv.git@2696927df9363b5fa175076bb827ba4da2c4e581
+vllm @ git+https://github.com/rwkv-rs/vllm-rwkv.git@c97557ccb1c884a1068edb018dca74ffcde6ec81

@@ -28,6 +28,8 @@ from typing import Any, Mapping
 import tomllib
 from hydra.core.override_parser.types import Quote, QuotedString
 
+from verl.models.transformers.rwkv_runtime import RwkvRuntimeError, validate_rwkv_runtime
+
 CONTEXT_SUFFIX_RE = re.compile(r"(?:^|[-_.])ctx(?P<tokens>[1-9]\d*)(?=[-_.]|$)")
 ENV_REFERENCE_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
 REQUIRED_SECTIONS = {
@@ -588,6 +590,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(shlex.join(command))
         return 0
+    try:
+        validate_rwkv_runtime(child_env["RWKV_MODEL_PATH"])
+    except RwkvRuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     os.execvpe(command[0], command, child_env)
     return 0
 

@@ -21,6 +21,7 @@ import pytest
 import tomllib
 from hydra import compose, initialize_config_dir
 
+import verl.trainer.maxrl as maxrl
 from verl.trainer.maxrl import (
     G1I_MODEL_ASSET,
     MaxRLConfigError,
@@ -264,6 +265,42 @@ def test_experiment_can_bound_a_two_optimizer_step_acceptance_run() -> None:
     overrides, _ = build_overrides(modified, env=ENV)
 
     assert resolved(overrides)["trainer.total_training_steps"] == "2"
+
+
+def test_product_entry_validates_rwkv_runtime_before_exec(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "maxrl.toml"
+    config_path.write_text(CONFIG_TOML, encoding="utf-8")
+    calls = []
+
+    def validate(checkpoint: str) -> None:
+        calls.append(("validate", checkpoint))
+
+    def execute(_file: str, _args: list[str], _env: dict[str, str]) -> None:
+        calls.append(("exec", _env["RWKV_MODEL_PATH"]))
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(maxrl, "validate_rwkv_runtime", validate)
+    monkeypatch.setattr(maxrl.os, "execvpe", execute)
+
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        maxrl.main(["--config", str(config_path)])
+
+    checkpoint = config()["model"]["checkpoint"]
+    assert calls == [("validate", checkpoint), ("exec", checkpoint)]
+
+
+def test_product_entry_fails_closed_before_exec(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "maxrl.toml"
+    config_path.write_text(CONFIG_TOML, encoding="utf-8")
+
+    def reject(_checkpoint: str) -> None:
+        raise maxrl.RwkvRuntimeError("runtime provenance rejected")
+
+    monkeypatch.setattr(maxrl, "validate_rwkv_runtime", reject)
+    monkeypatch.setattr(maxrl.os, "execvpe", lambda *_args: pytest.fail("must not exec"))
+
+    with pytest.raises(SystemExit, match="runtime provenance rejected"):
+        maxrl.main(["--config", str(config_path)])
 
 
 @pytest.mark.parametrize("value", [0, -1, "invalid"])
