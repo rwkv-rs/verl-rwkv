@@ -147,7 +147,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         stored_response_ids = response_ids[: self.response_length]
         response_text = self.tokenizer.decode(stored_response_ids, skip_special_tokens=True)
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
-        eos_token_ids = list(eos_token_id) if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+        eos_token_ids = list(eos_token_id) if isinstance(eos_token_id, list | tuple) else [eos_token_id]
         eos_token_ids = [token_id for token_id in eos_token_ids if isinstance(token_id, int)]
         backend_stop_reason = extra_fields.get("backend_stop_reason")
         stop_token_ids = (

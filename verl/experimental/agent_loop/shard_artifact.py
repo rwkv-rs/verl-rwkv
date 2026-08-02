@@ -851,6 +851,8 @@ def _validate_partial_shard(path: Path, contract: Mapping[str, Any]) -> dict[str
 
 
 def validate_promoted_shard(path: str | Path, *, expected_contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate an immutable promoted shard and return its verified manifest."""
+
     path = Path(path)
     manifest_path = path / "manifest.json"
     if not path.is_dir() or not manifest_path.is_file():

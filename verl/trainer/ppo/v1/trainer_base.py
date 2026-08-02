@@ -1596,7 +1596,7 @@ class PPOTrainer(ABC):
                 or not capacity["capacity_mode"]
                 or not isinstance(capacity.get("kv_cache_applicable"), bool)
                 or isinstance(capacity.get("gpu_memory_utilization"), bool)
-                or not isinstance(capacity.get("gpu_memory_utilization"), (int, float))
+                or not isinstance(capacity.get("gpu_memory_utilization"), int | float)
                 or not 0 < float(capacity["gpu_memory_utilization"]) <= 1
             ):
                 raise RuntimeError(
@@ -1621,8 +1621,7 @@ class PPOTrainer(ABC):
             raise RuntimeError(f"external evaluation replicas report different vLLM versions: {sorted(vllm_versions)}")
         if len(max_model_lens) != 1:
             raise RuntimeError(
-                "external evaluation replicas report different max_model_len values: "
-                f"{sorted(max_model_lens)}"
+                f"external evaluation replicas report different max_model_len values: {sorted(max_model_lens)}"
             )
 
         pool_manifest_path = checkpoint_parent / (f".vllm-eval-pool-{uuid.uuid4().hex}.json")
@@ -1680,30 +1679,18 @@ class PPOTrainer(ABC):
             "pool_manifest_lineage",
             "metrics",
         }
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != result_fields
-            or payload.get("schema_version") != 2
-        ):
-            raise RuntimeError(
-                "external evaluation result must use the complete lineage schema v2"
-            )
+        if not isinstance(payload, dict) or set(payload) != result_fields or payload.get("schema_version") != 2:
+            raise RuntimeError("external evaluation result must use the complete lineage schema v2")
         if payload.get("weight_sha256") != checkpoint_sha256:
-            raise RuntimeError(
-                "external evaluation result weight SHA does not match the evaluated checkpoint"
-            )
+            raise RuntimeError("external evaluation result weight SHA does not match the evaluated checkpoint")
         if payload.get("wkv_mode") != wkv_mode:
-            raise RuntimeError(
-                "external evaluation result WKV mode does not match the requested runtime"
-            )
+            raise RuntimeError("external evaluation result WKV mode does not match the requested runtime")
         lineage = payload.get("pool_manifest_lineage")
         if not isinstance(lineage, dict) or set(lineage) != {
             "manifest",
             "manifest_sha256",
         }:
-            raise RuntimeError(
-                "external evaluation result requires complete pool manifest lineage"
-            )
+            raise RuntimeError("external evaluation result requires complete pool manifest lineage")
         returned_manifest = lineage.get("manifest")
         returned_digest = lineage.get("manifest_sha256")
         expected_digest = hashlib.sha256(
@@ -1716,15 +1703,9 @@ class PPOTrainer(ABC):
             ).encode("utf-8")
         ).hexdigest()
         if returned_manifest != pool_payload:
-            raise RuntimeError(
-                "external evaluation result pool manifest lineage does not match "
-                "this evaluation round"
-            )
+            raise RuntimeError("external evaluation result pool manifest lineage does not match this evaluation round")
         if returned_digest != expected_digest:
-            raise RuntimeError(
-                "external evaluation result pool manifest lineage digest does not "
-                "match content"
-            )
+            raise RuntimeError("external evaluation result pool manifest lineage digest does not match content")
         metrics = payload.get("metrics")
         if not isinstance(metrics, dict) or not metrics:
             raise RuntimeError("external evaluation result requires a non-empty metrics object")

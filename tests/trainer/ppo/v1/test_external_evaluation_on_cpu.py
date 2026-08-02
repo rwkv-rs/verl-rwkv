@@ -233,9 +233,7 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
             }
         ),
         global_steps=7,
-        policy_round=SimpleNamespace(
-            published=SimpleNamespace(as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY))
-        ),
+        policy_round=SimpleNamespace(published=SimpleNamespace(as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY))),
         llm_server_manager=SimpleNamespace(
             get_addresses=lambda: ["10.0.0.1:18000", "10.0.0.2:18001"],
             get_runtime_metadata_snapshot=lambda: runtime_metadata,
@@ -308,9 +306,7 @@ def test_external_evaluation_rejects_stale_replica_policy_before_command(tmp_pat
             }
         ),
         global_steps=7,
-        policy_round=SimpleNamespace(
-            published=SimpleNamespace(as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY))
-        ),
+        policy_round=SimpleNamespace(published=SimpleNamespace(as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY))),
         llm_server_manager=SimpleNamespace(
             get_addresses=lambda: ["10.0.0.1:18000"],
             get_runtime_metadata_snapshot=lambda: [stale],
@@ -384,11 +380,7 @@ def test_external_evaluation_rejects_result_lineage_mismatch_before_metrics(
     def run(_command, *, cwd, env, check):
         assert cwd == "/product/helicopter"
         assert check is True
-        pool_payload = json.loads(
-            Path(env["HELICOPTER_VLLM_POOL_MANIFEST"]).read_text(
-                encoding="utf-8"
-            )
-        )
+        pool_payload = json.loads(Path(env["HELICOPTER_VLLM_POOL_MANIFEST"]).read_text(encoding="utf-8"))
         result = _result_payload(pool_payload)
         if mismatch == "missing_lineage":
             del result["pool_manifest_lineage"]
@@ -402,9 +394,7 @@ def test_external_evaluation_rejects_result_lineage_mismatch_before_metrics(
                 returned["global_step"] = 8
             elif mismatch == "behavior_policy_identity":
                 returned["behavior_policy_identity"]["policy_version"] = 8
-                returned["replicas"][0]["behavior_policy_identity"][
-                    "policy_version"
-                ] = 8
+                returned["replicas"][0]["behavior_policy_identity"]["policy_version"] = 8
             elif mismatch == "endpoint":
                 returned["replicas"][0]["base_url"] = "http://10.0.0.2:18000"
             elif mismatch == "wkv_mode":
@@ -433,11 +423,7 @@ def test_external_evaluation_rejects_result_lineage_mismatch_before_metrics(
             }
         ),
         global_steps=7,
-        policy_round=SimpleNamespace(
-            published=SimpleNamespace(
-                as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY)
-            )
-        ),
+        policy_round=SimpleNamespace(published=SimpleNamespace(as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY))),
         llm_server_manager=SimpleNamespace(
             get_addresses=lambda: ["10.0.0.1:18000"],
             get_runtime_metadata_snapshot=lambda: [runtime_metadata],

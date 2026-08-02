@@ -44,7 +44,6 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
-from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
 
 from verl.experimental.agent_loop.campaign_fields import CAMPAIGN_SAMPLING_SEED_FIELD
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -816,6 +815,8 @@ class AgentLoopWorker:
 
         prompt_token_ids = list(output.prompt_ids)
         if self.rollout_config.get("rwkv_prompt_template") is not None:
+            from vllm.tokenizers.rwkv_defaults import ensure_rwkv_prompt_bos_token
+
             prompt_token_ids = ensure_rwkv_prompt_bos_token(
                 prompt_token_ids,
                 max_length=self.rollout_config.prompt_length,

@@ -103,6 +103,8 @@ def deterministic_pilot_problem_ids(
 
 
 def problem_ids_digest(problem_ids: Sequence[str]) -> str:
+    """Return the canonical SHA-256 digest for an ordered problem-id sequence."""
+
     return hashlib.sha256(_canonical_bytes(list(problem_ids))).hexdigest()
 
 
@@ -570,6 +572,8 @@ async def run_dapo_math_pilot(config: Any, plan: DapoMathPilotPlan) -> Path:
 
 
 def print_campaign_plan(plan: DapoMathPilotPlan) -> None:
+    """Write a campaign dry-run contract as canonical JSON to standard output."""
+
     json.dump(plan.as_dict(), sys.stdout, sort_keys=True, indent=2)
     sys.stdout.write("\n")
 
