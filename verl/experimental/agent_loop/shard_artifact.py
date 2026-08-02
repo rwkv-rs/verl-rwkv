@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ import os
 import stat
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -44,7 +46,13 @@ ROLLOUT_CAMPAIGN_PARAMETER_KEYS = (
 
 
 def _canonical_bytes(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def _sha256(payload: bytes) -> str:
@@ -54,6 +62,13 @@ def _sha256(payload: bytes) -> str:
 def _require_nonempty_string(name: str, value: Any) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_path_component(name: str, value: Any) -> str:
+    value = _require_nonempty_string(name, value)
+    if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise ValueError(f"{name} must be a single path component")
     return value
 
 
@@ -83,7 +98,10 @@ def _validate_campaign_parameters(parameters: Mapping[str, Any]) -> dict[str, An
         raise ValueError("campaign policy_version must be a non-negative integer")
     for key in ("model_revision", "policy_lineage", "source_lineage", "runtime_identity"):
         _require_nonempty_string(f"campaign {key}", parameters[key])
-    canonical = json.loads(_canonical_bytes(parameters))
+    try:
+        canonical = json.loads(_canonical_bytes(parameters))
+    except (TypeError, ValueError) as error:
+        raise ValueError("campaign parameters must contain only strict JSON values") from error
     return canonical
 
 
@@ -310,7 +328,7 @@ class RolloutCampaignArtifact:
         parameters: Mapping[str, Any],
     ) -> None:
         self.root = Path(root)
-        self.campaign_id = _require_nonempty_string("campaign_id", campaign_id)
+        self.campaign_id = _require_path_component("campaign_id", campaign_id)
         problems = tuple(_require_nonempty_string("problem_id", value) for value in problem_ids)
         if not problems or len(set(problems)) != len(problems):
             raise ValueError("problem_ids must be a non-empty unique sequence")
@@ -328,6 +346,7 @@ class RolloutCampaignArtifact:
         self.partial_path = self.root / f".{self.campaign_id}.campaign"
         self.promoted_path = self.root / self.campaign_id
         self.final_path = self.promoted_path / "manifest.json"
+        self.lock_path = self.root / f".{self.campaign_id}.lock"
         self.contract = {
             "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
             "campaign_id": self.campaign_id,
@@ -348,41 +367,54 @@ class RolloutCampaignArtifact:
     def _pair_digest(problem_id: str, rollout_index: int) -> str:
         return _sha256(_canonical_bytes({"problem_id": problem_id, "rollout_index": rollout_index}))
 
+    @contextmanager
+    def _lock(self, *, exclusive: bool) -> Iterator[None]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as stream:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(stream.fileno(), operation)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def _open_or_create(self) -> None:
-        payload = _canonical_bytes(self.contract)
-        if self.is_promoted:
-            _validate_promoted_campaign(self.promoted_path, self.contract)
-            return
-        if self.promoted_path.exists():
-            raise RuntimeError("promoted campaign path exists but is not a directory")
-        self.partial_path.mkdir(parents=True, exist_ok=True)
-        try:
-            _atomic_write_new(self.partial_path / "contract.json", payload)
-        except FileExistsError:
-            if (self.partial_path / "contract.json").read_bytes() != payload:
-                raise RuntimeError("partial campaign contract conflicts with the request") from None
+        with self._lock(exclusive=True):
+            payload = _canonical_bytes(self.contract)
+            if self.is_promoted:
+                _validate_promoted_campaign(self.promoted_path, self.contract)
+                return
+            if self.promoted_path.exists():
+                raise RuntimeError("promoted campaign path exists but is not a directory")
+            self.partial_path.mkdir(parents=True, exist_ok=True)
+            try:
+                _atomic_write_new(self.partial_path / "contract.json", payload)
+            except FileExistsError:
+                if (self.partial_path / "contract.json").read_bytes() != payload:
+                    raise RuntimeError("partial campaign contract conflicts with the request") from None
 
     def completed_pairs(self) -> frozenset[tuple[str, int]]:
         """Return a validated snapshot of completed pairs for small-campaign inspection."""
 
-        if self.is_promoted:
-            _validate_promoted_campaign(self.promoted_path, self.contract)
-            return frozenset(
-                (problem_id, rollout_index)
-                for problem_id in self.problem_ids
-                for rollout_index in range(self.rollouts_per_problem)
-            )
-        paths = _campaign_record_paths(self.partial_path)
-        completed: set[tuple[str, int]] = set()
-        for path in paths:
-            record, _ = _load_campaign_record(path)
-            identity = record["identity"]
-            pair = (identity["prompt_id"], identity["sample_index"])
-            digest = self._pair_digest(*pair)
-            if digest != path.stem or not self.contains_pair(*pair):
-                raise RuntimeError(f"campaign record {path.name} has an invalid pair")
-            completed.add(pair)
-        return frozenset(completed)
+        with self._lock(exclusive=False):
+            if self.is_promoted:
+                _validate_promoted_campaign(self.promoted_path, self.contract)
+                return frozenset(
+                    (problem_id, rollout_index)
+                    for problem_id in self.problem_ids
+                    for rollout_index in range(self.rollouts_per_problem)
+                )
+            paths = _campaign_record_paths(self.partial_path)
+            completed: set[tuple[str, int]] = set()
+            for path in paths:
+                record, _ = _load_campaign_record(path)
+                identity = record["identity"]
+                pair = (identity["prompt_id"], identity["sample_index"])
+                digest = self._pair_digest(*pair)
+                if digest != path.stem or not self.contains_pair(*pair):
+                    raise RuntimeError(f"campaign record {path.name} has an invalid pair")
+                completed.add(pair)
+            return frozenset(completed)
 
     def pending_pairs(self) -> tuple[tuple[str, int], ...]:
         """Return missing pairs in stable dataset then rollout-index order."""
@@ -424,15 +456,17 @@ class RolloutCampaignArtifact:
         return True
 
     def remaining_count(self) -> int:
-        if self.is_promoted:
-            return 0
-        completed = sum(1 for _ in _campaign_record_paths(self.partial_path))
-        if completed > self.expected_pair_count:
-            raise RuntimeError(
-                "campaign contains more records than its contract: "
-                f"expected={self.expected_pair_count}, actual={completed}"
-            )
-        return self.expected_pair_count - completed
+        with self._lock(exclusive=False):
+            if self.is_promoted:
+                _validate_promoted_campaign(self.promoted_path, self.contract)
+                return 0
+            completed = sum(1 for _ in _campaign_record_paths(self.partial_path))
+            if completed > self.expected_pair_count:
+                raise RuntimeError(
+                    "campaign contains more records than its contract: "
+                    f"expected={self.expected_pair_count}, actual={completed}"
+                )
+            return self.expected_pair_count - completed
 
     def write_completion(
         self,
@@ -447,8 +481,6 @@ class RolloutCampaignArtifact:
         eos_token_ids: Sequence[int] = (),
         stop_token_ids: Sequence[int] = (),
     ) -> bool:
-        if self.is_promoted:
-            raise RuntimeError("finalized campaigns are read-only")
         problem_id = identity.prompt_id
         rollout_index = identity.sample_index
         if problem_id not in self.problem_ids:
@@ -489,30 +521,37 @@ class RolloutCampaignArtifact:
             "finish": build_rollout_finish_metadata(response, **finish_source),
         }
         payload = _canonical_bytes(record)
-        record_path = _campaign_record_path(self.partial_path, record["pair_digest"])
-        try:
-            _atomic_write_new(record_path, payload)
-        except FileExistsError:
-            if record_path.read_bytes() == payload:
-                return False
-            raise RuntimeError(f"conflicting completion for pair ({problem_id!r}, {rollout_index})") from None
-        return True
+        with self._lock(exclusive=False):
+            campaign_path = self.promoted_path if self.is_promoted else self.partial_path
+            record_path = _campaign_record_path(campaign_path, record["pair_digest"])
+            if self.is_promoted:
+                if record_path.read_bytes() == payload:
+                    return False
+                raise RuntimeError(f"conflicting completion for pair ({problem_id!r}, {rollout_index})")
+            try:
+                _atomic_write_new(record_path, payload)
+            except FileExistsError:
+                if record_path.read_bytes() == payload:
+                    return False
+                raise RuntimeError(f"conflicting completion for pair ({problem_id!r}, {rollout_index})") from None
+            return True
 
     def finalize(self) -> dict[str, Any]:
-        if self.is_promoted:
+        with self._lock(exclusive=True):
+            if self.is_promoted:
+                return _validate_promoted_campaign(self.promoted_path, self.contract)
+            result = _build_campaign_manifest(self.partial_path, self.contract)
+            manifest_path = self.partial_path / "manifest.json"
+            manifest_payload = _canonical_bytes(result)
+            if manifest_path.is_file():
+                if manifest_path.read_bytes() != manifest_payload:
+                    raise RuntimeError("partial campaign manifest conflicts with its records")
+            else:
+                _atomic_replace(manifest_path, manifest_payload)
+            _make_campaign_read_only(self.partial_path)
+            os.replace(self.partial_path, self.promoted_path)
+            _fsync_directory(self.root)
             return _validate_promoted_campaign(self.promoted_path, self.contract)
-        result = _build_campaign_manifest(self.partial_path, self.contract)
-        manifest_path = self.partial_path / "manifest.json"
-        manifest_payload = _canonical_bytes(result)
-        if manifest_path.is_file():
-            if manifest_path.read_bytes() != manifest_payload:
-                raise RuntimeError("partial campaign manifest conflicts with its records")
-        else:
-            _atomic_replace(manifest_path, manifest_payload)
-        _make_campaign_read_only(self.partial_path)
-        os.replace(self.partial_path, self.promoted_path)
-        _fsync_directory(self.root)
-        return _validate_promoted_campaign(self.promoted_path, self.contract)
 
 
 def _load_campaign_record(path: Path) -> tuple[dict[str, Any], bytes]:

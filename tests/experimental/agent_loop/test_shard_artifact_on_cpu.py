@@ -15,9 +15,12 @@
 import json
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import verl.experimental.agent_loop.shard_artifact as shard_artifact_module
 from verl.experimental.agent_loop.campaign_fields import deterministic_campaign_seed
 from verl.experimental.agent_loop.shard_artifact import (
     RolloutCampaignArtifact,
@@ -27,24 +30,30 @@ from verl.experimental.agent_loop.shard_artifact import (
 )
 
 
-def _campaign(root, *, rollouts_per_problem=4):
+def _campaign_parameters(*, rollouts_per_problem=4):
+    return {
+        "base_seed": 20260801,
+        "sampling": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 4096},
+        "model_revision": "rwkv7-g1i@sha256:weights",
+        "policy_lineage": "policy-0:lineage-digest",
+        "policy_version": 0,
+        "source_lineage": "checkpoint:sha256:source",
+        "runtime_identity": "vllm-rwkv:sha256:runtime",
+        "rollouts_per_problem": rollouts_per_problem,
+    }
+
+
+def _campaign(root, *, rollouts_per_problem=4, campaign_id="dapo-campaign", parameters=None):
     return RolloutCampaignArtifact(
         root,
-        "dapo-campaign",
+        campaign_id,
         ["problem-c", "problem-a", "problem-b"],
         rollouts_per_problem=rollouts_per_problem,
         dataset_fingerprint="sha256:dapo-17k",
         source_revision="verl-rwkv@abc123",
-        parameters={
-            "base_seed": 20260801,
-            "sampling": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 4096},
-            "model_revision": "rwkv7-g1i@sha256:weights",
-            "policy_lineage": "policy-0:lineage-digest",
-            "policy_version": 0,
-            "source_lineage": "checkpoint:sha256:source",
-            "runtime_identity": "vllm-rwkv:sha256:runtime",
-            "rollouts_per_problem": rollouts_per_problem,
-        },
+        parameters=(
+            parameters if parameters is not None else _campaign_parameters(rollouts_per_problem=rollouts_per_problem)
+        ),
     )
 
 
@@ -191,7 +200,76 @@ def test_campaign_tiny_3x4_resumes_out_of_order_and_finalizes_deterministically(
     assert resumed.finalize() == result
     assert resumed.final_path.read_bytes() == payload
     assert _campaign(tmp_path).finalize() == result
+    assert not _write_campaign_completion(resumed, "problem-a", 0)
+    with pytest.raises(RuntimeError, match="conflicting completion for pair"):
+        _write_campaign_completion(
+            resumed,
+            "problem-a",
+            0,
+            response="<think>different</think><answer>0</answer>",
+        )
     _make_tree_writable(resumed.promoted_path)
+
+
+def test_campaign_finalize_is_concurrently_idempotent(tmp_path):
+    store = _campaign(tmp_path)
+    for problem_id in ("problem-c", "problem-a", "problem-b"):
+        for rollout_index in range(4):
+            _write_campaign_completion(store, problem_id, rollout_index)
+    contenders = (store, _campaign(tmp_path))
+    ready = threading.Barrier(len(contenders))
+
+    def finalize(candidate):
+        ready.wait()
+        return candidate.finalize()
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(contenders)) as executor:
+            results = list(executor.map(finalize, contenders))
+        assert results[0] == results[1]
+        assert _campaign(tmp_path).finalize() == results[0]
+    finally:
+        _make_tree_writable(store.promoted_path)
+
+
+def test_campaign_different_pairs_keep_parallel_record_writes(tmp_path, monkeypatch):
+    stores = (_campaign(tmp_path), _campaign(tmp_path))
+    ready = threading.Barrier(len(stores))
+    atomic_write_new = shard_artifact_module._atomic_write_new
+
+    def synchronized_record_write(path, payload):
+        if path.parent.parent.name == "records":
+            ready.wait(timeout=5)
+        atomic_write_new(path, payload)
+
+    monkeypatch.setattr(shard_artifact_module, "_atomic_write_new", synchronized_record_write)
+    pairs = (("problem-a", 0), ("problem-b", 0))
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        results = list(
+            executor.map(
+                lambda item: _write_campaign_completion(item[0], *item[1]),
+                zip(stores, pairs, strict=True),
+            )
+        )
+    assert results == [True, True]
+
+
+@pytest.mark.parametrize("campaign_id", [".", "..", "../outside", "nested/name", "nested\\name", "/absolute"])
+def test_campaign_id_must_stay_within_artifact_root(tmp_path, campaign_id):
+    with pytest.raises(ValueError, match="single path component"):
+        _campaign(tmp_path, campaign_id=campaign_id)
+
+
+def test_campaign_parameters_are_strict_json_and_deeply_copied(tmp_path):
+    parameters = _campaign_parameters()
+    store = _campaign(tmp_path, parameters=parameters)
+    parameters["sampling"]["temperature"] = 0.5
+    assert store.contract["parameters"]["sampling"]["temperature"] == 1.0
+
+    invalid = _campaign_parameters()
+    invalid["sampling"]["temperature"] = float("nan")
+    with pytest.raises(ValueError, match="strict JSON"):
+        _campaign(tmp_path / "invalid", parameters=invalid)
 
 
 def test_campaign_rejects_duplicate_conflict_and_invalid_pair(tmp_path):
