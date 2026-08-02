@@ -19,10 +19,67 @@ import stat
 import pytest
 
 from verl.experimental.agent_loop.shard_artifact import (
+    RolloutCampaignArtifact,
     RolloutResponseIdentity,
     RolloutShardArtifact,
     validate_promoted_shard,
 )
+
+
+def _campaign(root, *, rollouts_per_problem=4):
+    return RolloutCampaignArtifact(
+        root,
+        "dapo-campaign",
+        ["problem-c", "problem-a", "problem-b"],
+        rollouts_per_problem=rollouts_per_problem,
+        dataset_fingerprint="sha256:dapo-17k",
+        source_revision="verl-rwkv@abc123",
+        parameters={"temperature": 1.0, "rollouts_per_problem": rollouts_per_problem},
+    )
+
+
+def _write_campaign_completion(store, problem_id, rollout_index, *, response=None):
+    category = rollout_index % 4
+    values = {
+        0: {
+            "finish_reason": "stop",
+            "backend_stop_reason": 0,
+            "repetition_truncated": False,
+            "response_token_ids": [101, 0],
+            "eos_token_ids": [0],
+        },
+        1: {
+            "finish_reason": "length",
+            "backend_stop_reason": None,
+            "repetition_truncated": False,
+            "response_token_ids": [101, 102],
+        },
+        2: {
+            "finish_reason": "stop",
+            "backend_stop_reason": "repetition_detected",
+            "repetition_truncated": True,
+            "response_token_ids": [101, 102, 103, 104] * 3,
+        },
+        3: {
+            "finish_reason": "stop",
+            "backend_stop_reason": "stop_token",
+            "repetition_truncated": False,
+            "response_token_ids": [101, 261],
+            "stop_token_ids": [261],
+        },
+    }[category]
+    return store.write_completion(
+        problem_id,
+        rollout_index,
+        response
+        if response is not None
+        else (
+            "invalid"
+            if category == 3
+            else "<think>work</think><answer>42</answer>"
+        ),
+        **values,
+    )
 
 
 def _identity(sample_index: int = 0, **overrides) -> RolloutResponseIdentity:
@@ -66,6 +123,74 @@ def _make_tree_writable(path):
         for name in files:
             (path.__class__(root) / name).chmod(stat.S_IRUSR | stat.S_IWUSR)
     path.chmod(stat.S_IRWXU)
+
+
+def test_campaign_tiny_3x4_resumes_out_of_order_and_finalizes_deterministically(
+    tmp_path,
+):
+    pairs = [
+        (problem_id, rollout_index)
+        for problem_id in ("problem-c", "problem-a", "problem-b")
+        for rollout_index in range(4)
+    ]
+    first = _campaign(tmp_path)
+    for problem_id, rollout_index in reversed(pairs[:5]):
+        assert _write_campaign_completion(first, problem_id, rollout_index)
+
+    resumed = _campaign(tmp_path)
+    assert not _write_campaign_completion(resumed, *pairs[0])
+    for problem_id, rollout_index in reversed(pairs[5:]):
+        assert _write_campaign_completion(resumed, problem_id, rollout_index)
+
+    result = resumed.finalize()
+    payload = resumed.final_path.read_bytes()
+    assert result["contract"]["dataset_fingerprint"] == "sha256:dapo-17k"
+    assert result["contract"]["source_revision"] == "verl-rwkv@abc123"
+    assert result["contract"]["parameters"]["rollouts_per_problem"] == 4
+    assert result["counts"] == {
+        "total": 12,
+        "strict_cot_format": 9,
+        "ended_by_eos": 3,
+        "length_truncated": 3,
+        "repetition_truncated": 3,
+    }
+    assert result["rates"] == {
+        "strict_cot_format": 0.75,
+        "ended_by_eos": 0.25,
+        "length_truncated": 0.25,
+        "repetition_truncated": 0.25,
+    }
+    assert resumed.finalize() == result
+    assert resumed.final_path.read_bytes() == payload
+    assert _campaign(tmp_path).finalize() == result
+
+
+def test_campaign_rejects_duplicate_conflict_and_invalid_pair(tmp_path):
+    store = _campaign(tmp_path)
+    assert _write_campaign_completion(store, "problem-a", 0)
+    assert not _write_campaign_completion(store, "problem-a", 0)
+    with pytest.raises(RuntimeError, match="conflicting completion for pair"):
+        _write_campaign_completion(
+            store,
+            "problem-a",
+            0,
+            response="<think>different</think><answer>0</answer>",
+        )
+    with pytest.raises(ValueError, match="outside the campaign range"):
+        _write_campaign_completion(store, "problem-a", 4)
+    with pytest.raises(ValueError, match="not part of this campaign"):
+        _write_campaign_completion(store, "unknown", 0)
+
+
+def test_campaign_finalize_rejects_any_missing_pair(tmp_path):
+    store = _campaign(tmp_path)
+    for problem_id in ("problem-c", "problem-a", "problem-b"):
+        for rollout_index in range(4):
+            if (problem_id, rollout_index) != ("problem-b", 3):
+                _write_campaign_completion(store, problem_id, rollout_index)
+
+    with pytest.raises(RuntimeError, match="campaign is incomplete.*problem-b"):
+        store.finalize()
 
 
 @pytest.mark.parametrize(

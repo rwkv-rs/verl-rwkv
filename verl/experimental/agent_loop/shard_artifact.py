@@ -28,6 +28,7 @@ from verl.trainer.ppo.v1.policy_identity import canonical_digest
 from verl.utils.ngram_repetition import ConsecutiveRepetitionDetector
 
 SHARD_ARTIFACT_SCHEMA_VERSION = 2
+ROLLOUT_CAMPAIGN_SCHEMA_VERSION = 1
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -239,6 +240,236 @@ class RolloutShardArtifact:
         return self.promoted_path
 
 
+class RolloutCampaignArtifact:
+    """Atomic completion ledger for a fixed problem-by-rollout campaign."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        campaign_id: str,
+        problem_ids: Sequence[str],
+        *,
+        rollouts_per_problem: int,
+        dataset_fingerprint: str,
+        source_revision: str,
+        parameters: Mapping[str, Any],
+    ) -> None:
+        self.root = Path(root)
+        self.campaign_id = _require_nonempty_string("campaign_id", campaign_id)
+        problems = tuple(_require_nonempty_string("problem_id", value) for value in problem_ids)
+        if not problems or len(set(problems)) != len(problems):
+            raise ValueError("problem_ids must be a non-empty unique sequence")
+        if (
+            isinstance(rollouts_per_problem, bool)
+            or not isinstance(rollouts_per_problem, int)
+            or rollouts_per_problem <= 0
+        ):
+            raise ValueError("rollouts_per_problem must be a positive integer")
+        if not isinstance(parameters, Mapping) or not parameters:
+            raise ValueError("parameters must be a non-empty mapping")
+        _canonical_bytes(parameters)
+        self.problem_ids = problems
+        self.rollouts_per_problem = rollouts_per_problem
+        self.expected_pairs = {
+            self._pair_digest(problem_id, rollout_index): (problem_id, rollout_index)
+            for problem_id in problems
+            for rollout_index in range(rollouts_per_problem)
+        }
+        self.partial_path = self.root / f".{self.campaign_id}.campaign"
+        self.final_path = self.root / f"{self.campaign_id}.completion.json"
+        self.contract = {
+            "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
+            "campaign_id": self.campaign_id,
+            "problem_ids": list(problems),
+            "rollouts_per_problem": rollouts_per_problem,
+            "dataset_fingerprint": _require_nonempty_string(
+                "dataset_fingerprint", dataset_fingerprint
+            ),
+            "source_revision": _require_nonempty_string(
+                "source_revision", source_revision
+            ),
+            "parameters": dict(parameters),
+            "expected_pair_count": len(self.expected_pairs),
+        }
+        self._open_or_create()
+
+    @staticmethod
+    def _pair_digest(problem_id: str, rollout_index: int) -> str:
+        return _sha256(
+            _canonical_bytes(
+                {"problem_id": problem_id, "rollout_index": rollout_index}
+            )
+        )
+
+    def _open_or_create(self) -> None:
+        payload = _canonical_bytes(self.contract)
+        if self.final_path.is_file():
+            final = json.loads(self.final_path.read_bytes())
+            if final.get("contract") != self.contract:
+                raise RuntimeError("finalized campaign contract conflicts with the request")
+            return
+        self.partial_path.mkdir(parents=True, exist_ok=True)
+        try:
+            _atomic_write_new(self.partial_path / "contract.json", payload)
+        except FileExistsError:
+            if (self.partial_path / "contract.json").read_bytes() != payload:
+                raise RuntimeError("partial campaign contract conflicts with the request") from None
+
+    def write_completion(
+        self,
+        problem_id: str,
+        rollout_index: int,
+        response: str,
+        *,
+        finish_reason: str | None,
+        backend_stop_reason: Any,
+        repetition_truncated: bool,
+        response_token_ids: Sequence[int],
+        eos_token_ids: Sequence[int] = (),
+        stop_token_ids: Sequence[int] = (),
+    ) -> bool:
+        if self.final_path.is_file():
+            raise RuntimeError("finalized campaigns are read-only")
+        if problem_id not in self.problem_ids:
+            raise ValueError("problem_id is not part of this campaign")
+        if (
+            isinstance(rollout_index, bool)
+            or not isinstance(rollout_index, int)
+            or not 0 <= rollout_index < self.rollouts_per_problem
+        ):
+            raise ValueError("rollout_index is outside the campaign range")
+        if not isinstance(response, str):
+            raise TypeError("response must be a string")
+        token_ids = list(response_token_ids)
+        if any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in token_ids):
+            raise TypeError("response_token_ids must contain only integers")
+        computed_repetition = ConsecutiveRepetitionDetector().observe(token_ids) is not None
+        if repetition_truncated != computed_repetition:
+            raise ValueError("repetition_truncated conflicts with response token IDs")
+        finish_source = {
+            "finish_reason": finish_reason,
+            "backend_stop_reason": backend_stop_reason,
+            "repetition_truncated": computed_repetition,
+            "response_token_ids": token_ids,
+            "eos_token_ids": list(eos_token_ids),
+            "stop_token_ids": list(stop_token_ids),
+        }
+        pair = {"problem_id": problem_id, "rollout_index": rollout_index}
+        record = {
+            "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
+            "pair": pair,
+            "pair_digest": self._pair_digest(problem_id, rollout_index),
+            "response": response,
+            "finish_source": finish_source,
+            "finish": build_rollout_finish_metadata(response, **finish_source),
+        }
+        payload = _canonical_bytes(record)
+        record_path = self.partial_path / "records" / f"{record['pair_digest']}.json"
+        try:
+            _atomic_write_new(record_path, payload)
+        except FileExistsError:
+            if record_path.read_bytes() == payload:
+                return False
+            raise RuntimeError(
+                f"conflicting completion for pair ({problem_id!r}, {rollout_index})"
+            ) from None
+        return True
+
+    def finalize(self) -> dict[str, Any]:
+        if self.final_path.is_file():
+            payload = self.final_path.read_bytes()
+            result = json.loads(payload)
+            if _canonical_bytes(result) != payload or result.get("contract") != self.contract:
+                raise RuntimeError("finalized campaign artifact is invalid")
+            return result
+        records_dir = self.partial_path / "records"
+        paths = sorted(records_dir.glob("*.json")) if records_dir.is_dir() else []
+        actual = {path.stem for path in paths}
+        expected = set(self.expected_pairs)
+        if actual != expected:
+            missing = [self.expected_pairs[digest] for digest in sorted(expected - actual)]
+            unexpected = sorted(actual - expected)
+            raise RuntimeError(
+                f"campaign is incomplete: missing={missing}, unexpected={unexpected}"
+            )
+        counts = {
+            "strict_cot_format": 0,
+            "ended_by_eos": 0,
+            "length_truncated": 0,
+            "repetition_truncated": 0,
+        }
+        record_sha256 = {}
+        for path in paths:
+            record, payload = _load_campaign_record(path)
+            pair = record["pair"]
+            digest = self._pair_digest(pair["problem_id"], pair["rollout_index"])
+            if digest != path.stem or self.expected_pairs.get(digest) != (
+                pair["problem_id"],
+                pair["rollout_index"],
+            ):
+                raise RuntimeError(f"campaign record {path.name} has an invalid pair")
+            finish = record["finish"]
+            counts["strict_cot_format"] += int(finish["format_valid"])
+            counts["ended_by_eos"] += int(finish["ended_by_eos"])
+            counts["length_truncated"] += int(finish["context_exhausted"])
+            counts["repetition_truncated"] += int(finish["repetition_truncated"])
+            record_sha256[path.stem] = _sha256(payload)
+        total = len(paths)
+        result = {
+            "schema_version": ROLLOUT_CAMPAIGN_SCHEMA_VERSION,
+            "contract": self.contract,
+            "counts": {"total": total, **counts},
+            "rates": {name: count / total for name, count in counts.items()},
+            "record_sha256": record_sha256,
+        }
+        _atomic_write_new(self.final_path, _canonical_bytes(result))
+        return result
+
+
+def _load_campaign_record(path: Path) -> tuple[dict[str, Any], bytes]:
+    payload = path.read_bytes()
+    try:
+        record = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"invalid campaign record {path.name}") from error
+    if _canonical_bytes(record) != payload:
+        raise RuntimeError(f"campaign record {path.name} is not canonical")
+    required = {
+        "schema_version",
+        "pair",
+        "pair_digest",
+        "response",
+        "finish_source",
+        "finish",
+    }
+    if set(record) != required or record["schema_version"] != ROLLOUT_CAMPAIGN_SCHEMA_VERSION:
+        raise RuntimeError(f"campaign record {path.name} has an invalid schema")
+    if not isinstance(record["response"], str):
+        raise RuntimeError(f"campaign record {path.name} has an invalid response")
+    finish_source = record["finish_source"]
+    if not isinstance(finish_source, dict) or set(finish_source) != {
+        "finish_reason",
+        "backend_stop_reason",
+        "repetition_truncated",
+        "response_token_ids",
+        "eos_token_ids",
+        "stop_token_ids",
+    }:
+        raise RuntimeError(f"campaign record {path.name} has an invalid finish source")
+    token_ids = finish_source["response_token_ids"]
+    if not isinstance(token_ids, list) or any(
+        isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in token_ids
+    ):
+        raise RuntimeError(f"campaign record {path.name} has invalid response token IDs")
+    recomputed_repetition = ConsecutiveRepetitionDetector().observe(token_ids) is not None
+    if finish_source["repetition_truncated"] != recomputed_repetition:
+        raise RuntimeError(f"campaign record {path.name} repetition metadata mismatch")
+    expected_finish = build_rollout_finish_metadata(record["response"], **finish_source)
+    if record["finish"] != expected_finish:
+        raise RuntimeError(f"campaign record {path.name} finish metadata mismatch")
+    return record, payload
+
+
 def _load_record(path: Path) -> tuple[dict[str, Any], bytes]:
     payload = path.read_bytes()
     try:
@@ -324,7 +555,9 @@ def validate_promoted_shard(path: str | Path, *, expected_contract: Mapping[str,
 
 __all__ = [
     "RolloutResponseIdentity",
+    "RolloutCampaignArtifact",
     "RolloutShardArtifact",
+    "ROLLOUT_CAMPAIGN_SCHEMA_VERSION",
     "SHARD_ARTIFACT_SCHEMA_VERSION",
     "validate_promoted_shard",
 ]
