@@ -17,17 +17,13 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 from peft import PeftModel
-from tensordict import TensorDict
 from transformers import AutoModelForCausalLM, Rwkv7Config, Rwkv7ForCausalLM
 
-from verl.utils import tensordict_utils as tu
-from verl.workers.config import ActorConfig, FSDPOptimizerConfig, HFModelConfig, PolicyLossConfig
+from verl.workers.config import FSDPOptimizerConfig, HFModelConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
-from verl.workers.engine_workers import build_actor_loss_fn
 
 
 def _tiny_rwkv7() -> Rwkv7ForCausalLM:
@@ -44,7 +40,7 @@ def _tiny_rwkv7() -> Rwkv7ForCausalLM:
     )
 
 
-def test_standard_fsdp_antidoom_build_train_save_load_merge_and_eval(tmp_path: Path):
+def test_standard_fsdp_antidoom_peft_train_save_load_merge_and_reload(tmp_path: Path):
     torch.manual_seed(31)
     base_directory = tmp_path / "base"
     _tiny_rwkv7().save_pretrained(base_directory, safe_serialization=True)
@@ -79,54 +75,14 @@ def test_standard_fsdp_antidoom_build_train_save_load_merge_and_eval(tmp_path: P
     assert all("lora_" in name for name in trainable)
     adapter_before = {name: parameter.detach().clone() for name, parameter in trainable.items()}
 
-    actor_config = ActorConfig(
-        strategy="fsdp",
-        rollout_n=1,
-        ppo_micro_batch_size_per_gpu=2,
-        use_fused_kernels=False,
-        policy_loss=PolicyLossConfig(loss_mode="antidoom_ftpo"),
-    )
-    loss_fn = build_actor_loss_fn(model_config, actor_config)
     input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
-    reference_logits = model(input_ids=input_ids).logits[:, -1, :].detach()
-    batch = TensorDict(
-        {
-            "chosen_token_ids": torch.tensor([[7, 8], [9, 10]]),
-            "rejected_token_ids": torch.tensor([11, 12]),
-            "reference_logits": reference_logits,
-        },
-        batch_size=[2],
-    )
-    jagged_input_ids = torch.nested.nested_tensor(
-        [input_ids[0], input_ids[1]],
-        layout=torch.jagged,
-    )
-    forward_batch = TensorDict({"input_ids": jagged_input_ids}, batch_size=[2])
-    tu.assign_non_tensor(
-        forward_batch,
-        use_remove_padding=False,
-        use_fused_kernels=False,
-        antidoom_ftpo=True,
-    )
-    engine.use_ulysses_sp = False
-    engine.engine_config = SimpleNamespace(entropy_checkpointing=False)
-    raw_output = model(input_ids=input_ids)
-    model_output = engine.prepare_model_outputs(
-        output=raw_output,
-        output_args={
-            "temperature": torch.ones(input_ids.shape[0]),
-            "input_ids_rmpad_rolled": torch.roll(input_ids.flatten(), shifts=-1),
-        },
-        micro_batch=forward_batch,
-        logits_processor_func=loss_fn,
-    )
-    torch.testing.assert_close(model_output["antidoom_logits"], raw_output.logits[:, -1, :])
-    loss, metrics = loss_fn(model_output=model_output, data=batch, dp_group=None)
+    model.train()
+    loss = model(input_ids=input_ids, labels=input_ids).loss
     loss.backward()
     optimizer.step()
+    optimizer.zero_grad()
 
     assert torch.isfinite(loss)
-    assert "actor/ftpo_pref_loss" in metrics
     assert any(not torch.equal(adapter_before[name], parameter) for name, parameter in trainable.items())
     base_model = model.get_base_model()
     torch.testing.assert_close(base_model.model.blocks[0].att.receptance.base_layer.weight, recurrent_weight_before)
@@ -145,13 +101,6 @@ def test_standard_fsdp_antidoom_build_train_save_load_merge_and_eval(tmp_path: P
         is_trainable=True,
     ).eval()
     torch.testing.assert_close(loaded(input_ids=input_ids).logits, expected)
-    eval_loss, eval_metrics = loss_fn(
-        model_output={"antidoom_logits": loaded(input_ids=input_ids).logits[:, -1, :]},
-        data=batch,
-        dp_group=None,
-    )
-    assert torch.isfinite(eval_loss)
-    assert "actor/ftpo_chosen_win" in eval_metrics
 
     merged = loaded.merge_and_unload(safe_merge=True).eval()
     torch.testing.assert_close(merged(input_ids=input_ids).logits, expected)

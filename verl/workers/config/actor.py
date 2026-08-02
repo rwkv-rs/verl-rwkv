@@ -98,10 +98,6 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
-    ftpo_clip_epsilon: float = 2.0
-    ftpo_lambda_mse: float = 0.4
-    ftpo_lambda_mse_target: float = 0.05
-    ftpo_target_tolerance: float = 1.0
 
 
 @dataclass

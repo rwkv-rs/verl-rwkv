@@ -1258,7 +1258,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
         calculate_sum_pi_squared = tu.get_non_tensor_data(
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
-        calculate_antidoom_ftpo = tu.get_non_tensor_data(data=micro_batch, key="antidoom_ftpo", default=False)
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
 
@@ -1267,11 +1266,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
-        if calculate_antidoom_ftpo and (use_remove_padding or use_fused_kernels):
-            raise NotImplementedError(
-                "Antidoom FTPO requires dense non-fused model output so final-token logits remain available"
-            )
-
         model_output = {}
 
         input_ids = micro_batch["input_ids"]
@@ -1420,15 +1414,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if isinstance(logits, DTensor):
                     logits = logits.full_tensor()
                 logits = logits / temperature.clamp(min=1e-8).to(logits.dtype)
-
-                if calculate_antidoom_ftpo:
-                    if pad_mode != DatasetPadMode.NO_PADDING:
-                        raise NotImplementedError(f"Antidoom FTPO does not support pad_mode {pad_mode}")
-                    sequence_lengths = input_ids.offsets().diff()
-                    if torch.any(sequence_lengths <= 0):
-                        raise ValueError("Antidoom FTPO requires non-empty input sequences")
-                    batch_ids = torch.arange(logits.shape[0], device=logits.device)
-                    model_output["antidoom_logits"] = logits[batch_ids, sequence_lengths - 1]
 
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:

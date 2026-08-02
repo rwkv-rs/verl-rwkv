@@ -54,40 +54,11 @@ from verl.workers.config import (
     RolloutConfig,
     TrainingWorkerConfig,
 )
-from verl.workers.config.model import resolve_antidoom_rwkv_lora
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
-from verl.workers.utils.losses import antidoom_actor_loss, ppo_loss
+from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def build_actor_loss_fn(
-    model_config: HFModelConfig,
-    actor_config: ActorConfig,
-    distillation_config: Optional[DistillationConfig] = None,
-):
-    """Select the actor loss and fail closed on incomplete Antidoom wiring."""
-
-    antidoom_lora = resolve_antidoom_rwkv_lora(model_config)
-    loss_mode = actor_config.policy_loss.loss_mode
-    if distillation_config is not None:
-        if antidoom_lora is not None or loss_mode == "antidoom_ftpo":
-            raise ValueError("Antidoom FTPO cannot be combined with distillation")
-        return partial(distillation_ppo_loss, config=actor_config, distillation_config=distillation_config)
-    if antidoom_lora is None:
-        if loss_mode == "antidoom_ftpo":
-            raise ValueError("policy_loss.loss_mode=antidoom_ftpo requires model.lora.adapter=antidoom_rwkv")
-        return partial(ppo_loss, config=actor_config)
-    if loss_mode != "antidoom_ftpo":
-        raise ValueError("model.lora.adapter=antidoom_rwkv requires policy_loss.loss_mode=antidoom_ftpo")
-    if model_config.use_remove_padding:
-        raise ValueError("Antidoom FTPO requires model.use_remove_padding=false to retain final-token logits")
-    if actor_config.use_fused_kernels:
-        raise ValueError("Antidoom FTPO does not support fused kernels because they do not materialize logits")
-    if actor_config.use_dynamic_bsz:
-        raise ValueError("Antidoom FTPO requires fixed per-rank batches for data-parallel loss normalization")
-    return partial(antidoom_actor_loss, config=actor_config)
 
 
 def strict_rwkv_init_delay_seconds(rank: int, value: str | None) -> int:
@@ -262,7 +233,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
-        self._uses_antidoom_ftpo = False
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -277,7 +247,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
-        self._uses_antidoom_ftpo = isinstance(loss_fn, functools.partial) and loss_fn.func is antidoom_actor_loss
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
@@ -465,7 +434,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
-            antidoom_ftpo=self._uses_antidoom_ftpo,
         )
 
         for key, val in default_keys.items():
@@ -757,7 +725,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
-            self.loss_fn = build_actor_loss_fn(model_config, actor_config, distillation_config)
+            if self.distillation_enabled:
+                self.loss_fn = partial(
+                    distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
+                )
+            else:
+                self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
             with strict_rwkv_init_slot(
                 os.getenv("HELICOPTER_RWKV_INIT_CONCURRENCY"),
