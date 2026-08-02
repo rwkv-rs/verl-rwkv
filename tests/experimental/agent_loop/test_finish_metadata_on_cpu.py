@@ -46,7 +46,9 @@ def test_parse_strict_cot_decision_table(text: str, valid: bool):
     ("finish_reason", "backend_stop_reason", "repetition_truncated", "expected_category"),
     [
         ("stop", None, False, "ended_by_eos"),
+        ("stop", 0, False, "ended_by_eos"),
         ("stop", "eos", False, "ended_by_eos"),
+        ("stop", 11, False, "other_failure"),
         ("stop", "\nUser:", False, "other_failure"),
         ("completed", None, False, "other_failure"),
         ("length", None, False, "context_exhausted"),
@@ -59,7 +61,7 @@ def test_parse_strict_cot_decision_table(text: str, valid: bool):
 )
 def test_classify_rollout_finish_is_exhaustive_and_disjoint(
     finish_reason: str | None,
-    backend_stop_reason: str | None,
+    backend_stop_reason: int | str | None,
     repetition_truncated: bool,
     expected_category: str,
 ):

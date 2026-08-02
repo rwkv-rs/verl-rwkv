@@ -31,7 +31,7 @@ _BLOCK_CONTENT = r"(?:(?!</?(?:think|answer)>)[\s\S])+"
 _STRICT_COT_PATTERN = re.compile(
     rf"\A<think>(?P<think>{_BLOCK_CONTENT})</think><answer>(?P<answer>{_BLOCK_CONTENT})</answer>\Z"
 )
-_EOS_BACKEND_REASONS = {None, "eos", "eos_token", "eos_token_id"}
+_EOS_BACKEND_REASONS = {None, 0, "eos", "eos_token", "eos_token_id"}
 _LENGTH_FINISH_REASONS = {"length", "max_length", "max_tokens", "max_length_truncated"}
 
 
