@@ -1656,7 +1656,59 @@ class PPOTrainer(ABC):
             raise RuntimeError(f"external evaluation did not write metrics: {result_path}")
         with result_path.open(encoding="utf-8") as stream:
             payload = json.load(stream)
-        metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        result_fields = {
+            "schema_version",
+            "weight_sha256",
+            "wkv_mode",
+            "pool_manifest_lineage",
+            "metrics",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != result_fields
+            or payload.get("schema_version") != 2
+        ):
+            raise RuntimeError(
+                "external evaluation result must use the complete lineage schema v2"
+            )
+        if payload.get("weight_sha256") != checkpoint_sha256:
+            raise RuntimeError(
+                "external evaluation result weight SHA does not match the evaluated checkpoint"
+            )
+        if payload.get("wkv_mode") != wkv_mode:
+            raise RuntimeError(
+                "external evaluation result WKV mode does not match the requested runtime"
+            )
+        lineage = payload.get("pool_manifest_lineage")
+        if not isinstance(lineage, dict) or set(lineage) != {
+            "manifest",
+            "manifest_sha256",
+        }:
+            raise RuntimeError(
+                "external evaluation result requires complete pool manifest lineage"
+            )
+        returned_manifest = lineage.get("manifest")
+        returned_digest = lineage.get("manifest_sha256")
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                pool_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if returned_manifest != pool_payload:
+            raise RuntimeError(
+                "external evaluation result pool manifest lineage does not match "
+                "this evaluation round"
+            )
+        if returned_digest != expected_digest:
+            raise RuntimeError(
+                "external evaluation result pool manifest lineage digest does not "
+                "match content"
+            )
+        metrics = payload.get("metrics")
         if not isinstance(metrics, dict) or not metrics:
             raise RuntimeError("external evaluation result requires a non-empty metrics object")
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -58,6 +59,32 @@ def _runtime_metadata(
     }
 
 
+def _result_payload(
+    pool_payload: dict[str, object],
+    *,
+    metrics: dict[str, float] | None = None,
+) -> dict[str, object]:
+    digest = hashlib.sha256(
+        json.dumps(
+            pool_payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": 2,
+        "weight_sha256": pool_payload["checkpoint_sha256"],
+        "wkv_mode": pool_payload["wkv_mode"],
+        "pool_manifest_lineage": {
+            "manifest": copy.deepcopy(pool_payload),
+            "manifest_sha256": digest,
+        },
+        "metrics": metrics or {"aime24/pass@1": 0.5},
+    }
+
+
 def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkeypatch):
     weight_root = tmp_path / "weights"
     checkpoint_root = weight_root / "maxrl" / "run"
@@ -81,7 +108,8 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
         pool_path = Path(env["HELICOPTER_VLLM_POOL_MANIFEST"])
         assert pool_path.is_file()
         assert pool_path.stat().st_mode & 0o777 == 0o600
-        assert json.loads(pool_path.read_text(encoding="utf-8")) == {
+        pool_payload = json.loads(pool_path.read_text(encoding="utf-8"))
+        assert pool_payload == {
             "schema_version": 3,
             "global_step": 7,
             "checkpoint_sha256": hashlib.sha256(b"weights").hexdigest(),
@@ -127,7 +155,15 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
             ],
         }
         result_path.write_text(
-            json.dumps({"metrics": {"aime24/pass@1": 0.5, "math_500/pass@1": 0.25}}),
+            json.dumps(
+                _result_payload(
+                    pool_payload,
+                    metrics={
+                        "aime24/pass@1": 0.5,
+                        "math_500/pass@1": 0.25,
+                    },
+                )
+            ),
             encoding="utf-8",
         )
         events.append("command")
@@ -258,6 +294,110 @@ def test_external_evaluation_rejects_missing_published_policy_with_contract_erro
     )
 
     with pytest.raises(RuntimeError, match="authoritative published behavior-policy identity"):
+        PPOTrainer._validate_external(
+            trainer,
+            OmegaConf.create({"command": ["helicopter", "eval"]}),
+        )
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "missing_lineage",
+        "checkpoint_sha256",
+        "global_step",
+        "behavior_policy_identity",
+        "endpoint",
+        "wkv_mode",
+        "capacity",
+        "manifest_digest",
+    ],
+)
+def test_external_evaluation_rejects_result_lineage_mismatch_before_metrics(
+    tmp_path,
+    monkeypatch,
+    mismatch,
+):
+    weight_root = tmp_path / "weights"
+    checkpoint_root = weight_root / "maxrl" / "run"
+    checkpoint_file = (
+        checkpoint_root / "global_step_7" / "actor" / "rwkv_lm.pth"
+    )
+    checkpoint_file.parent.mkdir(parents=True)
+    checkpoint_file.write_bytes(b"weights")
+    (checkpoint_file.parent / "config.json").write_text("{}", encoding="utf-8")
+    runtime_metadata = _runtime_metadata(
+        "10.0.0.1",
+        18000,
+        max_num_seqs=64,
+        max_num_batched_tokens=4096,
+    )
+
+    def run(_command, *, cwd, env, check):
+        assert cwd == "/product/helicopter"
+        assert check is True
+        pool_payload = json.loads(
+            Path(env["HELICOPTER_VLLM_POOL_MANIFEST"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        result = _result_payload(pool_payload)
+        if mismatch == "missing_lineage":
+            del result["pool_manifest_lineage"]
+        elif mismatch == "manifest_digest":
+            result["pool_manifest_lineage"]["manifest_sha256"] = "b" * 64
+        else:
+            returned = result["pool_manifest_lineage"]["manifest"]
+            if mismatch == "checkpoint_sha256":
+                returned["checkpoint_sha256"] = "b" * 64
+            elif mismatch == "global_step":
+                returned["global_step"] = 8
+            elif mismatch == "behavior_policy_identity":
+                returned["behavior_policy_identity"]["policy_version"] = 8
+                returned["replicas"][0]["behavior_policy_identity"][
+                    "policy_version"
+                ] = 8
+            elif mismatch == "endpoint":
+                returned["replicas"][0]["base_url"] = "http://10.0.0.2:18000"
+            elif mismatch == "wkv_mode":
+                returned["wkv_mode"] = "fp16"
+                returned["replicas"][0]["wkv_mode"] = "fp16"
+            elif mismatch == "capacity":
+                returned["replicas"][0]["max_num_seqs"] = 65
+                returned["aggregate_scheduler_capacity"]["max_num_seqs"] = 65
+            else:  # pragma: no cover - parameter list owns the decision table
+                raise AssertionError(mismatch)
+        Path(env["MAXRL_EVAL_RESULT_PATH"]).write_text(
+            json.dumps(result),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setenv("WEIGHT_PATH", str(weight_root))
+    monkeypatch.setenv("VLLM_RWKV7_WKV_MODE", "fp32io16")
+    monkeypatch.setenv("HELICOPTER_PRODUCT_ROOT", "/product/helicopter")
+    monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.subprocess.run", run)
+    trainer = SimpleNamespace(
+        config=OmegaConf.create(
+            {
+                "trainer": {"default_local_dir": str(checkpoint_root)},
+                "data": {"max_prompt_length": 2048, "max_response_length": 8192},
+                "actor_rollout_ref": {"rollout": {}},
+            }
+        ),
+        global_steps=7,
+        policy_round=SimpleNamespace(
+            published=SimpleNamespace(
+                as_dict=lambda: dict(BEHAVIOR_POLICY_IDENTITY)
+            )
+        ),
+        llm_server_manager=SimpleNamespace(
+            get_addresses=lambda: ["10.0.0.1:18000"],
+            get_runtime_metadata_snapshot=lambda: [runtime_metadata],
+        ),
+        _save_checkpoint=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="lineage|weight SHA|WKV mode"):
         PPOTrainer._validate_external(
             trainer,
             OmegaConf.create({"command": ["helicopter", "eval"]}),
