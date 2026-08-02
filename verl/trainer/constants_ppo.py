@@ -125,6 +125,7 @@ def get_ppo_ray_runtime_env(config=None):
         "REMOTE_RUN_LOG_DIR",
         "VERL_FILE_LOGGER_PATH",
         "VERL_POLICY_IDENTITY_LOG_PATH",
+        "VERL_POLICY_PUBLICATION_STATE_PATH",
         "HELICOPTER_RUN_ID",
         "HELICOPTER_MODEL_REPOSITORY",
         "HELICOPTER_MODEL_REVISION",

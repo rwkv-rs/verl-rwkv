@@ -15,6 +15,7 @@
 from copy import deepcopy
 
 import pytest
+from omegaconf import OmegaConf
 
 from verl.trainer.ppo.v1.policy_identity import (
     BehaviorPolicyIdentity,
@@ -25,7 +26,13 @@ from verl.trainer.ppo.v1.policy_identity import (
     training_policy_version,
     validate_behavior_policy_batch,
 )
-from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync, record_policy_identity
+from verl.trainer.ppo.v1.trainer_sync import (
+    POLICY_PUBLICATION_STATE_ENV,
+    PPOTrainerSync,
+    load_committed_policy_round,
+    record_policy_identity,
+    save_committed_policy_round,
+)
 from verl.workers.engine_workers import validate_strict_on_policy_optimizer_iterations
 
 
@@ -431,3 +438,103 @@ def test_sync_lifecycle_update_failure_or_timeout_never_commits(error):
 
     assert trainer.policy_round.phase is RoundPhase.PUBLISHED
     assert trainer.policy_round.published == previous
+
+
+def test_committed_state_roundtrip_excludes_partial_ack_and_preserves_lineage(tmp_path):
+    path = tmp_path / "policy-publication.json"
+    current = _identity(11)
+    state = StrictOnPolicyRound()
+    _publish_initial(state, current)
+    save_committed_policy_round(path, state)
+    committed_payload = path.read_bytes()
+
+    state.begin_rollout(11)
+    state.prepare(_tags(current))
+    state.begin_training()
+    target = _identity(12, previous=current.weight_digest)
+    _begin_publication(state, target)
+    state.acknowledge_publication(_acks(target)[0])
+
+    with pytest.raises(PolicyIdentityError, match="unavailable in phase publishing"):
+        state.committed_state_dict()
+    assert path.read_bytes() == committed_payload
+
+    state.rollback_publication("replica 1 failed")
+    restored = load_committed_policy_round(path)
+    assert restored.phase is RoundPhase.PUBLISHED
+    assert restored.published == current
+    assert restored.published.policy_version == 11
+    assert restored.published.weight_digest == current.weight_digest
+
+
+def _init_sync_trainer(checkpoint_manager, *, global_steps=0):
+    trainer = PPOTrainerSync.__new__(PPOTrainerSync)
+    trainer.checkpoint_manager = checkpoint_manager
+    trainer.global_steps = global_steps
+    trainer.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {"strategy": "fsdp2"},
+                "model": {
+                    "path": "/weights/rwkv7-g1i.pth",
+                    "repository": "BlinkDL/temp-latest-training-models",
+                    "revision": "fixed-revision",
+                    "filename": "rwkv7-g1i.pth",
+                },
+                "rollout": {"name": "vllm", "temperature": 1.0, "top_p": 1.0},
+            }
+        }
+    )
+    return trainer
+
+
+def test_initial_publication_and_resume_require_all_replicas_without_version_increment(tmp_path, monkeypatch):
+    path = tmp_path / "policy-publication.json"
+    monkeypatch.setenv(POLICY_PUBLICATION_STATE_ENV, str(path))
+    monkeypatch.setenv("HELICOPTER_CHECKPOINT_SHA256", "a" * 64)
+    monkeypatch.setenv("HELICOPTER_RUN_ID", "initial-run")
+    initial_events = []
+    initial = _init_sync_trainer(_CheckpointManager(initial_events))
+    initial.on_init_end()
+
+    committed = load_committed_policy_round(path).published
+    assert committed is not None
+    assert committed.policy_version == 0
+    assert len(initial_events) == 1
+    assert len(_acks(committed)) == 8
+
+    monkeypatch.setenv("HELICOPTER_RUN_ID", "resumed-run")
+    resume_events = []
+    resumed = _init_sync_trainer(_CheckpointManager(resume_events))
+    resumed.on_init_end()
+
+    assert resumed.policy_round.phase is RoundPhase.PUBLISHED
+    assert resumed.policy_round.published.policy_version == committed.policy_version
+    assert resumed.policy_round.published.weight_digest == committed.weight_digest
+    assert resumed.policy_round.published.runtime_identity != committed.runtime_identity
+    assert resume_events[0][0:2] == ("update", 0)
+    assert len(resume_events[0][2]) == len(committed.as_dict())
+
+
+def test_resume_partial_ack_failure_keeps_last_committed_state(tmp_path, monkeypatch):
+    path = tmp_path / "policy-publication.json"
+    monkeypatch.setenv(POLICY_PUBLICATION_STATE_ENV, str(path))
+    monkeypatch.setenv("HELICOPTER_CHECKPOINT_SHA256", "a" * 64)
+    initial = _init_sync_trainer(_CheckpointManager([]))
+    initial.on_init_end()
+    current = initial.policy_round.published
+    assert current is not None
+    committed_payload = path.read_bytes()
+
+    class _PartialCheckpointManager(_CheckpointManager):
+        def update_weights(self, global_steps, policy_identity):
+            self.events.append(("update", global_steps, policy_identity))
+            identity = BehaviorPolicyIdentity.from_dict(policy_identity)
+            return _acks(identity)[:-1]
+
+    resumed = _init_sync_trainer(_PartialCheckpointManager([]))
+    with pytest.raises(PolicyIdentityError, match="expected replica set"):
+        resumed.on_init_end()
+
+    assert path.read_bytes() == committed_payload
+    assert load_committed_policy_round(path).published == current

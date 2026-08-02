@@ -35,6 +35,7 @@ IDENTITY_TAG_KEYS = (
     "sampling_config_digest",
     "runtime_identity",
 )
+COMMITTED_POLICY_STATE_SCHEMA_VERSION = 1
 
 
 class PolicyIdentityError(RuntimeError):
@@ -187,6 +188,53 @@ class StrictOnPolicyRound:
         self.publication_failure = None
         self.phase = RoundPhase.PUBLISHING
         self.commit_publication(identity, acknowledgements)
+
+    def committed_state_dict(self) -> dict[str, Any]:
+        """Serialize only the last all-replica committed publication.
+
+        In-flight acknowledgements are intentionally excluded.  A crash during
+        transfer therefore resumes from the last atomically visible policy and
+        can never make a partially updated target durable.
+        """
+
+        if self.phase is not RoundPhase.PUBLISHED or self.published is None:
+            raise PolicyIdentityError(f"committed policy state is unavailable in phase {self.phase.value}")
+        if self.training_identity is not None or self.publication is not None:
+            raise PolicyIdentityError("committed policy state contains an in-flight round")
+        return {
+            "schema_version": COMMITTED_POLICY_STATE_SCHEMA_VERSION,
+            "expected_replica_ids": sorted(self.expected_replica_ids),
+            "published": self.published.as_dict(),
+        }
+
+    @classmethod
+    def from_committed_state_dict(cls, value: Mapping[str, Any]) -> StrictOnPolicyRound:
+        """Restore the last committed identity without advancing its version."""
+
+        required = {"schema_version", "expected_replica_ids", "published"}
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise PolicyIdentityError("committed policy state has an invalid schema")
+        if value["schema_version"] != COMMITTED_POLICY_STATE_SCHEMA_VERSION:
+            raise PolicyIdentityError(f"unsupported committed policy state schema: {value['schema_version']!r}")
+        replica_ids = value["expected_replica_ids"]
+        if (
+            not isinstance(replica_ids, list)
+            or not replica_ids
+            or any(
+                isinstance(replica_id, bool) or not isinstance(replica_id, int) or replica_id < 0
+                for replica_id in replica_ids
+            )
+            or len(set(replica_ids)) != len(replica_ids)
+        ):
+            raise PolicyIdentityError("committed policy state has invalid rollout replica ids")
+        try:
+            published = BehaviorPolicyIdentity.from_dict(value["published"])
+        except (PolicyIdentityError, TypeError) as exc:
+            raise PolicyIdentityError(f"committed policy state has an invalid identity: {exc}") from exc
+        state = cls(replica_ids)
+        state.published = published
+        state.phase = RoundPhase.PUBLISHED
+        return state
 
     def begin_rollout(self, expected_policy_version: int) -> BehaviorPolicyIdentity:
         if self.phase is not RoundPhase.PUBLISHED or self.published is None:
