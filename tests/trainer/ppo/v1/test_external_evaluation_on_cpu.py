@@ -44,6 +44,28 @@ def _write_hf_checkpoint(checkpoint_dir: Path) -> None:
     (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
 
 
+def test_hf_model_artifact_digest_accepts_complete_directory_and_tracks_file_content(tmp_path):
+    checkpoint_dir = tmp_path / "actor" / "huggingface"
+    _write_hf_checkpoint(checkpoint_dir)
+
+    initial_digest = _hf_model_artifact_digest(checkpoint_dir)
+    (checkpoint_dir / "model.safetensors").write_bytes(b"updated-weights")
+    updated_digest = _hf_model_artifact_digest(checkpoint_dir)
+
+    assert len(initial_digest) == 64
+    assert len(updated_digest) == 64
+    assert updated_digest != initial_digest
+
+
+def test_hf_model_artifact_digest_rejects_incomplete_directory(tmp_path):
+    checkpoint_dir = tmp_path / "actor" / "huggingface"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Incomplete Hugging Face model output.*no complete model weights"):
+        _hf_model_artifact_digest(checkpoint_dir)
+
+
 def _runtime_metadata(
     address: str,
     port: int,
@@ -232,6 +254,32 @@ def test_external_evaluation_uses_checkpoint_command_and_result(tmp_path, monkey
     }
     assert events == ["save", "command"]
     assert not list(checkpoint_dir.parent.glob(".vllm-eval-pool-*.json"))
+
+
+def test_external_evaluation_rejects_incomplete_hf_directory_after_checkpoint_save(tmp_path):
+    checkpoint_root = tmp_path / "weights" / "maxrl" / "run"
+    checkpoint_dir = _checkpoint_dir(checkpoint_root)
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "config.json").write_text("{}", encoding="utf-8")
+    save_calls = []
+    trainer = SimpleNamespace(
+        config=OmegaConf.create({"trainer": {"default_local_dir": str(checkpoint_root)}}),
+        global_steps=7,
+        _save_checkpoint=lambda: save_calls.append("save"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"external evaluation checkpoint is incomplete: .*actor/huggingface",
+    ) as error:
+        PPOTrainer._validate_external(
+            trainer,
+            OmegaConf.create({"command": ["helicopter", "eval"]}),
+        )
+
+    assert save_calls == ["save"]
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert "no complete model weights" in str(error.value.__cause__)
 
 
 def test_external_evaluation_rejects_stale_replica_policy_before_command(tmp_path, monkeypatch):
