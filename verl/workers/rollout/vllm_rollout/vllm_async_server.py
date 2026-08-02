@@ -46,7 +46,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
-from verl.trainer.ppo.v1.policy_identity import canonical_digest
+from verl.trainer.ppo.v1.policy_identity import BehaviorPolicyIdentity, canonical_digest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -1134,6 +1134,43 @@ class vLLMHttpServer:
         self.behavior_policy_identity = dict(policy_identity)
         self.weight_update_failure = None
         self.weight_update_state = "weights_ready"
+
+    async def publish_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> dict[str, Any]:
+        """Expose an immutable checkpoint loaded by a standalone vLLM server."""
+
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            raise RuntimeError("startup policy publication is only valid for standalone rollout servers")
+        normalized = BehaviorPolicyIdentity.from_dict(policy_identity).as_dict()
+        if self.weight_update_state == "active" and self.behavior_policy_identity == normalized:
+            return {
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+                "policy_identity": normalized,
+            }
+        if self.weight_update_state != "uninitialized" or self.behavior_policy_identity is not None:
+            raise RuntimeError(
+                "standalone checkpoint identity cannot replace an already visible policy: "
+                f"state={self.weight_update_state!r}"
+            )
+        self.behavior_policy_identity = normalized
+        self.weight_update_failure = None
+        self.weight_update_state = "active"
+        return {
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "policy_identity": normalized,
+        }
+
+    async def rollback_loaded_policy_identity(self, policy_identity: dict[str, Any]) -> None:
+        """Rollback only the matching pre-generation standalone publication."""
+
+        normalized = BehaviorPolicyIdentity.from_dict(policy_identity).as_dict()
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            return
+        if self.behavior_policy_identity == normalized:
+            self.behavior_policy_identity = None
+            self.weight_update_failure = None
+            self.weight_update_state = "uninitialized"
 
     async def begin_weight_update(self):
         """Hide the old identity before any live tensor can be overwritten."""

@@ -12,18 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop import (
-    AgentLoopBase,
-    AgentLoopManager,
-    AgentLoopOutput,
-    AgentLoopWorker,
-    get_trajectory_info,
-)
-from .single_turn_agent_loop import SingleTurnAgentLoop
-from .tool_agent_loop import ToolAgentLoop
-
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
-
 __all__ = [
     "AgentLoopBase",
     "AgentLoopManager",
@@ -31,3 +19,31 @@ __all__ = [
     "AgentLoopOutput",
     "get_trajectory_info",
 ]
+
+
+def __getattr__(name: str):
+    if name not in __all__:
+        raise AttributeError(name)
+    from .agent_loop import (
+        AgentLoopBase,
+        AgentLoopManager,
+        AgentLoopOutput,
+        AgentLoopWorker,
+        get_trajectory_info,
+    )
+
+    # Import built-in loops with the manager so their registry side effects
+    # remain identical to the former eager package import.
+    from .single_turn_agent_loop import SingleTurnAgentLoop
+    from .tool_agent_loop import ToolAgentLoop
+
+    _ = (SingleTurnAgentLoop, ToolAgentLoop)
+    exports = {
+        "AgentLoopBase": AgentLoopBase,
+        "AgentLoopManager": AgentLoopManager,
+        "AgentLoopOutput": AgentLoopOutput,
+        "AgentLoopWorker": AgentLoopWorker,
+        "get_trajectory_info": get_trajectory_info,
+    }
+    globals().update(exports)
+    return exports[name]
