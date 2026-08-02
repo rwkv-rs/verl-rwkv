@@ -20,39 +20,11 @@ from typing import Any
 
 from omegaconf import DictConfig
 
-RWKV_NATIVE_MODEL_TARGET = "verl.models.rwkv.RWKVNativeModelConfig"
-
-
-def _get(config: Any, key: str, default: Any = None) -> Any:
-    if hasattr(config, "get"):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-def is_rwkv_native_model_config(model_config: Any) -> bool:
-    """Return whether a model config describes native RWKV weights."""
-
-    return _get(model_config, "_target_") == RWKV_NATIVE_MODEL_TARGET
-
 
 def build_ppo_tokenizer_and_processor(config: DictConfig) -> tuple[Any, Any]:
-    """Build tokenizer and processor for PPO datasets.
-
-    Native RWKV checkpoints are `.pth` files, so they cannot be passed to
-    Hugging Face `AutoTokenizer.from_pretrained`. Use the native tokenizer
-    bridge instead and leave the processor unset because RWKV is text-only here.
-    """
+    """Build tokenizer and processor for PPO datasets."""
 
     model_config = config.actor_rollout_ref.model
-    if is_rwkv_native_model_config(model_config):
-        from verl.models.rwkv import build_rwkv_tokenizer
-
-        tokenizer = build_rwkv_tokenizer(
-            tokenizer_path=_get(model_config, "tokenizer_path"),
-            pickleable=True,
-        )
-        return tokenizer, None
-
     from verl.utils import hf_processor, hf_tokenizer
     from verl.utils.fs import copy_to_local
 

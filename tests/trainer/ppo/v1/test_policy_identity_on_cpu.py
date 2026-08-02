@@ -40,7 +40,7 @@ def _identity(version: int, previous: str = "checkpoint") -> BehaviorPolicyIdent
     return BehaviorPolicyIdentity.for_publication(
         policy_version=version,
         previous_weight_digest=previous,
-        export_contract={"engine": "rwkv_lm", "dtype": "bfloat16"},
+        export_contract={"engine": "fsdp", "dtype": "bfloat16"},
         sampling_config={"temperature": 1.0, "top_p": 1.0},
         runtime_identity="vllm:async:rwkv7",
     )
@@ -403,7 +403,7 @@ def _training_sync(checkpoint_manager):
     trainer.global_steps = 1
     trainer._sampling_config = {"temperature": 1.0}
     trainer._runtime_identity = "vllm:async:rwkv7"
-    trainer._export_contract = {"engine": "rwkv_lm", "dtype": "bfloat16"}
+    trainer._export_contract = {"engine": "fsdp", "dtype": "bfloat16"}
     current = _identity(0)
     trainer.policy_round = StrictOnPolicyRound()
     _publish_initial(trainer.policy_round, current)

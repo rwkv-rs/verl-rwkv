@@ -14,6 +14,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -142,6 +143,107 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metrics["kl_coef"] = config.kl_loss_coef
 
     return policy_loss, metrics
+
+
+def antidoom_actor_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+    """Compute Antidoom FTPO from the final-token logits produced by the FSDP actor."""
+
+    del dp_group
+    required = ("chosen_token_ids", "rejected_token_ids")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError("Antidoom FTPO batch is missing: " + ",".join(missing))
+    logits = model_output.get("antidoom_logits")
+    if logits is None:
+        raise ValueError("Antidoom FTPO requires dense final-token logits from the actor engine")
+    reference_logits = data.get("reference_logits")
+    if reference_logits is None and (
+        config.policy_loss.ftpo_lambda_mse > 0 or config.policy_loss.ftpo_lambda_mse_target > 0
+    ):
+        raise ValueError("Antidoom FTPO reference_logits are required when an MSE coefficient is positive")
+    loss, values = _antidoom_ftpo_objective(
+        logits,
+        chosen_token_ids=data["chosen_token_ids"],
+        rejected_token_ids=data["rejected_token_ids"],
+        chosen_mask=data.get("chosen_mask"),
+        reference_logits=reference_logits,
+        clip_epsilon=config.policy_loss.ftpo_clip_epsilon,
+        lambda_mse=config.policy_loss.ftpo_lambda_mse,
+        lambda_mse_target=config.policy_loss.ftpo_lambda_mse_target,
+        target_tolerance=config.policy_loss.ftpo_target_tolerance,
+    )
+    metrics = Metric.from_dict(
+        {f"actor/ftpo_{name}": value for name, value in values.items()},
+        aggregation=AggregationType.MEAN,
+    )
+    return loss, metrics
+
+
+def _antidoom_ftpo_objective(
+    logits: torch.Tensor,
+    *,
+    chosen_token_ids: torch.Tensor,
+    rejected_token_ids: torch.Tensor,
+    chosen_mask: torch.Tensor | None,
+    reference_logits: torch.Tensor | None,
+    clip_epsilon: float,
+    lambda_mse: float,
+    lambda_mse_target: float,
+    target_tolerance: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if logits.ndim != 2:
+        raise ValueError("Antidoom FTPO logits must have shape [batch, vocabulary]")
+    if chosen_token_ids.ndim == 1:
+        chosen_token_ids = chosen_token_ids.unsqueeze(-1)
+    if chosen_mask is None:
+        chosen_mask = torch.ones_like(chosen_token_ids, dtype=torch.bool)
+    else:
+        chosen_mask = chosen_mask.to(dtype=torch.bool)
+    if chosen_token_ids.shape != chosen_mask.shape or rejected_token_ids.shape != logits.shape[:1]:
+        raise ValueError("Antidoom FTPO token ids and masks do not match the logits batch")
+    if not torch.any(chosen_mask):
+        raise ValueError("Antidoom FTPO requires at least one active chosen token")
+    if clip_epsilon <= 0:
+        raise ValueError("Antidoom FTPO clip_epsilon must be positive")
+
+    row_ids = torch.arange(logits.size(0), device=logits.device).unsqueeze(1)
+    rejected_logits = logits.gather(-1, rejected_token_ids.unsqueeze(-1))
+    deltas = logits[row_ids, chosen_token_ids] - rejected_logits
+    active_weights = torch.clamp((clip_epsilon - deltas) / clip_epsilon, min=0.0, max=1.0) * chosen_mask
+    chosen_counts = chosen_mask.sum(dim=-1).clamp(min=1)
+    preference_loss = ((F.softplus(clip_epsilon - deltas) * active_weights).sum(dim=-1) / chosen_counts).mean()
+    loss = preference_loss
+
+    mse_other = logits.new_tensor(0.0)
+    mse_target = logits.new_tensor(0.0)
+    if reference_logits is not None:
+        if reference_logits.shape != logits.shape:
+            raise ValueError("Antidoom FTPO reference_logits must match logits")
+        difference = logits - reference_logits.detach()
+        target_mask = torch.zeros_like(logits, dtype=torch.bool)
+        target_mask[row_ids.expand_as(chosen_token_ids)[chosen_mask], chosen_token_ids[chosen_mask]] = True
+        target_mask.scatter_(1, rejected_token_ids.unsqueeze(-1), True)
+        other_mask = ~target_mask
+        mse_other = (difference.square() * other_mask).sum() / other_mask.sum().clamp(min=1)
+        excess = torch.clamp(difference.abs() - target_tolerance, min=0.0)
+        mse_target = (excess.square() * target_mask).sum() / target_mask.sum().clamp(min=1)
+        loss = loss + lambda_mse * mse_other + lambda_mse_target * mse_target
+
+    active_deltas = deltas[chosen_mask]
+    log_probabilities = F.log_softmax(logits, dim=-1)
+    chosen_log_probabilities = log_probabilities[row_ids, chosen_token_ids]
+    rejected_log_probabilities = log_probabilities.gather(-1, rejected_token_ids.unsqueeze(-1))
+    wins = (chosen_log_probabilities > rejected_log_probabilities) & chosen_mask
+    return loss, {
+        "pref_loss": preference_loss.detach(),
+        "chosen_win": (wins.sum(dim=-1) / chosen_counts).float().mean().detach(),
+        "margin_win": ((deltas >= clip_epsilon) & chosen_mask).sum().float().div(chosen_mask.sum()).detach(),
+        "mean_delta": active_deltas.mean().detach(),
+        "median_delta": active_deltas.median().detach(),
+        "active_weight": active_weights[chosen_mask].mean().detach(),
+        "mse_elem": mse_other.detach(),
+        "mse_tgt_tokenwise": mse_target.detach(),
+    }
 
 
 def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=None):
