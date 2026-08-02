@@ -1,5 +1,6 @@
 # Dependencies shared by the registry-backed generic profile and RWKV profile.
 accelerate
+cachetools
 codetiming
 datasets
 dill
