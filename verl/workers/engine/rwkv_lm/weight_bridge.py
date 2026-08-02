@@ -38,5 +38,35 @@ def export_rwkv_lm_weights(weights: Iterable[tuple[str, Any]]) -> Generator[tupl
 def iter_rwkv_lm_state_dict_weights(model_or_state: Any) -> Generator[tuple[str, Any], None, None]:
     """Iterate native rwkv-lm ``state_dict`` weights without layout changes."""
 
-    state = model_or_state.state_dict() if hasattr(model_or_state, "state_dict") else model_or_state
+    if hasattr(model_or_state, "state_dict") and hasattr(model_or_state, "peft_config"):
+        state = _snapshot_merged_peft_state_dict(model_or_state)
+    else:
+        state = model_or_state.state_dict() if hasattr(model_or_state, "state_dict") else model_or_state
     yield from export_rwkv_lm_weights(state.items())
+
+
+def _snapshot_merged_peft_state_dict(model: Any) -> dict[str, Any]:
+    """Snapshot merged PEFT weights and exactly restore the recurrent base."""
+
+    from peft.tuners.lora import LoraLayer
+
+    layers = [module for module in model.modules() if isinstance(module, LoraLayer)]
+    backups = [(layer, layer.get_base_layer().weight.detach().clone(), bool(layer.merged)) for layer in layers]
+    try:
+        for layer in layers:
+            if not layer.merged:
+                layer.merge(safe_merge=True)
+        state = {}
+        for name, value in model.state_dict().items():
+            normalized_name = name.replace("base_model.model.", "").replace("base_model.", "")
+            normalized_name = normalized_name.replace(".base_layer", "")
+            if "lora_" in normalized_name or ".adapter_" in normalized_name:
+                continue
+            state[normalized_name] = value.detach().clone() if isinstance(value, torch.Tensor) else value
+        return state
+    finally:
+        with torch.no_grad():
+            for layer, base_weight, was_merged in backups:
+                if layer.merged and not was_merged:
+                    layer.unmerge()
+                layer.get_base_layer().weight.copy_(base_weight)

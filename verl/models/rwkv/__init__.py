@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import RWKVNativeModelConfig
-from .native_imports import import_rwkv_lm
-from .paths import (
-    RWKVLMPaths,
-    resolve_rwkv_lm_paths,
-)
-from .tokenizer import build_rwkv_tokenizer
-from .weight_mapping import map_verl_to_rwkv_lm
+from typing import Any
 
 __all__ = [
     "RWKVLMPaths",
@@ -29,3 +22,29 @@ __all__ = [
     "map_verl_to_rwkv_lm",
     "resolve_rwkv_lm_paths",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Keep model-only utilities importable without loading the vLLM tokenizer."""
+
+    if name == "RWKVNativeModelConfig":
+        from .config import RWKVNativeModelConfig
+
+        return RWKVNativeModelConfig
+    if name == "import_rwkv_lm":
+        from .native_imports import import_rwkv_lm
+
+        return import_rwkv_lm
+    if name in {"RWKVLMPaths", "resolve_rwkv_lm_paths"}:
+        from .paths import RWKVLMPaths, resolve_rwkv_lm_paths
+
+        return {"RWKVLMPaths": RWKVLMPaths, "resolve_rwkv_lm_paths": resolve_rwkv_lm_paths}[name]
+    if name == "build_rwkv_tokenizer":
+        from .tokenizer import build_rwkv_tokenizer
+
+        return build_rwkv_tokenizer
+    if name == "map_verl_to_rwkv_lm":
+        from .weight_mapping import map_verl_to_rwkv_lm
+
+        return map_verl_to_rwkv_lm
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

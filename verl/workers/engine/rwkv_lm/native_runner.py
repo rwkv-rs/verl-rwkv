@@ -30,6 +30,7 @@ import torch
 
 from verl.utils.device import get_device_name, is_device_available
 
+from .antidoom_adapter import apply_configured_antidoom_rwkv_adapter
 from .args import build_rwkv_lm_args
 from .checkpoint import load_rwkv_lm_checkpoint
 from .env import build_rwkv_lm_env, rwkv_lm_env
@@ -136,6 +137,7 @@ class NativeRWKVLMRunner:
             model = model_module.RWKV(self.args)
         if self.args.load_model:
             model.load_state_dict(self.checkpoint_loader(self.args.load_model))
+        model = apply_configured_antidoom_rwkv_adapter(model, self.model_config)
         self.model = model
         return model
 

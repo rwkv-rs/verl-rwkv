@@ -34,6 +34,7 @@ from verl.workers.config import HFModelConfig, RWKVLMEngineConfig, RWKVLMOptimiz
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import prepare_micro_batches
 
+from .antidoom_adapter import configured_antidoom_rwkv_adapter, restrict_optimizer_to_antidoom_adapter
 from .batch_bridge import build_verl_loss_model_output, extract_rwkv_lm_forward_batch
 from .checkpoint import load_rwkv_lm_checkpoint
 from .native_runner import NativeRWKVLMRunner
@@ -100,8 +101,9 @@ class RWKVLMEngine(BaseEngine):
             grad=False,
         )
         release_cpu_checkpoint_memory()
+        native_model = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
         try:
-            trainer_attached = self.model.trainer is not None
+            trainer_attached = native_model.trainer is not None
         except Exception:
             trainer_attached = False
         if not trainer_attached:
@@ -109,12 +111,18 @@ class RWKVLMEngine(BaseEngine):
 
             trainer = SimpleNamespace(is_global_zero=True, strategy=None)
             try:
-                self.model.trainer = trainer
+                native_model.trainer = trainer
             except Exception:
-                self.model._trainer = trainer
+                native_model._trainer = trainer
         self.train_callback = self.runner.build_train_callback()
         if hasattr(self.model, "configure_optimizers"):
             self.optimizer, self.lr_scheduler = self._normalize_optimizers(self.model.configure_optimizers())
+            if (
+                configured_antidoom_rwkv_adapter(self.model_config) is not None
+                and hasattr(self.model, "peft_config")
+                and self.optimizer is not None
+            ):
+                restrict_optimizer_to_antidoom_adapter(self.optimizer, self.model)
         return self
 
     def train_mode(self, **kwargs) -> ContextDecorator:
@@ -122,6 +130,11 @@ class RWKVLMEngine(BaseEngine):
 
     def eval_mode(self, **kwargs) -> ContextDecorator:
         return self._mode_context("eval", **kwargs)
+
+    def disable_adapter(self) -> ContextDecorator:
+        if self.model is not None and hasattr(self.model, "disable_adapter"):
+            return self.model.disable_adapter()
+        return nullcontext()
 
     def optimizer_zero_grad(self):
         if self.optimizer is not None:
